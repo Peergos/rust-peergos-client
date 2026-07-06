@@ -1,0 +1,18 @@
+[package]
+name = "peergos-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+peergos-cbor.workspace = true
+peergos-multiformats.workspace = true
+peergos-crypto.workspace = true
+peergos-core.workspace = true
+
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+webp = "0.3"

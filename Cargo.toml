@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/peergos-cbor",
+    "crates/peergos-multiformats",
+    "crates/peergos-crypto",
+    "crates/peergos-core",
+    "crates/peergos-fs",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/Peergos/rust-peergos-client"
+
+[workspace.dependencies]
+peergos-cbor = { path = "crates/peergos-cbor" }
+peergos-multiformats = { path = "crates/peergos-multiformats" }
+peergos-crypto = { path = "crates/peergos-crypto" }
+peergos-core = { path = "crates/peergos-core" }
+peergos-fs = { path = "crates/peergos-fs" }

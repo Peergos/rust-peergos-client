@@ -1,0 +1,6 @@
+[toolchain]
+# The crypto dependency tree (and later reqwest/tokio/ml-kem) pulls crates that
+# declare edition2024, which the distro's rustc 1.75 cannot even parse during
+# resolution. Use a recent stable via rustup. Ensure ~/.cargo/bin is on PATH so
+# this file is honoured (otherwise /usr/bin/cargo 1.75 shadows it).
+channel = "stable"

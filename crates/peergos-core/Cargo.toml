@@ -1,0 +1,19 @@
+[package]
+name = "peergos-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+peergos-cbor.workspace = true
+peergos-multiformats.workspace = true
+peergos-crypto.workspace = true
+
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["gzip", "rustls-tls"] }
+async-trait = "0.1"
+async-recursion = "1"
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

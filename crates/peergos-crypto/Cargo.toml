@@ -1,0 +1,25 @@
+[package]
+name = "peergos-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# NaCl-compatible primitives. Peergos (via TweetNaCl) uses the mac-FIRST "easy"
+# layout, so we use detached AEAD and assemble mac||ciphertext by hand.
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
+crypto_box = { version = "0.9", default-features = false, features = ["std", "salsa20"] }
+crypto_secretbox = { version = "0.1", default-features = false, features = ["std", "salsa20"] }
+
+# Digests / KDF (no layout ambiguity, plain RustCrypto).
+sha2 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
+blake2 = "0.10"
+blake3 = "1"
+scrypt = { version = "0.11", default-features = false, features = ["std"] }
+
+# Post-quantum KEM (FIPS-203 ML-KEM-1024) for hybrid boxing keys.
+ml-kem = { version = "0.3", features = ["getrandom"] }
+
+rand_core = { version = "0.6", features = ["getrandom"] }
