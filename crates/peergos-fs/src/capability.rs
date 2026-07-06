@@ -13,6 +13,10 @@ use peergos_core::error::{Error, Result};
 use peergos_core::keys::PublicKeyHash;
 use peergos_core::symmetric::{CipherText, SymmetricKey};
 use peergos_crypto::hash::hash_to_key_bytes;
+use peergos_crypto::random_bytes;
+
+/// The alphabet for a link password (`EncryptedCapability.passwordCharacters`).
+const PASSWORD_CHARACTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
 pub const MAP_KEY_LENGTH: usize = 32;
 
@@ -129,6 +133,23 @@ impl SecretLink {
         self.label.to_string()
     }
 
+    /// Generate a fresh link: a random positive 32-bit label and a 12-character
+    /// password (`SecretLink.create` + `EncryptedCapability.createLinkPassword`).
+    pub fn create(owner: PublicKeyHash) -> Result<SecretLink> {
+        let b = random_bytes(4);
+        let mut label =
+            (b[0] as i64) | ((b[1] as i64) << 8) | ((b[2] as i64) << 16) | ((b[3] as i64) << 24);
+        if label <= 0 {
+            label = 1; // labels must be positive
+        }
+        Ok(SecretLink { owner, label, link_password: create_link_password()? })
+    }
+
+    /// The shareable link string `secret/z<owner>/<label>#<password>`.
+    pub fn to_link(&self) -> String {
+        format!("secret/{}/{}#{}", self.owner, self.label, self.link_password)
+    }
+
     /// Parse a secret link. Accepts a bare `secret/...` path or a full URL
     /// containing `secret/` (with an optional leading `/`).
     pub fn from_link(link: &str) -> Result<SecretLink> {
@@ -196,4 +217,54 @@ impl EncryptedCapability {
         let key = EncryptedCapability::derive_key(salt, password)?;
         self.payload.decrypt(&key, AbsoluteCapability::from_cbor)
     }
+
+    /// Encrypt `cap` under a key derived from the label (salt) + password
+    /// (`EncryptedCapability.createFromPassword`).
+    pub fn create_from_password(
+        cap: &AbsoluteCapability,
+        salt: &str,
+        password: &str,
+        has_user_password: bool,
+    ) -> Result<EncryptedCapability> {
+        let key = EncryptedCapability::derive_key(salt, password)?;
+        Ok(EncryptedCapability { payload: CipherText::build(&key, cap)?, has_user_password })
+    }
+
+    pub fn to_cbor(&self) -> CborObject {
+        let b = CborObject::map().put("c", self.payload.to_cbor());
+        // `p` is only present when a user password is required (matches Java).
+        if self.has_user_password {
+            b.put("p", CborObject::Boolean(true)).build()
+        } else {
+            b.build()
+        }
+    }
+}
+
+/// The value stored behind a secret-link label: the encrypted capability plus
+/// optional expiry and retrieval limit (`SecretLinkTarget`).
+#[derive(Debug, Clone)]
+pub struct SecretLinkTarget {
+    pub cap: EncryptedCapability,
+    pub expiry_epoch_secs: Option<i64>,
+    pub max_retrievals: Option<i64>,
+}
+
+impl SecretLinkTarget {
+    pub fn to_cbor(&self) -> CborObject {
+        let mut b = CborObject::map().put("cap", self.cap.to_cbor());
+        if let Some(e) = self.expiry_epoch_secs {
+            b = b.put("expiry", CborObject::Long(e));
+        }
+        if let Some(m) = self.max_retrievals {
+            b = b.put("max", CborObject::Long(m));
+        }
+        b.build()
+    }
+}
+
+/// 12 random characters from `[a-zA-Z0-9]` (~2^72 of entropy).
+fn create_link_password() -> Result<String> {
+    let bytes = random_bytes(12);
+    Ok(bytes.iter().map(|b| PASSWORD_CHARACTERS[*b as usize % PASSWORD_CHARACTERS.len()] as char).collect())
 }

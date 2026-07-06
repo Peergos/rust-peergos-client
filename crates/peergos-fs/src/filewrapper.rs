@@ -278,6 +278,40 @@ impl FileWrapper {
         Ok(())
     }
 
+    /// The sha256 of this file's current contents (`getContentHash`). Reads the whole
+    /// file, so prefer for modestly-sized files.
+    pub async fn content_hash(&self) -> Result<Vec<u8>> {
+        if self.is_directory() {
+            return Err(Error::Protocol("cannot hash a directory".into()));
+        }
+        Ok(peergos_crypto::hash::sha256(&self.read().await?))
+    }
+
+    /// The number of direct children of this directory (`getDirectChildrenCount`),
+    /// counting the child links without fetching the children themselves.
+    pub async fn direct_children_count(&self) -> Result<usize> {
+        if !self.is_directory() {
+            return Ok(0);
+        }
+        Ok(crate::list_directory(&self.cap, self.store.clone(), self.mutable.as_ref()).await?.len())
+    }
+
+    /// Re-read this handle from its capability to pick up the latest committed
+    /// version (`getLatest`).
+    pub async fn get_latest(&self) -> Result<FileWrapper> {
+        Ok(FileWrapper::from_cap(
+            self.cap.clone(),
+            self.name.clone(),
+            self.path.clone(),
+            self.signer.clone(),
+            self.home_cap.clone(),
+            self.store.clone(),
+            self.mutable.clone(),
+        )
+        .await?
+        .with_cache(self.cache.clone()))
+    }
+
     // ---- mutation ----------------------------------------------------------
 
     /// This directory's writer's current champ tree root (for cache migration).
@@ -305,6 +339,76 @@ impl FileWrapper {
             .await?;
         self.migrate_cache(prior, &[&self.cap.map_key]).await;
         self.child(name).await?.ok_or_else(|| Error::Protocol("mkdir did not create the directory".into()))
+    }
+
+    /// Resolve a `/`-separated path under this directory, creating any missing
+    /// directories along the way, and return the leaf (`getOrMkdirs`).
+    pub async fn get_or_mkdirs(&self, path: &str) -> Result<FileWrapper> {
+        let mut cur = self.clone();
+        for comp in path.trim_matches('/').split('/').filter(|s| !s.is_empty()) {
+            cur = match cur.child(comp).await? {
+                Some(c) => c,
+                None => cur.mkdir(comp).await?,
+            };
+        }
+        Ok(cur)
+    }
+
+    /// Remove several children of this directory (`deleteChildren`).
+    pub async fn delete_children(&self, names: &[&str]) -> Result<()> {
+        for name in names {
+            self.remove_child(name).await?;
+        }
+        Ok(())
+    }
+
+    /// Append `data` to the end of this file (`appendFile`). Currently supports the
+    /// result staying within a single chunk (<= 5 MiB). Requires write access.
+    pub async fn append(&self, data: &[u8]) -> Result<()> {
+        if self.is_directory() {
+            return Err(Error::Protocol("cannot append to a directory".into()));
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        if self.size() + data.len() as u64 > crate::CHUNK_MAX_SIZE {
+            return Err(Error::Protocol("append that would cross a chunk boundary is not supported yet".into()));
+        }
+        let signer = crate::recover_signer(&self.cap, self.store.clone(), self.mutable.as_ref())
+            .await
+            .ok()
+            .or_else(|| self.signer.clone())
+            .ok_or_else(|| Error::Protocol("no writer available to append to this file".into()))?;
+        let mut content = self.read().await?;
+        content.extend_from_slice(data);
+        let prior = self.writer_root().await;
+        crate::overwrite_file(&self.cap, &content, &signer, self.store.clone(), self.mutable.as_ref()).await?;
+        self.migrate_cache(prior, &[&self.cap.map_key]).await;
+        Ok(())
+    }
+
+    /// Shrink this file to `new_size` bytes (`truncate`). No-op if already that small
+    /// or smaller. Currently supports single-chunk files (<= 5 MiB).
+    pub async fn truncate(&self, new_size: u64) -> Result<()> {
+        if self.is_directory() {
+            return Err(Error::Protocol("cannot truncate a directory".into()));
+        }
+        if new_size >= self.size() {
+            return Ok(());
+        }
+        if self.size() > crate::CHUNK_MAX_SIZE {
+            return Err(Error::Protocol("truncate of multi-chunk files is not supported yet".into()));
+        }
+        let signer = crate::recover_signer(&self.cap, self.store.clone(), self.mutable.as_ref())
+            .await
+            .ok()
+            .or_else(|| self.signer.clone())
+            .ok_or_else(|| Error::Protocol("no writer available to truncate this file".into()))?;
+        let content = self.read().await?;
+        let prior = self.writer_root().await;
+        crate::overwrite_file(&self.cap, &content[..new_size as usize], &signer, self.store.clone(), self.mutable.as_ref()).await?;
+        self.migrate_cache(prior, &[&self.cap.map_key]).await;
+        Ok(())
     }
 
     /// Upload a file into this directory and return its wrapper (`uploadFile`).

@@ -271,6 +271,67 @@ async fn get_login_data(
     decrypt_entry_points(static_data, &creds.root)
 }
 
+/// UserStaticData padding block size (`UserStaticData`), same as signup.
+const USER_STATIC_DATA_PADDING: usize = 4096;
+
+/// Change the account password (`UserContext.changePassword`), non-legacy accounts.
+/// Re-derives the login key from `new_password` (keeping the existing salt — the
+/// identity key and WriterData are unchanged), re-encrypts the entry points under
+/// the new root key, and pushes the new login data to the account endpoint. After
+/// this succeeds, sign in again with `new_password`.
+pub async fn change_password(
+    username: &str,
+    old_password: &str,
+    new_password: &str,
+    mfa: Option<&MfaResponder<'_>>,
+    poster: &dyn HttpPoster,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    if old_password == new_password {
+        return Err(Error::Protocol("You must change to a different password.".into()));
+    }
+    let owner = get_public_key_hash(poster, username)
+        .await?
+        .ok_or_else(|| Error::Protocol(format!("Unknown username: {username}")))?;
+    let pointer = mutable.get_pointer_target(&owner, &owner, store.as_ref()).await?;
+    let wd_cid = pointer.updated.ok_or_else(|| Error::Protocol("User has been deleted".into()))?;
+    let wd = store.get(&owner, &wd_cid, None).await?.ok_or_else(|| Error::Protocol("writer data block missing".into()))?;
+    if wd.get("static").is_some() {
+        return Err(Error::Protocol("changing the password of a legacy account is not supported".into()));
+    }
+    let controller = wd
+        .get("controller")
+        .ok_or_else(|| Error::Cbor("WriterData missing 'controller'".into()))
+        .and_then(PublicKeyHash::from_cbor)?;
+    let algo = ScryptParams::from_writer_data(&wd)?;
+
+    // Verify the old password and fetch the current (decrypted) entry points.
+    let old_creds = generate_user(username, old_password, &algo)?;
+    let entry_points_cbor = get_login_data(poster, username, &old_creds, mfa).await?;
+    let (_, identity, _) = parse_entry_points(&entry_points_cbor)?;
+    let identity = identity.ok_or_else(|| Error::Protocol("No identity key in login data".into()))?;
+    let signer = SigningPrivateKeyAndPublicHash::new(controller, identity.secret);
+
+    // Re-key: new login keypair + root from the new password (same salt), then
+    // re-encrypt the same entry points under the new root and re-sign the login data.
+    let new_creds = generate_user(username, new_password, &algo)?;
+    let new_static =
+        crate::cryptree::PaddedCipherText::build(&new_creds.root, &entry_points_cbor, USER_STATIC_DATA_PADDING)?.to_cbor();
+    let login_data = CborObject::map()
+        .put("u", CborObject::Str(username.to_string()))
+        .put("e", new_static)
+        .put("r", new_creds.login_pub.to_cbor())
+        .build();
+    let auth = to_hex(&signer.secret.signature_only(&login_data.to_bytes())?);
+    let url = format!("{LOGIN_URL}setLogin?username={username}&auth={auth}&local=false");
+    let res = poster.post_unzip(&url, login_data.to_bytes(), 0).await?;
+    if res.first().copied() != Some(1) {
+        return Err(Error::Protocol("server rejected the password change".into()));
+    }
+    Ok(())
+}
+
 /// Decrypt a `UserStaticData` (PaddedCipherText) to its `EntryPoints` cbor.
 fn decrypt_entry_points(static_data: &CborObject, root: &SymmetricKey) -> Result<CborObject> {
     crate::cryptree::PaddedCipherText::from_cbor(static_data)?

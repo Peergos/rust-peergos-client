@@ -291,6 +291,185 @@ async fn persist_friend_entry_point(
 
 /// The entry points shared with us by friends (`getFriendsEntryPoints`): each is
 /// a read cap to a friend's `/friend/shared/<us>` folder. Persisted across logins.
+const SHARED_DIR: &str = "shared";
+const SOCIAL_STATE_FILE: &str = ".social-state.cbor";
+const BLOCKED_USERNAMES_FILE: &str = ".blocked-usernames.txt";
+
+/// A snapshot of the user's social state (`getSocialState`). Populated from the
+/// pieces the Rust client tracks; Java additionally carries follower/following
+/// FileWrapper roots, friend annotations and group-name mappings, which this does
+/// not.
+#[derive(Debug, Clone)]
+pub struct SocialState {
+    pub pending_incoming_requests: Vec<ReceivedFollowRequest>,
+    pub pending_outgoing: Vec<String>,
+    pub following: Vec<String>,
+    pub followers: Vec<String>,
+    pub blocked: Vec<String>,
+    /// The friend/following entry-point roots (kept for navigation).
+    pub friends: Vec<EntryPoint>,
+}
+
+/// Read a file named `name` in the user's home directory, if present.
+async fn read_home_child(
+    user: &LoggedInUser,
+    name: &str,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<Option<Vec<u8>>> {
+    let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
+    match list_directory(home, store.clone(), mutable).await?.into_iter().find(|e| e.name == name) {
+        Some(e) => Ok(Some(crate::read_file(&e.cap, store, mutable).await?.1)),
+        None => Ok(None),
+    }
+}
+
+/// The usernames of the people the user follows (`getFollowing`) — the owner names
+/// of their friend roots.
+pub async fn get_following(
+    user: &LoggedInUser,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<Vec<String>> {
+    Ok(get_friends(user, store, mutable).await?.into_iter().map(|e| e.owner_name).collect())
+}
+
+/// The usernames of the user's followers (`getFollowerNames`): the sub-directories
+/// of `/<us>/shared/`, excluding hidden entries and still-pending outgoing requests.
+pub async fn get_follower_names(
+    user: &LoggedInUser,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<Vec<String>> {
+    let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
+    let shared = match list_directory(home, store.clone(), mutable).await?.into_iter().find(|e| e.name == SHARED_DIR) {
+        Some(e) => e.cap,
+        None => return Ok(Vec::new()),
+    };
+    let pending: BTreeSet<String> =
+        get_pending_outgoing(user, store.clone(), mutable).await?.into_iter().collect();
+    Ok(list_directory(&shared, store, mutable)
+        .await?
+        .into_iter()
+        .map(|e| e.name)
+        .filter(|n| !n.starts_with('.') && !pending.contains(n))
+        .collect())
+}
+
+/// The usernames the user has blocked (`getBlocked`) — the newline-separated
+/// `.blocked-usernames.txt` in home.
+pub async fn get_blocked(
+    user: &LoggedInUser,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<Vec<String>> {
+    match read_home_child(user, BLOCKED_USERNAMES_FILE, store, mutable).await? {
+        Some(bytes) => Ok(String::from_utf8_lossy(&bytes)
+            .split('\n')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The usernames of follow requests the user has sent that are not yet accepted
+/// (`getPendingOutgoingFollowRequests`) — from `.social-state.cbor` in home.
+pub async fn get_pending_outgoing(
+    user: &LoggedInUser,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<Vec<String>> {
+    match read_home_child(user, SOCIAL_STATE_FILE, store, mutable).await? {
+        Some(bytes) => {
+            let cbor = CborObject::from_bytes(&bytes)?;
+            Ok(cbor
+                .get("pendingOutgoing")
+                .and_then(|c| c.as_list())
+                .map(|l| l.iter().filter_map(|u| u.as_string().map(|s| s.to_string())).collect())
+                .unwrap_or_default())
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Every file shared with `username`, as `(home-relative dir path, child name,
+/// access)`, by walking the outbound shared-with cache. Used by `removeFollower` to
+/// revoke each one.
+pub async fn collect_shares_for_user(
+    user: &LoggedInUser,
+    username: &str,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<Vec<(String, String, Access)>> {
+    let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
+    let cap_cache = match list_directory(home, store.clone(), mutable).await?.into_iter().find(|e| e.name == CAP_CACHE_DIR) {
+        Some(e) => e.cap,
+        None => return Ok(Vec::new()),
+    };
+    let outbound = match list_directory(&cap_cache, store.clone(), mutable).await?.into_iter().find(|e| e.name == OUTBOUND_DIR) {
+        Some(e) => e.cap,
+        None => return Ok(Vec::new()),
+    };
+    let mut out = Vec::new();
+    walk_outbound(&outbound, String::new(), username, &mut out, store, mutable).await?;
+    Ok(out)
+}
+
+fn walk_outbound<'a>(
+    dir_cap: &'a AbsoluteCapability,
+    prefix: String,
+    username: &'a str,
+    out: &'a mut Vec<(String, String, Access)>,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &'a dyn MutablePointers,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
+    Box::pin(async move {
+        let entries = list_directory(dir_cap, store.clone(), mutable).await?;
+        if let Some(sw) = entries.iter().find(|e| e.name == DIR_CACHE_FILE) {
+            let bytes = crate::read_file(&sw.cap, store.clone(), mutable).await?.1;
+            let state = SharedWithState::from_cbor(&CborObject::from_bytes(&bytes)?);
+            for (child, users) in &state.read {
+                if users.contains(username) {
+                    out.push((prefix.clone(), child.clone(), Access::Read));
+                }
+            }
+            for (child, users) in &state.write {
+                if users.contains(username) {
+                    out.push((prefix.clone(), child.clone(), Access::Write));
+                }
+            }
+        }
+        for e in entries {
+            if e.is_dir == Some(true) && e.name != DIR_CACHE_FILE {
+                let sub = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+                walk_outbound(&e.cap, sub, username, out, store.clone(), mutable).await?;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Block `username` (`unfollow`): add them to `.blocked-usernames.txt` in home. This
+/// stops honouring their follow of us. (Java also removes their local entry-point
+/// mirror; that cleanup is not done here.)
+pub async fn unfollow(
+    user: &LoggedInUser,
+    username: &str,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let mut blocked = get_blocked(user, store.clone(), mutable).await?;
+    if !blocked.iter().any(|b| b == username) {
+        blocked.push(username.to_string());
+    }
+    let content = format!("{}\n", blocked.join("\n"));
+    let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
+    let signer = recover_signer(home, store.clone(), mutable).await?;
+    crate::upload_file(home, BLOCKED_USERNAMES_FILE, content.as_bytes(), None, Some(signer), store, mutable).await?;
+    Ok(())
+}
+
 pub async fn get_friends(
     user: &LoggedInUser,
     store: Arc<dyn ContentAddressedStorage>,
@@ -730,12 +909,56 @@ pub enum Access {
     Write,
 }
 
+/// A recorded secret link, enough to re-mint it under the same label/password when
+/// the target's keys rotate (`LinkProperties`). Cbor `{l,p,u,w,o,[h],[m],[e]}`.
+#[derive(Debug, Clone)]
+pub struct LinkProperties {
+    pub label: i64,
+    pub link_password: String,
+    pub user_password: String,
+    pub writable: bool,
+    pub open: bool,
+    pub max_retrievals: Option<i64>,
+    pub expiry_epoch_secs: Option<i64>,
+}
+
+impl LinkProperties {
+    fn to_cbor(&self) -> CborObject {
+        let mut b = CborObject::map()
+            .put("l", CborObject::Long(self.label))
+            .put("p", CborObject::Str(self.link_password.clone()))
+            .put("u", CborObject::Str(self.user_password.clone()))
+            .put("w", CborObject::Boolean(self.writable))
+            .put("o", CborObject::Boolean(self.open));
+        if let Some(m) = self.max_retrievals {
+            b = b.put("m", CborObject::Long(m));
+        }
+        if let Some(e) = self.expiry_epoch_secs {
+            b = b.put("e", CborObject::Long(e));
+        }
+        b.build()
+    }
+
+    fn from_cbor(cbor: &CborObject) -> Option<LinkProperties> {
+        Some(LinkProperties {
+            label: cbor.get("l")?.as_long()?,
+            link_password: cbor.get("p")?.as_string()?.to_string(),
+            user_password: cbor.get("u").and_then(|c| c.as_string()).unwrap_or("").to_string(),
+            writable: cbor.get("w").and_then(|c| c.as_bool()).unwrap_or(false),
+            open: cbor.get("o").and_then(|c| c.as_bool()).unwrap_or(false),
+            max_retrievals: cbor.get("m").and_then(|c| c.as_long()),
+            expiry_epoch_secs: cbor.get("e").and_then(|c| c.as_long()),
+        })
+    }
+}
+
 /// Who the children of a directory are shared with (`SharedWithState`). Keyed by
-/// child filename → set of usernames. (Links are not tracked here yet.)
+/// child filename → set of usernames (read/write) or list of links.
 #[derive(Debug, Default, Clone)]
 struct SharedWithState {
     read: BTreeMap<String, BTreeSet<String>>,
     write: BTreeMap<String, BTreeSet<String>>,
+    links: BTreeMap<String, Vec<LinkProperties>>,
 }
 
 impl SharedWithState {
@@ -755,7 +978,19 @@ impl SharedWithState {
             }
             out
         };
-        SharedWithState { read: parse("r"), write: parse("w") }
+        let mut links = BTreeMap::new();
+        if let Some(m) = cbor.get("l").and_then(|c| c.as_map()) {
+            for (k, v) in m {
+                let list: Vec<LinkProperties> = v
+                    .as_list()
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter_map(LinkProperties::from_cbor)
+                    .collect();
+                links.insert(k.as_str().to_string(), list);
+            }
+        }
+        SharedWithState { read: parse("r"), write: parse("w"), links }
     }
 
     fn to_cbor(&self) -> CborObject {
@@ -767,10 +1002,17 @@ impl SharedWithState {
             }
             CborObject::Map(inner)
         };
+        let mut links_inner = BTreeMap::new();
+        for (name, ls) in &self.links {
+            links_inner.insert(
+                CborString::new(name.clone()),
+                CborObject::List(ls.iter().map(|l| l.to_cbor()).collect()),
+            );
+        }
         let mut top = BTreeMap::new();
         top.insert(CborString::new("r"), map_to_cbor(&self.read));
         top.insert(CborString::new("w"), map_to_cbor(&self.write));
-        top.insert(CborString::new("l"), CborObject::Map(BTreeMap::new()));
+        top.insert(CborString::new("l"), CborObject::Map(links_inner));
         CborObject::Map(top)
     }
 
@@ -886,6 +1128,56 @@ async fn record_shared_with(
     let mut state = read_shared_with_at(user, &dir_path, store.clone(), mutable).await?;
     state.map(access).entry(filename).or_default().extend(users.iter().cloned());
     write_shared_with_at(user, &dir_path, &state, store, mutable).await
+}
+
+/// Record a secret link minted to the file at home-relative `path` (so it can be
+/// re-minted if the target's keys later rotate). Java `sharedWithCache.addSecretLink`.
+pub async fn record_link(
+    user: &LoggedInUser,
+    path: &str,
+    link: LinkProperties,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let (dir_path, filename) = split_path(path);
+    let mut state = read_shared_with_at(user, &dir_path, store.clone(), mutable).await?;
+    let entry = state.links.entry(filename).or_default();
+    // Replace an existing record for the same label (re-mint), else append.
+    if let Some(existing) = entry.iter_mut().find(|l| l.label == link.label) {
+        *existing = link;
+    } else {
+        entry.push(link);
+    }
+    write_shared_with_at(user, &dir_path, &state, store, mutable).await
+}
+
+/// Forget the recorded secret link with `label` for the file at home-relative
+/// `path` (Java `sharedWithCache.removeSecretLink`).
+pub async fn remove_link(
+    user: &LoggedInUser,
+    path: &str,
+    label: i64,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let (dir_path, filename) = split_path(path);
+    let mut state = read_shared_with_at(user, &dir_path, store.clone(), mutable).await?;
+    if let Some(entry) = state.links.get_mut(&filename) {
+        entry.retain(|l| l.label != label);
+    }
+    write_shared_with_at(user, &dir_path, &state, store, mutable).await
+}
+
+/// The secret links recorded for the file at home-relative `path`.
+pub async fn get_links(
+    user: &LoggedInUser,
+    path: &str,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<Vec<LinkProperties>> {
+    let (dir_path, filename) = split_path(path);
+    let state = read_shared_with_at(user, &dir_path, store, mutable).await?;
+    Ok(state.links.get(&filename).cloned().unwrap_or_default())
 }
 
 /// The usernames the file at home-relative `path` is currently shared with, at the

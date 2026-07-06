@@ -23,21 +23,24 @@ pub mod signup;
 pub mod social;
 pub mod transaction;
 
-pub use capability::{AbsoluteCapability, EncryptedCapability, Location, SecretLink};
-pub use login::{login, EntryPoint, LoggedInUser, MfaResponder};
+pub use capability::{AbsoluteCapability, EncryptedCapability, Location, SecretLink, SecretLinkTarget};
+pub use login::{change_password, login, EntryPoint, LoggedInUser, MfaResponder};
 pub use mfa::{
     current_totp, generate_totp, MfaType, MultiFactorAuthMethod, MultiFactorAuthRequest,
     MultiFactorAuthResponse, TotpKey,
 };
 pub use signup::signup;
 pub use social::{
-    accept_follow_request, add_member_to_group, get_follow_requests, get_friends,
-    get_or_create_groups, get_public_keys, get_shared_with, group_uid,
+    accept_follow_request, add_member_to_group, collect_shares_for_user, get_blocked,
+    get_follow_requests, get_follower_names,
+    get_following, get_friends, get_links, get_or_create_groups, get_pending_outgoing,
+    get_public_keys, get_shared_with, group_uid, unfollow,
     load_read_access_sharing_links, load_write_access_sharing_links, move_file,
-    process_follow_reply, read_shared_capabilities, read_write_shared_capabilities,
-    send_follow_request, share_read_access, share_read_with_group, share_write_access,
+    process_follow_reply, read_shared_capabilities, read_write_shared_capabilities, record_link,
+    remove_link, send_follow_request, share_read_access, share_read_with_group, share_write_access,
     share_write_with_group, unshare_read_access, unshare_write_access, Access, CapabilitiesFromUser,
-    CapabilityWithPath, Groups, ReceivedFollowRequest, FOLLOWERS_GROUP, FRIENDS_GROUP,
+    CapabilityWithPath, Groups, LinkProperties, ReceivedFollowRequest, SocialState, FOLLOWERS_GROUP,
+    FRIENDS_GROUP,
 };
 pub use cryptree::{
     ChildrenLinks, CryptreeNode, FileProperties, NamedRelativeCapability, RelativeCapability,
@@ -69,7 +72,7 @@ use peergos_core::storage::{
 };
 use peergos_core::symmetric::SymmetricKey;
 use peergos_core::{
-    identity_key_hasher, BatWithId, ChampWrapper, ChunkMirrorCap, FallbackStorage, RamStorage,
+    identity_key_hasher, BatWithId, Champ, ChampWrapper, ChunkMirrorCap, FallbackStorage, RamStorage,
     MAX_CHAMP_GETS,
 };
 use peergos_crypto::random_bytes;
@@ -108,6 +111,153 @@ pub async fn retrieve_secret_link_capability(
         link.link_password.clone()
     };
     enc.decrypt_from_password(&label, &password)
+}
+
+/// Generate a shareable secret link that grants exactly `cap` and return its link
+/// string (`UserContext.createSecretLink` / `updateSecretLink`). The encrypted
+/// capability is stored under a fresh random label in the identity writer's
+/// secret-link CHAMP (mirror-BAT gated for privacy) and committed. Pass a read-only
+/// cap for a read link, or a writable cap for a write link — for a writable link the
+/// caller must have already relocated the target into its own writing space (Java's
+/// invariant; [`UserContext::create_secret_link`] does this via
+/// [`move_dir_to_own_writer`]).
+#[allow(clippy::too_many_arguments)]
+pub async fn create_secret_link(
+    cap: &AbsoluteCapability,
+    user_password: &str,
+    expiry_epoch_secs: Option<i64>,
+    max_retrievals: Option<i64>,
+    signer: &SigningPrivateKeyAndPublicHash,
+    mirror_bat: Option<&BatWithId>,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<SecretLink> {
+    let link = SecretLink::create(cap.owner.clone())?;
+    put_secret_link(cap, &link, user_password, expiry_epoch_secs, max_retrievals, signer, mirror_bat, store, mutable).await?;
+    Ok(link)
+}
+
+/// Store (or overwrite) the secret link `link` mapping `cap`, under `link`'s label —
+/// used both to mint a fresh link and to RE-MINT an existing one under the same
+/// label/password after the target's keys rotate (Java `updateSecretLink`).
+#[allow(clippy::too_many_arguments)]
+pub async fn put_secret_link(
+    cap: &AbsoluteCapability,
+    link: &SecretLink,
+    user_password: &str,
+    expiry_epoch_secs: Option<i64>,
+    max_retrievals: Option<i64>,
+    signer: &SigningPrivateKeyAndPublicHash,
+    mirror_bat: Option<&BatWithId>,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let full_password = format!("{}{}", link.link_password, user_password);
+    let has_user_password = !user_password.is_empty();
+    let enc = EncryptedCapability::create_from_password(cap, &link.label_string(), &full_password, has_user_password)?;
+    let target = SecretLinkTarget { cap: enc, expiry_epoch_secs, max_retrievals };
+    add_secret_link(&cap.owner, signer, link.label, &target, mirror_bat, &store, mutable).await
+}
+
+/// The secret-link CHAMP key for a label: sha256 of its 8 little-endian bytes
+/// (`SecretLinkChamp.keyToBytes`).
+fn secret_link_key(label: i64) -> Vec<u8> {
+    peergos_crypto::hash::sha256(&label.to_le_bytes())
+}
+
+/// Set a `MerkleLink` field on a WriterData cbor map (preserving all other fields).
+fn writer_data_with_link_field(wd: &CborObject, field: &str, cid: &Cid) -> Result<CborObject> {
+    let mut map = match wd {
+        CborObject::Map(m) => m.clone(),
+        _ => return Err(Error::Cbor("WriterData is not a map".into())),
+    };
+    map.insert(peergos_cbor::CborString::new(field), CborObject::MerkleLink(cid.to_bytes()));
+    Ok(CborObject::Map(map))
+}
+
+/// Store `target` under `label` in the identity writer's secret-link CHAMP
+/// (`WriterData.addLink`) and commit the identity pointer.
+async fn add_secret_link(
+    identity: &PublicKeyHash,
+    signer: &SigningPrivateKeyAndPublicHash,
+    label: i64,
+    target: &SecretLinkTarget,
+    mirror_bat: Option<&BatWithId>,
+    store: &Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let pointer = mutable.get_pointer_target(identity, &signer.public_key_hash, store.as_ref()).await?;
+    let wd_cid = pointer.updated.clone().ok_or_else(|| Error::Protocol("identity has no data".into()))?;
+    let wd = store.get(identity, &wd_cid, None).await?.ok_or_else(|| Error::Protocol("writer data missing".into()))?;
+    let tid = store.start_transaction(identity).await?;
+
+    // Get or create the links champ; a fresh one embeds the mirror BAT so the
+    // stored links stay private.
+    let links_root = match wd.get("links").and_then(|c| c.as_link()) {
+        Some(link) => Cid::cast(link)?,
+        None => {
+            let mut empty = Champ::empty();
+            empty.mirror_bat = mirror_bat.map(|b| b.id());
+            put_block_signed(store.as_ref(), identity, signer, empty.serialize(), &tid).await?
+        }
+    };
+    // The champ key is already sha256(label); the champ positions by it directly
+    // (identity hasher), matching Java's SecretLinkChamp.
+    let mut champ =
+        ChampWrapper::create(identity.clone(), links_root, mirror_bat, store.clone(), identity_key_hasher()).await?;
+
+    // Store the target block, then map label -> MerkleLink(target).
+    let value_cid = put_block_signed(store.as_ref(), identity, signer, target.to_cbor().to_bytes(), &tid).await?;
+    let key = secret_link_key(label);
+    let expected = champ.get(&key).await?;
+    champ.put(signer, &key, &expected, Some(CborObject::MerkleLink(value_cid.to_bytes())), &tid).await?;
+
+    // Update WriterData.links and commit the identity pointer.
+    let new_wd = writer_data_with_link_field(&wd, "links", champ.root_hash())?;
+    let new_wd_cid = put_block_signed(store.as_ref(), identity, signer, new_wd.to_bytes(), &tid).await?;
+    let update = PointerUpdate::new(Some(wd_cid), Some(new_wd_cid), PointerUpdate::increment(pointer.sequence));
+    if !mutable.set_pointer_update(identity, signer, &update).await? {
+        return Err(Error::Protocol("secret-link pointer rejected (concurrent modification?)".into()));
+    }
+    store.close_transaction(identity, &tid).await?;
+    Ok(())
+}
+
+/// Remove the secret link `label` from the identity writer's secret-link CHAMP and
+/// commit (`WriterData.removeLink` / `UserContext.deleteSecretLink`). No-op if the
+/// user has no links or the label is absent.
+pub async fn delete_secret_link(
+    identity: &PublicKeyHash,
+    signer: &SigningPrivateKeyAndPublicHash,
+    label: i64,
+    mirror_bat: Option<&BatWithId>,
+    store: &Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let pointer = mutable.get_pointer_target(identity, &signer.public_key_hash, store.as_ref()).await?;
+    let wd_cid = pointer.updated.clone().ok_or_else(|| Error::Protocol("identity has no data".into()))?;
+    let wd = store.get(identity, &wd_cid, None).await?.ok_or_else(|| Error::Protocol("writer data missing".into()))?;
+    let links_root = match wd.get("links").and_then(|c| c.as_link()) {
+        Some(link) => Cid::cast(link)?,
+        None => return Ok(()), // no links at all
+    };
+    let tid = store.start_transaction(identity).await?;
+    let mut champ =
+        ChampWrapper::create(identity.clone(), links_root, mirror_bat, store.clone(), identity_key_hasher()).await?;
+    let key = secret_link_key(label);
+    let expected = champ.get(&key).await?;
+    if expected.is_none() {
+        return Ok(()); // label not present
+    }
+    champ.remove(signer, &key, &expected, &tid).await?;
+    let new_wd = writer_data_with_link_field(&wd, "links", champ.root_hash())?;
+    let new_wd_cid = put_block_signed(store.as_ref(), identity, signer, new_wd.to_bytes(), &tid).await?;
+    let update = PointerUpdate::new(Some(wd_cid), Some(new_wd_cid), PointerUpdate::increment(pointer.sequence));
+    if !mutable.set_pointer_update(identity, signer, &update).await? {
+        return Err(Error::Protocol("secret-link delete pointer rejected".into()));
+    }
+    store.close_transaction(identity, &tid).await?;
+    Ok(())
 }
 
 /// Open the champ tree of the capability's writer (writer pointer →
@@ -1650,6 +1800,193 @@ pub async fn move_dir_to_own_writer(
     Ok(new_dir)
 }
 
+/// Create a **single-chunk file** in a fresh writer subspace owned by the parent
+/// writer, holding `content` under new keys with a writer link (so it is writable),
+/// and return its writable capability. The file is NOT yet linked into the parent —
+/// the caller adds a link node (see [`move_file_to_own_writer`]). Mirrors the file
+/// arm of Java `rotateAllKeys`.
+#[allow(clippy::too_many_arguments)]
+async fn create_writable_shared_file(
+    parent_cap: &AbsoluteCapability,
+    name: &str,
+    content: &[u8],
+    old_props: &FileProperties,
+    entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<AbsoluteCapability> {
+    if content.len() as u64 > retrieve::CHUNK_MAX_SIZE {
+        return Err(Error::Protocol(
+            "writable links to multi-chunk files are not supported yet".into(),
+        ));
+    }
+    let owner = &parent_cap.owner;
+    let parent_writer = parent_writer_signer(parent_cap, &entry_signer, store.clone(), mutable).await?;
+    let parent_writer_hash = parent_writer.public_key_hash.clone();
+
+    // A fresh writer keypair (inline identity-multihash hash).
+    let (wpub, wsec64) =
+        peergos_crypto::sign::keypair_from_seed(&random_bytes(32)).map_err(|e| Error::Crypto(e.to_string()))?;
+    let writer_hash = PublicSigningKey::new(wpub.to_vec()).hash()?;
+    let writer = SigningPrivateKeyAndPublicHash::new(writer_hash.clone(), SecretSigningKey::new(wsec64.to_vec()));
+
+    // Fresh file keys/location.
+    let file_r = random_symmetric_key()?;
+    let file_w = loop {
+        let k = random_symmetric_key()?;
+        if k != file_r {
+            break k;
+        }
+    };
+    let file_data_key = loop {
+        let k = random_symmetric_key()?;
+        if k != file_r {
+            break k;
+        }
+    };
+    let file_map_key = random_bytes(32);
+    let file_bat = Bat::new(random_bytes(32))?;
+    let stream_secret = random_bytes(32);
+
+    let tid = store.start_transaction(owner).await?;
+
+    // --- 1. Register the new writer as owned by the parent writer (must precede
+    // any block signed by the new writer).
+    let pw_pointer = mutable.get_pointer_target(owner, &parent_writer_hash, store.as_ref()).await?;
+    let pw_wd_cid = pw_pointer.updated.clone().ok_or_else(|| Error::Protocol("parent writer has no data".into()))?;
+    let pw_wd = store.get(owner, &pw_wd_cid, None).await?.ok_or_else(|| Error::Protocol("parent writer data missing".into()))?;
+    let owned_root = Cid::cast(
+        pw_wd.get("owned").and_then(|c| c.as_link()).ok_or_else(|| Error::Protocol("parent writer has no owned champ".into()))?,
+    )?;
+    let signed_owner = writer.secret.sign_message(&parent_writer_hash.to_cbor().to_bytes())?;
+    let owner_proof = CborObject::map()
+        .put("o", writer_hash.to_cbor())
+        .put("p", CborObject::ByteString(signed_owner))
+        .build();
+    let proof_cid = put_block_signed(store.as_ref(), owner, &parent_writer, owner_proof.to_bytes(), &tid).await?;
+    let mut owned_champ = ChampWrapper::create(owner.clone(), owned_root, None, store.clone(), identity_key_hasher()).await?;
+    let mut owned_key = writer_hash.to_cbor().to_bytes();
+    owned_key.reverse();
+    owned_champ.put(&parent_writer, &owned_key, &None, Some(CborObject::MerkleLink(proof_cid.to_bytes())), &tid).await?;
+    let new_pw_wd = writer_data_with_owned(&pw_wd, owned_champ.root_hash())?;
+    let new_pw_wd_cid = put_block_signed(store.as_ref(), owner, &parent_writer, new_pw_wd.to_bytes(), &tid).await?;
+    let pw_update = PointerUpdate::new(Some(pw_wd_cid), Some(new_pw_wd_cid), PointerUpdate::increment(pw_pointer.sequence));
+    if !mutable.set_pointer_update(owner, &parent_writer, &pw_update).await? {
+        return Err(Error::Protocol("parent writer pointer rejected".into()));
+    }
+
+    // --- 2. Build the file's chunk-0 node (with a writer link) in the new writer.
+    let writer_link = peergos_core::symmetric::CipherText::build(&file_w, &writer)?.to_cbor();
+    let next_chunk = RelCap::subsequent_chunk(random_bytes(32), Some(Bat::new(random_bytes(32))?), file_r.clone());
+    let from_base = CborObject::map()
+        .put("k", file_data_key.to_cbor())
+        .put("w", writer_link)
+        .put("n", next_chunk.to_cbor())
+        .build();
+    let mime = mimetype::calculate_mime_type(content, name);
+    let mut props = FileProperties::new_file(
+        name.to_string(),
+        mime,
+        content.len() as u64,
+        old_props.created_epoch,
+        stream_secret,
+        old_props.thumbnail.clone(),
+    );
+    props.tree_hash = Some(hashtree::HashTree::build(&[peergos_crypto::hash::sha256(content)])?.branch(0));
+    let parent_node = retrieve_file_metadata(parent_cap, store.clone(), mutable).await?.0;
+    let to_parent = RelCap {
+        writer: Some(parent_cap.writer.clone()),
+        map_key: parent_cap.map_key.clone(),
+        bat: parent_cap.bat.clone(),
+        r_base_key: parent_node.get_parent_key(&parent_cap.r_base_key),
+        w_base_key_link: None,
+    };
+    let from_parent = CborObject::map().put("p", to_parent.to_cbor()).put("s", props.to_cbor()).build();
+    let (data, fragments) = retrieve::FragmentedPaddedCipherText::build(
+        &file_data_key,
+        &CborObject::ByteString(content.to_vec()),
+        MIN_FRAGMENT_SIZE,
+        None,
+    )?;
+    let node = CryptreeNode::new(
+        false,
+        vec![BatId::inline(&file_bat)?.to_cbor()],
+        PaddedCipherText::build(&file_r, &from_base, BASE_BLOCK_PADDING_BLOCKSIZE)?,
+        PaddedCipherText::build(&file_r, &from_parent, META_DATA_PADDING_BLOCKSIZE)?,
+        data.to_cbor(),
+    );
+    put_raw_blocks_signed(store.as_ref(), owner, &writer, fragments, &tid).await?;
+    let node_cid = put_block_signed(store.as_ref(), owner, &writer, node.to_cbor().to_bytes(), &tid).await?;
+
+    // --- 3. The new writer's subspace: a champ holding the file's chunk-0 node.
+    let writer_owned = put_block_signed(store.as_ref(), owner, &writer, peergos_core::Champ::empty().serialize(), &tid).await?;
+    let fs_empty = put_block_signed(store.as_ref(), owner, &writer, peergos_core::Champ::empty().serialize(), &tid).await?;
+    let mut fs_champ = ChampWrapper::create(owner.clone(), fs_empty, None, store.clone(), identity_key_hasher()).await?;
+    fs_champ.put(&writer, &file_map_key, &None, Some(CborObject::MerkleLink(node_cid.to_bytes())), &tid).await?;
+    let writer_wd = CborObject::map()
+        .put("controller", writer_hash.to_cbor())
+        .put("owned", CborObject::MerkleLink(writer_owned.to_bytes()))
+        .put("tree", CborObject::MerkleLink(fs_champ.root_hash().to_bytes()))
+        .build();
+    let writer_wd_cid = put_block_signed(store.as_ref(), owner, &writer, writer_wd.to_bytes(), &tid).await?;
+    let writer_update = PointerUpdate::new(None, Some(writer_wd_cid), PointerUpdate::increment(None));
+    if !mutable.set_pointer_update(owner, &writer, &writer_update).await? {
+        return Err(Error::Protocol("new writer pointer rejected".into()));
+    }
+    store.close_transaction(owner, &tid).await?;
+
+    AbsoluteCapability::new(owner.clone(), writer_hash, file_map_key, Some(file_bat), file_r, Some(file_w))
+}
+
+/// Move the file `child_name` in `parent_cap` into its **own writer subspace** so
+/// write access to it can be granted (Java `shareWriteAccessWith`/`rotateAllKeys`
+/// for a file). No-op returning the writable cap if it already has its own writer;
+/// otherwise the file is re-encrypted into a fresh writer, linked into the parent
+/// via a link node, and the old chunk removed. Returns the writable capability.
+pub async fn move_file_to_own_writer(
+    parent_cap: &AbsoluteCapability,
+    child_name: &str,
+    entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<AbsoluteCapability> {
+    let old = list_directory(parent_cap, store.clone(), mutable)
+        .await?
+        .into_iter()
+        .find(|e| e.name == child_name)
+        .ok_or_else(|| Error::Protocol(format!("no such child: {child_name}")))?;
+    if old.is_dir == Some(true) {
+        return Err(Error::Protocol("move_file_to_own_writer is for files; use move_dir_to_own_writer".into()));
+    }
+    if !old.cap.is_writable() {
+        return Err(Error::Protocol("cannot grant write access without a writable capability".into()));
+    }
+    // Already in its own writer subspace — just hand back its writable cap.
+    if old.cap.writer != parent_cap.writer {
+        return Ok(old.cap);
+    }
+    let (_node, old_props) = retrieve_file_metadata(&old.cap, store.clone(), mutable).await?;
+    let (_props, content) = read_file(&old.cap, store.clone(), mutable).await?;
+
+    let new_cap =
+        create_writable_shared_file(parent_cap, child_name, &content, &old_props, entry_signer.clone(), store.clone(), mutable)
+            .await?;
+    create_link_node(
+        parent_cap,
+        child_name,
+        &new_cap,
+        false,
+        Some(old_props.mime_type.clone()),
+        old_props.created_epoch,
+        entry_signer.clone(),
+        store.clone(),
+        mutable,
+    )
+    .await?;
+    remove_orphaned_subtree(parent_cap, &old.cap, entry_signer, &store, mutable).await?;
+    Ok(new_cap)
+}
+
 /// Remove `writer_to_remove` from `parent_cap`'s writer's owned-key champ
 /// (`CryptreeNode.deAuthoriseSigner`): the server will then reject any further
 /// writes signed by that key.
@@ -1692,6 +2029,24 @@ async fn deauthorize_writer(
         return Err(Error::Protocol("deauthorise pointer rejected".into()));
     }
     store.close_transaction(owner, &tid).await?;
+    Ok(())
+}
+
+/// Delete the account's filesystem (`UserContext.deleteAccount`): null the home
+/// writer's mutable pointer and then the identity pointer (CAS to empty, each signed
+/// by its own key). Irreversible; leaves the account with no readable data.
+pub async fn delete_account(
+    identity: &PublicKeyHash,
+    identity_signer: &SigningPrivateKeyAndPublicHash,
+    home_cap: &AbsoluteCapability,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    // Null the home writer FIRST, while the identity's owned-key set still
+    // authorises it; then null the identity pointer.
+    let home_signer = recover_signer(home_cap, store.clone(), mutable).await?;
+    delete_writer_subspace(identity, &home_signer, &store, mutable).await?;
+    delete_writer_subspace(identity, identity_signer, &store, mutable).await?;
     Ok(())
 }
 
