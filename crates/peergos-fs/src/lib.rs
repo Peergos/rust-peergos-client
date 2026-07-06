@@ -1815,11 +1815,6 @@ async fn create_writable_shared_file(
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<AbsoluteCapability> {
-    if content.len() as u64 > retrieve::CHUNK_MAX_SIZE {
-        return Err(Error::Protocol(
-            "writable links to multi-chunk files are not supported yet".into(),
-        ));
-    }
     let owner = &parent_cap.owner;
     let parent_writer = parent_writer_signer(parent_cap, &entry_signer, store.clone(), mutable).await?;
     let parent_writer_hash = parent_writer.public_key_hash.clone();
@@ -1875,24 +1870,9 @@ async fn create_writable_shared_file(
         return Err(Error::Protocol("parent writer pointer rejected".into()));
     }
 
-    // --- 2. Build the file's chunk-0 node (with a writer link) in the new writer.
+    // --- 2. Write the file's chunk nodes (writer link on chunk 0) in the new writer.
     let writer_link = peergos_core::symmetric::CipherText::build(&file_w, &writer)?.to_cbor();
-    let next_chunk = RelCap::subsequent_chunk(random_bytes(32), Some(Bat::new(random_bytes(32))?), file_r.clone());
-    let from_base = CborObject::map()
-        .put("k", file_data_key.to_cbor())
-        .put("w", writer_link)
-        .put("n", next_chunk.to_cbor())
-        .build();
     let mime = mimetype::calculate_mime_type(content, name);
-    let mut props = FileProperties::new_file(
-        name.to_string(),
-        mime,
-        content.len() as u64,
-        old_props.created_epoch,
-        stream_secret,
-        old_props.thumbnail.clone(),
-    );
-    props.tree_hash = Some(hashtree::HashTree::build(&[peergos_crypto::hash::sha256(content)])?.branch(0));
     let parent_node = retrieve_file_metadata(parent_cap, store.clone(), mutable).await?.0;
     let to_parent = RelCap {
         writer: Some(parent_cap.writer.clone()),
@@ -1901,28 +1881,33 @@ async fn create_writable_shared_file(
         r_base_key: parent_node.get_parent_key(&parent_cap.r_base_key),
         w_base_key_link: None,
     };
-    let from_parent = CborObject::map().put("p", to_parent.to_cbor()).put("s", props.to_cbor()).build();
-    let (data, fragments) = retrieve::FragmentedPaddedCipherText::build(
+    let chunks = write_file_chunks(
+        owner,
+        &writer,
+        &file_map_key,
+        &Some(file_bat.clone()),
+        &file_r,
         &file_data_key,
-        &CborObject::ByteString(content.to_vec()),
-        MIN_FRAGMENT_SIZE,
-        None,
-    )?;
-    let node = CryptreeNode::new(
-        false,
-        vec![BatId::inline(&file_bat)?.to_cbor()],
-        PaddedCipherText::build(&file_r, &from_base, BASE_BLOCK_PADDING_BLOCKSIZE)?,
-        PaddedCipherText::build(&file_r, &from_parent, META_DATA_PADDING_BLOCKSIZE)?,
-        data.to_cbor(),
-    );
-    put_raw_blocks_signed(store.as_ref(), owner, &writer, fragments, &tid).await?;
-    let node_cid = put_block_signed(store.as_ref(), owner, &writer, node.to_cbor().to_bytes(), &tid).await?;
+        &stream_secret,
+        &to_parent,
+        Some(&writer_link),
+        name,
+        &mime,
+        old_props.created_epoch,
+        &old_props.thumbnail,
+        content,
+        &store,
+        &tid,
+    )
+    .await?;
 
-    // --- 3. The new writer's subspace: a champ holding the file's chunk-0 node.
+    // --- 3. The new writer's subspace: a champ holding all the file's chunk nodes.
     let writer_owned = put_block_signed(store.as_ref(), owner, &writer, peergos_core::Champ::empty().serialize(), &tid).await?;
     let fs_empty = put_block_signed(store.as_ref(), owner, &writer, peergos_core::Champ::empty().serialize(), &tid).await?;
     let mut fs_champ = ChampWrapper::create(owner.clone(), fs_empty, None, store.clone(), identity_key_hasher()).await?;
-    fs_champ.put(&writer, &file_map_key, &None, Some(CborObject::MerkleLink(node_cid.to_bytes())), &tid).await?;
+    for (mk, cid) in &chunks {
+        fs_champ.put(&writer, mk, &None, Some(CborObject::MerkleLink(cid.to_bytes())), &tid).await?;
+    }
     let writer_wd = CborObject::map()
         .put("controller", writer_hash.to_cbor())
         .put("owned", CborObject::MerkleLink(writer_owned.to_bytes()))
@@ -2213,6 +2198,170 @@ async fn reupload_node(
     let update = PointerUpdate::new(Some(wd_cid), Some(new_wd_cid), PointerUpdate::increment(pointer.sequence));
     if !mutable.set_pointer_update(owner, signer, &update).await? {
         return Err(Error::Protocol("node reupload pointer rejected".into()));
+    }
+    store.close_transaction(owner, &tid).await?;
+    Ok(())
+}
+
+/// Write every chunk node for a file holding `content`, encrypting fragments and
+/// nodes into `store` under `signer`, and return `(map_key, node_cid)` per chunk.
+/// Chunk map-keys/BATs derive from `first_map_key`/`first_bat` via `stream_secret`;
+/// `writer_link` (if any) is embedded in chunk 0's base block for own-writer files.
+/// Shared by full-file rewrite ([`rewrite_file_content`]) and own-writer relocation.
+#[allow(clippy::too_many_arguments)]
+async fn write_file_chunks(
+    owner: &PublicKeyHash,
+    signer: &SigningPrivateKeyAndPublicHash,
+    first_map_key: &[u8],
+    first_bat: &Option<Bat>,
+    r_base_key: &SymmetricKey,
+    data_key: &SymmetricKey,
+    stream_secret: &[u8],
+    to_parent: &RelCap,
+    writer_link: Option<&CborObject>,
+    name: &str,
+    mime: &str,
+    created: i64,
+    thumbnail: &Option<(String, Vec<u8>)>,
+    content: &[u8],
+    store: &Arc<dyn ContentAddressedStorage>,
+    tid: &TransactionId,
+) -> Result<Vec<(Vec<u8>, Cid)>> {
+    let chunk_size = retrieve::CHUNK_MAX_SIZE as usize;
+    let n_chunks = if content.is_empty() { 1 } else { content.len().div_ceil(chunk_size) };
+    let hashes: Vec<Vec<u8>> = (0..n_chunks)
+        .map(|i| peergos_crypto::hash::sha256(&content[i * chunk_size..((i + 1) * chunk_size).min(content.len())]))
+        .collect();
+    let tree = hashtree::HashTree::build(&hashes)?;
+
+    let mut out = Vec::with_capacity(n_chunks);
+    let mut map_key = first_map_key.to_vec();
+    let mut bat = first_bat.clone();
+    for i in 0..n_chunks {
+        let slice = &content[i * chunk_size..((i + 1) * chunk_size).min(content.len())];
+        let (next_map_key, next_bat) = retrieve::calculate_next_map_key(stream_secret, &map_key, &bat)?;
+        let (data, fragments) = retrieve::FragmentedPaddedCipherText::build(
+            data_key,
+            &CborObject::ByteString(slice.to_vec()),
+            MIN_FRAGMENT_SIZE,
+            None,
+        )?;
+        put_raw_blocks_signed(store.as_ref(), owner, signer, fragments, tid).await?;
+        let next_chunk = RelCap::subsequent_chunk(next_map_key.clone(), next_bat.clone(), r_base_key.clone());
+        let mut fb = CborObject::map().put("k", data_key.to_cbor());
+        if i == 0 {
+            if let Some(w) = writer_link {
+                fb = fb.put("w", w.clone());
+            }
+        }
+        let from_base = fb.put("n", next_chunk.to_cbor()).build();
+        let mut props = FileProperties::new_file(
+            name.to_string(),
+            mime.to_string(),
+            content.len() as u64,
+            created,
+            stream_secret.to_vec(),
+            if i == 0 { thumbnail.clone() } else { None },
+        );
+        if i % 1024 == 0 {
+            props.tree_hash = Some(tree.branch(i as u64));
+        }
+        let from_parent = CborObject::map().put("p", to_parent.to_cbor()).put("s", props.to_cbor()).build();
+        let inline_bat = bat.as_ref().map(|b| BatId::inline(b).map(|id| id.to_cbor())).transpose()?.into_iter().collect();
+        let node = CryptreeNode::new(
+            false,
+            inline_bat,
+            PaddedCipherText::build(r_base_key, &from_base, BASE_BLOCK_PADDING_BLOCKSIZE)?,
+            PaddedCipherText::build(r_base_key, &from_parent, META_DATA_PADDING_BLOCKSIZE)?,
+            data.to_cbor(),
+        );
+        let cid = put_block_signed(store.as_ref(), owner, signer, node.to_cbor().to_bytes(), tid).await?;
+        out.push((map_key.clone(), cid));
+        map_key = next_map_key;
+        bat = next_bat;
+    }
+    Ok(out)
+}
+
+/// Rewrite a file's entire content in place, keeping its capability (any size).
+/// Re-encrypts all chunks under the file's existing keys at their existing map-keys
+/// (preserved via the stream secret), removes any now-surplus trailing chunks, and
+/// commits in one pointer update. The content hash-tree is recomputed for the new
+/// content. Backs multi-chunk `truncate`/`append`.
+pub async fn rewrite_file_content(
+    cap: &AbsoluteCapability,
+    new_content: &[u8],
+    signer: &SigningPrivateKeyAndPublicHash,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let (node, old_props) = retrieve_file_metadata(cap, store.clone(), mutable).await?;
+    if node.is_directory() {
+        return Err(Error::Protocol("cannot rewrite a directory".into()));
+    }
+    let r_base = &cap.r_base_key;
+    let base = node.base_block(r_base)?;
+    let data_key = node.get_data_key(r_base)?;
+    let writer_link = base.signer.clone();
+    let to_parent = node.parent_link(r_base)?.ok_or_else(|| Error::Protocol("file has no parent link".into()))?;
+    let stream_secret = old_props
+        .stream_secret
+        .clone()
+        .ok_or_else(|| Error::Protocol("file without a stream secret".into()))?;
+    let old_n = chunk_count(old_props.size);
+
+    let owner = &cap.owner;
+    let pointer = mutable.get_pointer_target(owner, &cap.writer, store.as_ref()).await?;
+    let wd_cid = pointer.updated.clone().ok_or_else(|| Error::Protocol("writer has no data".into()))?;
+    let wd = store.get(owner, &wd_cid, None).await?.ok_or_else(|| Error::Protocol("writer data missing".into()))?;
+    let tree_root = Cid::cast(wd.get("tree").and_then(|c| c.as_link()).ok_or_else(|| Error::Protocol("no champ tree".into()))?)?;
+    let mut champ = ChampWrapper::create(owner.clone(), tree_root, None, store.clone(), identity_key_hasher()).await?;
+    let tid = store.start_transaction(owner).await?;
+
+    let new_chunks = write_file_chunks(
+        owner,
+        signer,
+        &cap.map_key,
+        &cap.bat,
+        r_base,
+        &data_key,
+        &stream_secret,
+        &to_parent,
+        writer_link.as_ref(),
+        &old_props.name,
+        &old_props.mime_type,
+        old_props.created_epoch,
+        &old_props.thumbnail,
+        new_content,
+        &store,
+        &tid,
+    )
+    .await?;
+    let new_n = new_chunks.len() as u64;
+    for (mk, cid) in &new_chunks {
+        let expected = champ.get(mk).await?;
+        champ.put(signer, mk, &expected, Some(CborObject::MerkleLink(cid.to_bytes())), &tid).await?;
+    }
+    // Drop trailing chunks that the shorter new content no longer needs.
+    let mut mk = cap.map_key.clone();
+    let mut bat = cap.bat.clone();
+    for i in 0..old_n {
+        if i >= new_n {
+            let expected = champ.get(&mk).await?;
+            if expected.is_some() {
+                champ.remove(signer, &mk, &expected, &tid).await?;
+            }
+        }
+        let (nmk, nbat) = retrieve::calculate_next_map_key(&stream_secret, &mk, &bat)?;
+        mk = nmk;
+        bat = nbat;
+    }
+
+    let new_wd = writer_data_with_tree(&wd, champ.root_hash())?;
+    let new_wd_cid = put_block_signed(store.as_ref(), owner, signer, new_wd.to_bytes(), &tid).await?;
+    let update = PointerUpdate::new(Some(wd_cid), Some(new_wd_cid), PointerUpdate::increment(pointer.sequence));
+    if !mutable.set_pointer_update(owner, signer, &update).await? {
+        return Err(Error::Protocol("file rewrite pointer rejected (concurrent modification?)".into()));
     }
     store.close_transaction(owner, &tid).await?;
     Ok(())

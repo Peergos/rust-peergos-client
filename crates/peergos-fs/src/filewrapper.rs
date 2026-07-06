@@ -362,8 +362,8 @@ impl FileWrapper {
         Ok(())
     }
 
-    /// Append `data` to the end of this file (`appendFile`). Currently supports the
-    /// result staying within a single chunk (<= 5 MiB). Requires write access.
+    /// Append `data` to the end of this file (`appendFile`), any resulting size.
+    /// Requires write access.
     pub async fn append(&self, data: &[u8]) -> Result<()> {
         if self.is_directory() {
             return Err(Error::Protocol("cannot append to a directory".into()));
@@ -371,24 +371,13 @@ impl FileWrapper {
         if data.is_empty() {
             return Ok(());
         }
-        if self.size() + data.len() as u64 > crate::CHUNK_MAX_SIZE {
-            return Err(Error::Protocol("append that would cross a chunk boundary is not supported yet".into()));
-        }
-        let signer = crate::recover_signer(&self.cap, self.store.clone(), self.mutable.as_ref())
-            .await
-            .ok()
-            .or_else(|| self.signer.clone())
-            .ok_or_else(|| Error::Protocol("no writer available to append to this file".into()))?;
         let mut content = self.read().await?;
         content.extend_from_slice(data);
-        let prior = self.writer_root().await;
-        crate::overwrite_file(&self.cap, &content, &signer, self.store.clone(), self.mutable.as_ref()).await?;
-        self.migrate_cache(prior, &[&self.cap.map_key]).await;
-        Ok(())
+        self.rewrite(&content).await
     }
 
-    /// Shrink this file to `new_size` bytes (`truncate`). No-op if already that small
-    /// or smaller. Currently supports single-chunk files (<= 5 MiB).
+    /// Shrink this file to `new_size` bytes (`truncate`), any file size. No-op if
+    /// already that small or smaller. Requires write access.
     pub async fn truncate(&self, new_size: u64) -> Result<()> {
         if self.is_directory() {
             return Err(Error::Protocol("cannot truncate a directory".into()));
@@ -396,17 +385,19 @@ impl FileWrapper {
         if new_size >= self.size() {
             return Ok(());
         }
-        if self.size() > crate::CHUNK_MAX_SIZE {
-            return Err(Error::Protocol("truncate of multi-chunk files is not supported yet".into()));
-        }
+        let content = self.read().await?;
+        self.rewrite(&content[..new_size as usize]).await
+    }
+
+    /// Replace the file's whole content (any size), keeping its capability.
+    async fn rewrite(&self, content: &[u8]) -> Result<()> {
         let signer = crate::recover_signer(&self.cap, self.store.clone(), self.mutable.as_ref())
             .await
             .ok()
             .or_else(|| self.signer.clone())
-            .ok_or_else(|| Error::Protocol("no writer available to truncate this file".into()))?;
-        let content = self.read().await?;
+            .ok_or_else(|| Error::Protocol("no writer available to modify this file".into()))?;
         let prior = self.writer_root().await;
-        crate::overwrite_file(&self.cap, &content[..new_size as usize], &signer, self.store.clone(), self.mutable.as_ref()).await?;
+        crate::rewrite_file_content(&self.cap, content, &signer, self.store.clone(), self.mutable.as_ref()).await?;
         self.migrate_cache(prior, &[&self.cap.map_key]).await;
         Ok(())
     }
