@@ -101,6 +101,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("streamed a {} MiB file in {:.2}s", BIG / 1024 / 1024, started3.elapsed().as_secs_f64());
     let bigf = ctx.get_by_path(&format!("bulk{n}/big.bin")).await?.expect("big file");
     assert_eq!(bigf.size(), BIG, "streamed file size must match");
+    // The upload computed the content hash tree as it streamed and set it, even
+    // though no hash was supplied and it went through the transaction path.
+    assert!(bigf.properties().tree_hash.is_some(), "a streamed upload must set the content hash tree");
     // Spot-check content across a chunk boundary (5 MiB) without reading the whole file.
     let off = 5 * 1024 * 1024 - 8;
     let sec = bigf.read_section(off, 16).await?;

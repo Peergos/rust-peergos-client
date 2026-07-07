@@ -3704,7 +3704,9 @@ where
     if let Some(existing) = get_open_transaction(home_cap, &txn_name, store.clone(), mutable).await? {
         if existing.size == size && existing.props.tree_hash == props.tree_hash {
             let start = find_first_absent_chunk(&existing, &store, mutable).await? as usize;
-            upload_txn_chunks(dir_cap, &existing, None, start, mirror_bat, &open, &store, mutable).await?;
+            // Pass the (already-computed) tree so a resumed multi-chunk upload still
+            // sets every content hash-tree branch, not just chunk 0's.
+            upload_txn_chunks(dir_cap, &existing, Some(&tree), start, mirror_bat, &open, &store, mutable).await?;
             let file_cap = add_file_child_link(dir_cap, Some(existing.writer.clone()), mirror_bat, &existing, &store, mutable).await?;
             close_transaction_record(home_cap, &existing.name, store, mutable).await?;
             return Ok(file_cap);
@@ -4050,7 +4052,25 @@ where
 {
     let _ = &entry_signer; // the transaction records the parent's writer directly
     let start = find_first_absent_chunk(txn, &store, mutable).await? as usize;
-    upload_txn_chunks(dir_cap, txn, None, start, mirror_bat, &open, &store, mutable).await?;
+    // The record only stored chunk 0's hash-tree branch, which is the whole tree for
+    // files up to 1024 chunks. For larger files, recompute the tree from the source
+    // so every branch (one per 1024 chunks) is set on the resumed chunks.
+    let n_chunks = txn.chunk_count() as usize;
+    let tree = if n_chunks > 1024 {
+        let chunk_size = retrieve::CHUNK_MAX_SIZE as usize;
+        let mut reader = open().map_err(|e| Error::Protocol(format!("open error: {e}")))?;
+        let mut buf = vec![0u8; chunk_size];
+        let mut chunk_hashes = Vec::with_capacity(n_chunks);
+        for i in 0..n_chunks {
+            let want = if i + 1 == n_chunks { (txn.size as usize) - i * chunk_size } else { chunk_size };
+            read_exact(&mut reader, &mut buf[..want])?;
+            chunk_hashes.push(peergos_crypto::hash::sha256(&buf[..want]));
+        }
+        Some(hashtree::HashTree::build(&chunk_hashes)?)
+    } else {
+        None
+    };
+    upload_txn_chunks(dir_cap, txn, tree.as_ref(), start, mirror_bat, &open, &store, mutable).await?;
     let file_cap = add_file_child_link(dir_cap, Some(txn.writer.clone()), mirror_bat, txn, &store, mutable).await?;
     close_transaction_record(home_cap, &txn.name, store, mutable).await?;
     Ok(file_cap)
