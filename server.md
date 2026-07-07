@@ -165,19 +165,20 @@ OpLog apply + PoW-accept, `getPublicKey`), login (`getLogin`/`setLogin`), space
 usage (`usage`/`quota` via block reachability), social (`followRequest`/
 `getFollowRequests`/`removeFollowRequest`), BATs (`getUserBats`/`addBat`).
 
-Six end-to-end tests pass in-process (`crates/peergos-fs/tests/mock_e2e.rs`):
+Also enforces **owned-writer authorization** on `setPointer`/`setPointers`: a write
+is accepted only if the writer is the owner or is transitively reachable in the
+owner's owned-writer tree (walked via a `champ_all_keys` HAMT enumerator over the
+public `Champ` API, recovering each owned writer from `reverse(writer.to_cbor())`).
+A writer removed by `deAuthoriseSigner` during revocation is rejected.
+
+Seven end-to-end tests pass in-process (`crates/peergos-fs/tests/mock_e2e.rs`):
 signup→upload→sign-in→read, usage delete round-trip, two-user read-share,
-secret-link (read-only + password), mutate (rename/move/delete), change-password.
-Most other examples use only these endpoints and should run unchanged.
+secret-link (read-only + password), mutate (rename/move/delete), change-password,
+and revoke-write (denies a revoked writer). Most other examples use only these
+endpoints and should run unchanged.
 
 ## Known gaps (still need the live server)
 
-- **Owned-writer authorization** — the mock accepts any writer's CAS (it doesn't
-  walk the owned-writer champ to reject a *deauthorized* writer). Needed only for
-  `revoke_write`/`revoke` to assert bob can no longer write. Blocked on a champ
-  key-enumeration helper (`Champ` currently only supports get-by-key). Once that
-  exists, walk the owned tree from the owner on each `setPointer` and reject
-  unreachable writers.
 - **MFA challenge/response** — `listMfa`/`addTotp`/`enableTotp`/`deleteMfa` plus the
   `getLogin` second-factor branch (`a:false` + `MultiFactorAuthRequest`, TOTP
   verification, re-auth). Needed for the `mfa` example only.
