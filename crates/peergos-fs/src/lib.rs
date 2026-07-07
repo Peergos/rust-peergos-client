@@ -31,16 +31,16 @@ pub use mfa::{
 };
 pub use signup::signup;
 pub use social::{
-    accept_follow_request, add_member_to_group, collect_shares_for_user, get_blocked,
-    get_follow_requests, get_follower_names,
+    accept_follow_request, add_friend_annotation, add_member_to_group, block, collect_shares_for_user,
+    get_blocked, get_follow_requests, get_follower_names, get_friend_annotations,
     get_following, get_friends, get_links, get_or_create_groups, get_pending_outgoing,
-    get_public_keys, get_shared_with, group_uid, unfollow,
+    get_public_keys, get_shared_with, group_uid, unblock, unfollow,
     load_read_access_sharing_links, load_write_access_sharing_links, move_file,
     process_follow_reply, read_shared_capabilities, read_write_shared_capabilities, record_link,
     remove_link, send_follow_request, share_read_access, share_read_with_group, share_write_access,
     share_write_with_group, unshare_read_access, unshare_write_access, Access, CapabilitiesFromUser,
-    CapabilityWithPath, Groups, LinkProperties, ReceivedFollowRequest, SocialState, FOLLOWERS_GROUP,
-    FRIENDS_GROUP,
+    CapabilityWithPath, FriendAnnotation, Groups, LinkProperties, ReceivedFollowRequest, SocialState,
+    FOLLOWERS_GROUP, FRIENDS_GROUP,
 };
 pub use cryptree::{
     ChildrenLinks, CryptreeNode, FileProperties, NamedRelativeCapability, RelativeCapability,

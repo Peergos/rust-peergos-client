@@ -296,6 +296,7 @@ async fn persist_friend_entry_point(
 const SHARED_DIR: &str = "shared";
 const SOCIAL_STATE_FILE: &str = ".social-state.cbor";
 const BLOCKED_USERNAMES_FILE: &str = ".blocked-usernames.txt";
+const FRIEND_ANNOTATIONS_FILE: &str = ".annotations";
 
 /// A snapshot of the user's social state (`getSocialState`). Populated from the
 /// pieces the Rust client tracks; Java additionally carries follower/following
@@ -452,6 +453,50 @@ fn walk_outbound<'a>(
     })
 }
 
+/// Overwrite the blocked-usernames file with `blocked` (sorted, one per line).
+async fn write_blocked(
+    user: &LoggedInUser,
+    blocked: &BTreeSet<String>,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let content: String = blocked.iter().map(|u| format!("{u}\n")).collect();
+    let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
+    let signer = recover_signer(home, store.clone(), mutable).await?;
+    crate::upload_file(home, BLOCKED_USERNAMES_FILE, content.as_bytes(), None, Some(signer), user.mirror_bat_id().as_ref(), store, mutable).await?;
+    Ok(())
+}
+
+/// Block `username`: add them to `.blocked-usernames.txt` in home so their shared
+/// entry points are no longer honoured. Idempotent.
+pub async fn block(
+    user: &LoggedInUser,
+    username: &str,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let mut blocked: BTreeSet<String> = get_blocked(user, store.clone(), mutable).await?.into_iter().collect();
+    if !blocked.insert(username.to_string()) {
+        return Ok(()); // already blocked
+    }
+    write_blocked(user, &blocked, store, mutable).await
+}
+
+/// Unblock `username` (`unblock`): remove them from `.blocked-usernames.txt`. No-op
+/// if they weren't blocked (or there is no blocked file yet).
+pub async fn unblock(
+    user: &LoggedInUser,
+    username: &str,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let mut blocked: BTreeSet<String> = get_blocked(user, store.clone(), mutable).await?.into_iter().collect();
+    if !blocked.remove(username) {
+        return Ok(()); // not blocked
+    }
+    write_blocked(user, &blocked, store, mutable).await
+}
+
 /// Block `username` (`unfollow`): add them to `.blocked-usernames.txt` in home. This
 /// stops honouring their follow of us. (Java also removes their local entry-point
 /// mirror; that cleanup is not done here.)
@@ -461,14 +506,88 @@ pub async fn unfollow(
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<()> {
-    let mut blocked = get_blocked(user, store.clone(), mutable).await?;
-    if !blocked.iter().any(|b| b == username) {
-        blocked.push(username.to_string());
+    block(user, username, store, mutable).await
+}
+
+/// A local annotation about a friend (`FriendAnnotation`): whether we have verified
+/// their identity, and which of their keys were current at verification time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FriendAnnotation {
+    pub username: String,
+    pub is_verified: bool,
+    pub keys_at_verification: Vec<PublicKeyHash>,
+}
+
+impl FriendAnnotation {
+    pub fn new(username: impl Into<String>, is_verified: bool, keys_at_verification: Vec<PublicKeyHash>) -> FriendAnnotation {
+        FriendAnnotation { username: username.into(), is_verified, keys_at_verification }
     }
-    let content = format!("{}\n", blocked.join("\n"));
+
+    fn to_cbor(&self) -> CborObject {
+        CborObject::map()
+            .put("u", CborObject::Str(self.username.clone()))
+            .put("v", CborObject::Boolean(self.is_verified))
+            .put("k", CborObject::List(self.keys_at_verification.iter().map(|k| k.to_cbor()).collect()))
+            .build()
+    }
+
+    fn from_cbor(cbor: &CborObject) -> Result<FriendAnnotation> {
+        Ok(FriendAnnotation {
+            username: cbor.get("u").and_then(|c| c.as_string()).ok_or_else(|| Error::Cbor("FriendAnnotation missing 'u'".into()))?.to_string(),
+            is_verified: cbor.get("v").and_then(|c| c.as_bool()).unwrap_or(false),
+            keys_at_verification: cbor
+                .get("k")
+                .and_then(|c| c.as_list())
+                .map(|l| l.iter().map(PublicKeyHash::from_cbor).collect::<Result<Vec<_>>>())
+                .transpose()?
+                .unwrap_or_default(),
+        })
+    }
+}
+
+/// The user's friend annotations keyed by username (`getFriendAnnotations`) — the
+/// stream of [`FriendAnnotation`]s in `.annotations` in home.
+pub async fn get_friend_annotations(
+    user: &LoggedInUser,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<BTreeMap<String, FriendAnnotation>> {
+    let bytes = match read_home_child(user, FRIEND_ANNOTATIONS_FILE, store, mutable).await? {
+        Some(b) => b,
+        None => return Ok(BTreeMap::new()),
+    };
+    let mut out = BTreeMap::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let (cbor, consumed) = CborObject::from_bytes_consumed(&bytes[offset..])?;
+        let anno = FriendAnnotation::from_cbor(&cbor)?;
+        out.insert(anno.username.clone(), anno);
+        if consumed == 0 {
+            break;
+        }
+        offset += consumed;
+    }
+    Ok(out)
+}
+
+/// Add or replace a friend annotation (`addFriendAnnotation`): merges `annotation`
+/// (by username) into the existing set and rewrites `.annotations` as the
+/// concatenated stream of all annotations, ordered by username.
+pub async fn add_friend_annotation(
+    user: &LoggedInUser,
+    annotation: FriendAnnotation,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let mut all = get_friend_annotations(user, store.clone(), mutable).await?;
+    all.insert(annotation.username.clone(), annotation);
+    let mut content = Vec::new();
+    for anno in all.values() {
+        content.extend_from_slice(&anno.to_cbor().to_bytes());
+    }
     let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
     let signer = recover_signer(home, store.clone(), mutable).await?;
-    crate::upload_file(home, BLOCKED_USERNAMES_FILE, content.as_bytes(), None, Some(signer), user.mirror_bat_id().as_ref(), store, mutable).await?;
+    crate::upload_file(home, FRIEND_ANNOTATIONS_FILE, &content, None, Some(signer), user.mirror_bat_id().as_ref(), store, mutable).await?;
     Ok(())
 }
 

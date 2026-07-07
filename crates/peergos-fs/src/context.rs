@@ -371,6 +371,36 @@ impl UserContext {
         crate::unfollow(user, username, self.store.clone(), self.mutable.as_ref()).await
     }
 
+    /// The usernames the user has blocked (`getBlocked`).
+    pub async fn get_blocked(&self) -> Result<Vec<String>> {
+        let user = self.require_user()?;
+        crate::get_blocked(user, self.store.clone(), self.mutable.as_ref()).await
+    }
+
+    /// Block `username` so their shared entry points are no longer honoured.
+    pub async fn block(&self, username: &str) -> Result<()> {
+        let user = self.require_user()?;
+        crate::block(user, username, self.store.clone(), self.mutable.as_ref()).await
+    }
+
+    /// Unblock `username` (`unblock`): remove them from the blocked list.
+    pub async fn unblock(&self, username: &str) -> Result<()> {
+        let user = self.require_user()?;
+        crate::unblock(user, username, self.store.clone(), self.mutable.as_ref()).await
+    }
+
+    /// The user's friend annotations, keyed by username (`getFriendAnnotations`).
+    pub async fn get_friend_annotations(&self) -> Result<std::collections::BTreeMap<String, crate::FriendAnnotation>> {
+        let user = self.require_user()?;
+        crate::get_friend_annotations(user, self.store.clone(), self.mutable.as_ref()).await
+    }
+
+    /// Add or replace a friend annotation (`addFriendAnnotation`).
+    pub async fn add_friend_annotation(&self, annotation: crate::FriendAnnotation) -> Result<()> {
+        let user = self.require_user()?;
+        crate::add_friend_annotation(user, annotation, self.store.clone(), self.mutable.as_ref()).await
+    }
+
     /// Remove `username` as a follower (`removeFollower`): revoke every file ever
     /// shared with them (rotating each file's keys and re-sharing to the remaining
     /// recipients) and delete their `/shared/<username>` folder.
