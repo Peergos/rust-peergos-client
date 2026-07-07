@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("Creating subdirectory {dirname:?} ...");
-    let sub_cap = peergos_fs::create_directory(&dir_cap, &dirname, None, store.clone(), &mutable).await?;
+    let sub_cap = peergos_fs::create_directory(&dir_cap, &dirname, None, None, store.clone(), &mutable).await?;
     println!("Created (writable: {}).", sub_cap.is_writable());
 
     println!("\nParent directory now contains:");

@@ -68,8 +68,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let home = alice.home().ok_or("no home")?.clone();
     let signer = peergos_fs::recover_signer(&home, store.clone(), &mutable).await?;
     // Fresh docs each run to avoid stale state.
-    let docs = peergos_fs::create_directory(&home, "docs", Some(signer.clone()), store.clone(), &mutable).await?;
-    peergos_fs::upload_file(&docs, "secret.txt", b"top secret", None, Some(signer), store.clone(), &mutable).await?;
+    let docs = peergos_fs::create_directory(&home, "docs", Some(signer.clone()), None, store.clone(), &mutable).await?;
+    peergos_fs::upload_file(&docs, "secret.txt", b"top secret", None, Some(signer), None, store.clone(), &mutable).await?;
     peergos_fs::share_read_access(&alice, "docs", &docs, bu, store.clone(), &mutable).await?;
     peergos_fs::share_read_access(&alice, "docs", &docs, cu, store.clone(), &mutable).await?;
 

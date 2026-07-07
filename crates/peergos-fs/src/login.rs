@@ -78,6 +78,16 @@ pub struct LoggedInUser {
     /// Our boxing keypair (for follow requests / sharing); absent on legacy accounts.
     pub boxer: Option<peergos_core::boxing::BoxingKeyPair>,
     pub entries: Vec<EntryPoint>,
+    /// The account mirror BAT — every block we write is tagged with its id so the
+    /// server can mirror the data. `None` if the account has none.
+    pub mirror_bat: Option<peergos_core::auth::BatWithId>,
+}
+
+impl LoggedInUser {
+    /// The mirror BAT's id (hash form), used to tag written blocks.
+    pub fn mirror_bat_id(&self) -> Option<peergos_core::auth::BatId> {
+        self.mirror_bat.as_ref().map(|b| b.id())
+    }
 }
 
 impl LoggedInUser {
@@ -274,6 +284,34 @@ async fn get_login_data(
 /// UserStaticData padding block size (`UserStaticData`), same as signup.
 const USER_STATIC_DATA_PADDING: usize = 4096;
 
+/// Fetch the user's mirror BAT (`getUserBats`) — the last registered BAT — from the
+/// bats endpoint, authorised by a time-limited identity signature. Every block a user
+/// writes is tagged with this BAT's id so the server can mirror it.
+pub async fn fetch_mirror_bat(
+    username: &str,
+    identity: &SigningPrivateKeyAndPublicHash,
+    poster: &dyn HttpPoster,
+) -> Result<Option<peergos_core::auth::BatWithId>> {
+    let path = "peergos/v0/bats/getUserBats";
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let req = CborObject::map()
+        .put("p", CborObject::Str(path.to_string()))
+        .put("t", CborObject::Long(now))
+        .build();
+    let auth = to_hex(&identity.secret.sign_message(&req.to_bytes())?);
+    let url = format!(
+        "{path}?username={}&auth={auth}",
+        peergos_core::storage::url_encode(username)
+    );
+    match CborObject::from_bytes(&poster.get(&url).await?)? {
+        CborObject::List(items) => items.last().map(peergos_core::auth::BatWithId::from_cbor).transpose(),
+        _ => Ok(None),
+    }
+}
+
 /// Change the account password (`UserContext.changePassword`), non-legacy accounts.
 /// Re-derives the login key from `new_password` (keeping the existing salt — the
 /// identity key and WriterData are unchanged), re-encrypts the entry points under
@@ -417,6 +455,10 @@ pub async fn login(
         SigningPrivateKeyAndPublicHash::new(controller.clone(), identity.secret)
     };
 
+    // The mirror BAT (used to tag every block this user writes). Best-effort:
+    // legacy/BAT-less accounts simply get None.
+    let mirror_bat = fetch_mirror_bat(username, &signer, poster).await.ok().flatten();
+
     Ok(LoggedInUser {
         username: username.to_string(),
         identity: controller,
@@ -424,5 +466,6 @@ pub async fn login(
         root_key: creds.root,
         boxer,
         entries,
+        mirror_bat,
     })
 }

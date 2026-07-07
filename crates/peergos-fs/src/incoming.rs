@@ -20,6 +20,7 @@ use crate::capability::AbsoluteCapability;
 use crate::login::LoggedInUser;
 use crate::social::CapabilityWithPath;
 use peergos_cbor::{Cborable, CborObject};
+use peergos_core::auth::BatId;
 use peergos_core::error::{Error, Result};
 use peergos_core::keys::{PublicKeyHash, SigningPrivateKeyAndPublicHash};
 use peergos_core::mutable::MutablePointers;
@@ -200,6 +201,7 @@ pub struct IncomingCapCache {
     cache_root: AbsoluteCapability,
     world_root: AbsoluteCapability,
     signer: SigningPrivateKeyAndPublicHash,
+    mirror_bat: Option<BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: Arc<dyn MutablePointers>,
     /// Last-seen mutable-pointer target per friend sharing-dir writer, to skip an
@@ -217,6 +219,7 @@ impl IncomingCapCache {
     ) -> Result<IncomingCapCache> {
         let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
         let signer = crate::recover_signer(home, store.clone(), mutable.as_ref()).await?;
+        let mirror_bat = user.mirror_bat_id();
         let cache_root = crate::list_directory(home, store.clone(), mutable.as_ref())
             .await?
             .into_iter()
@@ -227,6 +230,7 @@ impl IncomingCapCache {
             world_root: cache_root.clone(),
             cache_root,
             signer,
+            mirror_bat,
             store,
             mutable,
             pointer_cache: Mutex::new(HashMap::new()),
@@ -249,7 +253,7 @@ impl IncomingCapCache {
         match self.find_child(dir, name).await? {
             Some(cap) => Ok(cap),
             None => {
-                crate::create_directory(dir, name, Some(self.signer.clone()), self.store.clone(), self.mutable.as_ref())
+                crate::create_directory(dir, name, Some(self.signer.clone()), self.mirror_bat.as_ref(), self.store.clone(), self.mutable.as_ref())
                     .await
             }
         }
@@ -280,6 +284,7 @@ impl IncomingCapCache {
             &caps.to_cbor().to_bytes(),
             None,
             Some(self.signer.clone()),
+            self.mirror_bat.as_ref(),
             self.store.clone(),
             self.mutable.as_ref(),
         )
@@ -306,6 +311,7 @@ impl IncomingCapCache {
             &state.to_cbor().to_bytes(),
             None,
             Some(self.signer.clone()),
+            self.mirror_bat.as_ref(),
             self.store.clone(),
             self.mutable.as_ref(),
         )
@@ -447,6 +453,7 @@ impl IncomingCapCache {
             &b.build().to_bytes(),
             None,
             Some(self.signer.clone()),
+            self.mirror_bat.as_ref(),
             self.store.clone(),
             self.mutable.as_ref(),
         )

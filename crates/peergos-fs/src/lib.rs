@@ -851,6 +851,8 @@ struct DirWriteContext {
     wd_cid: Cid,
     pointer_sequence: Option<i64>,
     tid: TransactionId,
+    /// Account mirror BAT id — tags every child block written during this mutation.
+    mirror_bat: Option<BatId>,
 }
 
 /// Resolve a writable directory (pointer → WriterData → champ → node + signer)
@@ -858,6 +860,7 @@ struct DirWriteContext {
 async fn begin_dir_write(
     dir_cap: &AbsoluteCapability,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
     store: &Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<DirWriteContext> {
@@ -918,6 +921,7 @@ async fn begin_dir_write(
         wd_cid,
         pointer_sequence: pointer.sequence,
         tid,
+        mirror_bat: mirror_bat.cloned(),
     })
 }
 
@@ -958,7 +962,9 @@ async fn finish_dir_write(
         wd_cid,
         pointer_sequence,
         tid,
+        mirror_bat,
     } = ctx;
+    let mirror_bat = mirror_bat.as_ref();
 
     // Add the child link, respecting the per-blob cap: a directory splits into
     // subsequent chunks of MAX_CHILD_LINKS_PER_BLOB links each. Mirrors
@@ -1044,17 +1050,11 @@ async fn finish_dir_write(
             &dir_cap.r_base_key,
             &ChildrenLinks::Named(vec![child_link]).to_cbor(),
             MIN_FRAGMENT_SIZE,
-            None,
+            mirror_bat,
         )?;
-        let inline_bat = new_bat
-            .as_ref()
-            .map(|b| BatId::inline(b).map(|id| id.to_cbor()))
-            .transpose()?
-            .into_iter()
-            .collect();
         let node = CryptreeNode::new(
             true,
-            inline_bat,
+            node_bats_opt(new_bat.as_ref(), mirror_bat)?,
             PaddedCipherText::build(&dir_cap.r_base_key, &from_base, BASE_BLOCK_PADDING_BLOCKSIZE)?,
             PaddedCipherText::build(&parent_key, &from_parent, META_DATA_PADDING_BLOCKSIZE)?,
             children_data.to_cbor(),
@@ -1071,7 +1071,7 @@ async fn finish_dir_write(
             &dir_cap.r_base_key,
             &ChildrenLinks::Named(chunk.children.clone()).to_cbor(),
             MIN_FRAGMENT_SIZE,
-            None,
+            mirror_bat,
         )?;
         put_raw_blocks_signed(store.as_ref(), &dir_cap.owner, &signer, fragments, &tid).await?;
         let new_node = chunk.node.with_children_or_data(children_data.to_cbor());
@@ -1117,12 +1117,14 @@ fn read_exact(r: &mut impl std::io::Read, buf: &mut [u8]) -> Result<()> {
 /// is called twice: once to compute the content hash tree, once to encrypt and
 /// upload. The thumbnail (if any) goes on chunk 0.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub async fn upload_file_streaming<R, F>(
     dir_cap: &AbsoluteCapability,
     name: &str,
     size: u64,
     thumbnail: Option<(String, Vec<u8>)>,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
     open: F,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
@@ -1181,7 +1183,7 @@ where
     let mime_type = mimetype::calculate_mime_type(&header, name);
 
     // Pass 2: open the directory transaction, then stream-encrypt + upload chunks.
-    let mut ctx = begin_dir_write(dir_cap, entry_signer, &store, mutable).await?;
+    let mut ctx = begin_dir_write(dir_cap, entry_signer, mirror_bat, &store, mutable).await?;
     let to_parent = RelCap {
         writer: None,
         map_key: dir_cap.map_key.clone(),
@@ -1203,7 +1205,7 @@ where
             &file_data_key,
             &CborObject::ByteString(buf[..want].to_vec()),
             MIN_FRAGMENT_SIZE,
-            None,
+            mirror_bat,
         )?;
         let next_chunk =
             RelCap::subsequent_chunk(next_map_key.clone(), next_bat.clone(), file_r_base.clone());
@@ -1227,15 +1229,9 @@ where
             .put("p", to_parent.to_cbor())
             .put("s", props.to_cbor())
             .build();
-        let inline_bat = bat
-            .as_ref()
-            .map(|b| BatId::inline(b).map(|id| id.to_cbor()))
-            .transpose()?
-            .into_iter()
-            .collect();
         let node = CryptreeNode::new(
             false,
-            inline_bat,
+            node_bats_opt(bat.as_ref(), mirror_bat)?,
             PaddedCipherText::build(&file_r_base, &from_base, BASE_BLOCK_PADDING_BLOCKSIZE)?,
             PaddedCipherText::build(&file_r_base, &from_parent, META_DATA_PADDING_BLOCKSIZE)?,
             data.to_cbor(),
@@ -1281,6 +1277,7 @@ pub async fn upload_file(
     contents: &[u8],
     thumbnail: Option<(String, Vec<u8>)>,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<AbsoluteCapability> {
@@ -1290,6 +1287,7 @@ pub async fn upload_file(
         contents.len() as u64,
         thumbnail,
         entry_signer,
+        mirror_bat,
         || Ok(std::io::Cursor::new(contents)),
         store,
         mutable,
@@ -1303,6 +1301,7 @@ pub async fn create_directory(
     dir_cap: &AbsoluteCapability,
     name: &str,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<AbsoluteCapability> {
@@ -1326,7 +1325,7 @@ pub async fn create_directory(
         Some(sub_w_base.clone()),
     )?;
 
-    let mut ctx = begin_dir_write(dir_cap, entry_signer, &store, mutable).await?;
+    let mut ctx = begin_dir_write(dir_cap, entry_signer, mirror_bat, &store, mutable).await?;
 
     // Build the (empty) subdirectory node: base block encrypted with its rBaseKey,
     // parent block with its parentKey.
@@ -1355,7 +1354,7 @@ pub async fn create_directory(
     )?;
     let node = CryptreeNode::new(
         true,
-        vec![BatId::inline(&sub_bat)?.to_cbor()],
+        node_bats(&sub_bat, mirror_bat)?,
         PaddedCipherText::build(&sub_r_base, &from_base, BASE_BLOCK_PADDING_BLOCKSIZE)?,
         PaddedCipherText::build(&sub_parent_key, &from_parent, META_DATA_PADDING_BLOCKSIZE)?,
         empty_children.to_cbor(),
@@ -1431,6 +1430,7 @@ async fn create_writable_shared_dir(
     parent_cap: &AbsoluteCapability,
     name: &str,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<AbsoluteCapability> {
@@ -1533,7 +1533,7 @@ async fn create_writable_shared_dir(
     )?;
     let node = CryptreeNode::new(
         true,
-        vec![BatId::inline(&dir_bat)?.to_cbor()],
+        node_bats(&dir_bat, mirror_bat)?,
         PaddedCipherText::build(&dir_r, &from_base, BASE_BLOCK_PADDING_BLOCKSIZE)?,
         PaddedCipherText::build(&parent_key, &from_parent, META_DATA_PADDING_BLOCKSIZE)?,
         empty_children.to_cbor(),
@@ -1589,6 +1589,7 @@ async fn create_link_node(
     mime_type: Option<String>,
     created_epoch: i64,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<()> {
@@ -1603,7 +1604,7 @@ async fn create_link_node(
     let link_map_key = random_bytes(32);
     let link_bat = Bat::new(random_bytes(32))?;
 
-    let mut ctx = begin_dir_write(parent_cap, entry_signer.clone(), &store, mutable).await?;
+    let mut ctx = begin_dir_write(parent_cap, entry_signer.clone(), mirror_bat, &store, mutable).await?;
 
     // The link node's single child: a relative cap from the link node to the
     // target (its writer differs, so the writer field is carried), with the
@@ -1651,11 +1652,11 @@ async fn create_link_node(
         &link_r,
         &ChildrenLinks::Named(vec![to_target]).to_cbor(),
         MIN_FRAGMENT_SIZE,
-        None,
+        mirror_bat,
     )?;
     let link_node = CryptreeNode::new(
         true,
-        vec![BatId::inline(&link_bat)?.to_cbor()],
+        node_bats(&link_bat, mirror_bat)?,
         PaddedCipherText::build(&link_r, &from_base, BASE_BLOCK_PADDING_BLOCKSIZE)?,
         PaddedCipherText::build(&link_parent_key, &from_parent, META_DATA_PADDING_BLOCKSIZE)?,
         children_data.to_cbor(),
@@ -1693,6 +1694,7 @@ fn copy_dir_contents<'a>(
     old_cap: &'a AbsoluteCapability,
     new_cap: &'a AbsoluteCapability,
     new_signer: &'a SigningPrivateKeyAndPublicHash,
+    mirror_bat: Option<&'a BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &'a dyn MutablePointers,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
@@ -1700,8 +1702,8 @@ fn copy_dir_contents<'a>(
         for e in list_directory(old_cap, store.clone(), mutable).await? {
             if e.is_dir == Some(true) {
                 let sub_new =
-                    create_directory(new_cap, &e.name, Some(new_signer.clone()), store.clone(), mutable).await?;
-                copy_dir_contents(&e.cap, &sub_new, new_signer, store.clone(), mutable).await?;
+                    create_directory(new_cap, &e.name, Some(new_signer.clone()), mirror_bat, store.clone(), mutable).await?;
+                copy_dir_contents(&e.cap, &sub_new, new_signer, mirror_bat, store.clone(), mutable).await?;
             } else {
                 let (props, bytes) = read_file(&e.cap, store.clone(), mutable).await?;
                 upload_file(
@@ -1710,6 +1712,7 @@ fn copy_dir_contents<'a>(
                     &bytes,
                     props.thumbnail.clone(),
                     Some(new_signer.clone()),
+                    mirror_bat,
                     store.clone(),
                     mutable,
                 )
@@ -1726,10 +1729,11 @@ async fn remove_orphaned_subtree(
     parent_cap: &AbsoluteCapability,
     old: &AbsoluteCapability,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
     store: &Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<()> {
-    let mut ctx = begin_dir_write(parent_cap, entry_signer, store, mutable).await?;
+    let mut ctx = begin_dir_write(parent_cap, entry_signer, mirror_bat, store, mutable).await?;
     let signer = ctx.signer.clone();
     let loc = ChunkLoc {
         map_key: old.map_key.clone(),
@@ -1752,6 +1756,7 @@ pub async fn move_dir_to_own_writer(
     parent_cap: &AbsoluteCapability,
     child_name: &str,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<AbsoluteCapability> {
@@ -1791,12 +1796,12 @@ pub async fn move_dir_to_own_writer(
     // the parent's child by name and keeps rename authority in the parent writer),
     // and finally delete the now-orphaned old subtree.
     let new_dir =
-        create_writable_shared_dir(parent_cap, child_name, entry_signer.clone(), store.clone(), mutable).await?;
+        create_writable_shared_dir(parent_cap, child_name, entry_signer.clone(), mirror_bat, store.clone(), mutable).await?;
     let new_signer = recover_signer(&new_dir, store.clone(), mutable).await?;
-    copy_dir_contents(&old.cap, &new_dir, &new_signer, store.clone(), mutable).await?;
-    create_link_node(parent_cap, child_name, &new_dir, true, None, created, entry_signer.clone(), store.clone(), mutable)
+    copy_dir_contents(&old.cap, &new_dir, &new_signer, mirror_bat, store.clone(), mutable).await?;
+    create_link_node(parent_cap, child_name, &new_dir, true, None, created, entry_signer.clone(), mirror_bat, store.clone(), mutable)
         .await?;
-    remove_orphaned_subtree(parent_cap, &old.cap, entry_signer, &store, mutable).await?;
+    remove_orphaned_subtree(parent_cap, &old.cap, entry_signer, mirror_bat, &store, mutable).await?;
     Ok(new_dir)
 }
 
@@ -1812,6 +1817,7 @@ async fn create_writable_shared_file(
     content: &[u8],
     old_props: &FileProperties,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<AbsoluteCapability> {
@@ -1895,6 +1901,7 @@ async fn create_writable_shared_file(
         &mime,
         old_props.created_epoch,
         &old_props.thumbnail,
+        mirror_bat,
         content,
         &store,
         &tid,
@@ -1932,6 +1939,7 @@ pub async fn move_file_to_own_writer(
     parent_cap: &AbsoluteCapability,
     child_name: &str,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<AbsoluteCapability> {
@@ -1954,7 +1962,7 @@ pub async fn move_file_to_own_writer(
     let (_props, content) = read_file(&old.cap, store.clone(), mutable).await?;
 
     let new_cap =
-        create_writable_shared_file(parent_cap, child_name, &content, &old_props, entry_signer.clone(), store.clone(), mutable)
+        create_writable_shared_file(parent_cap, child_name, &content, &old_props, entry_signer.clone(), mirror_bat, store.clone(), mutable)
             .await?;
     create_link_node(
         parent_cap,
@@ -1964,11 +1972,12 @@ pub async fn move_file_to_own_writer(
         Some(old_props.mime_type.clone()),
         old_props.created_epoch,
         entry_signer.clone(),
+        mirror_bat,
         store.clone(),
         mutable,
     )
     .await?;
-    remove_orphaned_subtree(parent_cap, &old.cap, entry_signer, &store, mutable).await?;
+    remove_orphaned_subtree(parent_cap, &old.cap, entry_signer, mirror_bat, &store, mutable).await?;
     Ok(new_cap)
 }
 
@@ -2063,6 +2072,7 @@ pub async fn force_rotate_child_to_new_writer(
     parent_cap: &AbsoluteCapability,
     child_name: &str,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<AbsoluteCapability> {
@@ -2089,16 +2099,16 @@ pub async fn force_rotate_child_to_new_writer(
 
     // Create a fresh writer subspace, copy the old contents across, and relink.
     let new_target =
-        create_writable_shared_dir(parent_cap, child_name, entry_signer.clone(), store.clone(), mutable).await?;
+        create_writable_shared_dir(parent_cap, child_name, entry_signer.clone(), mirror_bat, store.clone(), mutable).await?;
     let new_signer = recover_signer(&new_target, store.clone(), mutable).await?;
-    copy_dir_contents(&old_target, &new_target, &new_signer, store.clone(), mutable).await?;
-    create_link_node(parent_cap, child_name, &new_target, true, None, created, entry_signer.clone(), store.clone(), mutable)
+    copy_dir_contents(&old_target, &new_target, &new_signer, mirror_bat, store.clone(), mutable).await?;
+    create_link_node(parent_cap, child_name, &new_target, true, None, created, entry_signer.clone(), mirror_bat, store.clone(), mutable)
         .await?;
 
     // Delete the old target subspace (while its writer is still authorised), then
     // remove the orphaned old link node, then deauthorise the old writer.
     delete_writer_subspace(&parent_cap.owner, &old_writer, &store, mutable).await?;
-    remove_orphaned_subtree(parent_cap, &link.cap, entry_signer.clone(), &store, mutable).await?;
+    remove_orphaned_subtree(parent_cap, &link.cap, entry_signer.clone(), mirror_bat, &store, mutable).await?;
     deauthorize_writer(parent_cap, &old_target.writer, entry_signer, store.clone(), mutable).await?;
     Ok(new_target)
 }
@@ -2114,6 +2124,7 @@ pub async fn rotate_child_read_keys(
     parent_cap: &AbsoluteCapability,
     child_name: &str,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<AbsoluteCapability> {
@@ -2132,17 +2143,17 @@ pub async fn rotate_child_read_keys(
     let new_cap = if old.is_dir == Some(true) {
         // Re-create the directory under fresh keys (replaces the parent's child
         // link by name), then copy the old subtree across.
-        let new_dir = create_directory(parent_cap, child_name, Some(signer.clone()), store.clone(), mutable).await?;
-        copy_dir_contents(&old.cap, &new_dir, &signer, store.clone(), mutable).await?;
+        let new_dir = create_directory(parent_cap, child_name, Some(signer.clone()), mirror_bat, store.clone(), mutable).await?;
+        copy_dir_contents(&old.cap, &new_dir, &signer, mirror_bat, store.clone(), mutable).await?;
         new_dir
     } else {
         // Re-upload the file's content under fresh keys (replaces the link).
         let (props, bytes) = read_file(&old.cap, store.clone(), mutable).await?;
-        upload_file(parent_cap, child_name, &bytes, props.thumbnail, Some(signer.clone()), store.clone(), mutable)
+        upload_file(parent_cap, child_name, &bytes, props.thumbnail, Some(signer.clone()), mirror_bat, store.clone(), mutable)
             .await?
     };
     // Delete the old (now-orphaned) subtree so its old keys grant no access.
-    remove_orphaned_subtree(parent_cap, &old.cap, entry_signer, &store, mutable).await?;
+    remove_orphaned_subtree(parent_cap, &old.cap, entry_signer, mirror_bat, &store, mutable).await?;
     Ok(new_cap)
 }
 
@@ -2153,10 +2164,11 @@ async fn remove_child_link(
     dir_cap: &AbsoluteCapability,
     name: &str,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<()> {
-    let mut ctx = begin_dir_write(dir_cap, entry_signer, &store, mutable).await?;
+    let mut ctx = begin_dir_write(dir_cap, entry_signer, mirror_bat, &store, mutable).await?;
     let mut chunks = collect_dir_chunks(dir_cap, &ctx, &store).await?;
     let mut modified: Option<usize> = None;
     for (i, (.., children)) in chunks.iter_mut().enumerate() {
@@ -2203,6 +2215,27 @@ async fn reupload_node(
     Ok(())
 }
 
+/// The `bats` list for a cryptree node: the block's own inline BAT (secret embedded)
+/// plus — by id, NOT inlined — the account mirror BAT, matching Java (2 BATs per
+/// cryptree node / fragment; internal champ + WriterData blocks carry none).
+fn node_bats(bat: &Bat, mirror_bat: Option<&BatId>) -> Result<Vec<CborObject>> {
+    let mut v = vec![BatId::inline(bat)?.to_cbor()];
+    if let Some(m) = mirror_bat {
+        v.push(m.to_cbor());
+    }
+    Ok(v)
+}
+
+/// As [`node_bats`] but for an optional block BAT (continuation chunks / children).
+fn node_bats_opt(bat: Option<&Bat>, mirror_bat: Option<&BatId>) -> Result<Vec<CborObject>> {
+    let mut v: Vec<CborObject> =
+        bat.map(|b| BatId::inline(b).map(|id| id.to_cbor())).transpose()?.into_iter().collect();
+    if let Some(m) = mirror_bat {
+        v.push(m.to_cbor());
+    }
+    Ok(v)
+}
+
 /// Write every chunk node for a file holding `content`, encrypting fragments and
 /// nodes into `store` under `signer`, and return `(map_key, node_cid)` per chunk.
 /// Chunk map-keys/BATs derive from `first_map_key`/`first_bat` via `stream_secret`;
@@ -2223,6 +2256,7 @@ async fn write_file_chunks(
     mime: &str,
     created: i64,
     thumbnail: &Option<(String, Vec<u8>)>,
+    mirror_bat: Option<&BatId>,
     content: &[u8],
     store: &Arc<dyn ContentAddressedStorage>,
     tid: &TransactionId,
@@ -2244,7 +2278,7 @@ async fn write_file_chunks(
             data_key,
             &CborObject::ByteString(slice.to_vec()),
             MIN_FRAGMENT_SIZE,
-            None,
+            mirror_bat,
         )?;
         put_raw_blocks_signed(store.as_ref(), owner, signer, fragments, tid).await?;
         let next_chunk = RelCap::subsequent_chunk(next_map_key.clone(), next_bat.clone(), r_base_key.clone());
@@ -2267,10 +2301,9 @@ async fn write_file_chunks(
             props.tree_hash = Some(tree.branch(i as u64));
         }
         let from_parent = CborObject::map().put("p", to_parent.to_cbor()).put("s", props.to_cbor()).build();
-        let inline_bat = bat.as_ref().map(|b| BatId::inline(b).map(|id| id.to_cbor())).transpose()?.into_iter().collect();
         let node = CryptreeNode::new(
             false,
-            inline_bat,
+            node_bats_opt(bat.as_ref(), mirror_bat)?,
             PaddedCipherText::build(r_base_key, &from_base, BASE_BLOCK_PADDING_BLOCKSIZE)?,
             PaddedCipherText::build(r_base_key, &from_parent, META_DATA_PADDING_BLOCKSIZE)?,
             data.to_cbor(),
@@ -2292,6 +2325,7 @@ pub async fn rewrite_file_content(
     cap: &AbsoluteCapability,
     new_content: &[u8],
     signer: &SigningPrivateKeyAndPublicHash,
+    mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<()> {
@@ -2332,6 +2366,7 @@ pub async fn rewrite_file_content(
         &old_props.mime_type,
         old_props.created_epoch,
         &old_props.thumbnail,
+        mirror_bat,
         new_content,
         &store,
         &tid,
@@ -2374,63 +2409,12 @@ pub async fn overwrite_file(
     cap: &AbsoluteCapability,
     new_content: &[u8],
     signer: &SigningPrivateKeyAndPublicHash,
+    mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<()> {
-    if new_content.len() as u64 > retrieve::CHUNK_MAX_SIZE {
-        return Err(Error::Protocol("overwrite_file only supports single-chunk files".into()));
-    }
-    let (node, old_props) = retrieve_file_metadata(cap, store.clone(), mutable).await?;
-    if node.is_directory() {
-        return Err(Error::Protocol("cannot overwrite a directory".into()));
-    }
-    let r_base = &cap.r_base_key;
-    let data_key = node.get_data_key(r_base)?;
-    let next_chunk = node.base_block(r_base)?.next_chunk;
-    let to_parent = node
-        .parent_link(r_base)?
-        .ok_or_else(|| Error::Protocol("file has no parent link".into()))?;
-    let stream_secret = old_props.stream_secret.clone().unwrap_or_else(|| random_bytes(32));
-
-    let tree = hashtree::HashTree::build(&[peergos_crypto::hash::sha256(new_content)])?;
-    let mut props = FileProperties::new_file(
-        old_props.name.clone(),
-        old_props.mime_type.clone(),
-        new_content.len() as u64,
-        old_props.created_epoch,
-        stream_secret,
-        old_props.thumbnail.clone(),
-    );
-    props.tree_hash = Some(tree.branch(0));
-
-    let (data, fragments) = retrieve::FragmentedPaddedCipherText::build(
-        &data_key,
-        &CborObject::ByteString(new_content.to_vec()),
-        MIN_FRAGMENT_SIZE,
-        None,
-    )?;
-    let from_base = CborObject::map().put("k", data_key.to_cbor()).put("n", next_chunk.to_cbor()).build();
-    let from_parent = CborObject::map().put("p", to_parent.to_cbor()).put("s", props.to_cbor()).build();
-    let inline_bat = cap
-        .bat
-        .as_ref()
-        .map(|b| BatId::inline(b).map(|id| id.to_cbor()))
-        .transpose()?
-        .into_iter()
-        .collect();
-    let new_node = CryptreeNode::new(
-        false,
-        inline_bat,
-        PaddedCipherText::build(r_base, &from_base, BASE_BLOCK_PADDING_BLOCKSIZE)?,
-        PaddedCipherText::build(r_base, &from_parent, META_DATA_PADDING_BLOCKSIZE)?,
-        data.to_cbor(),
-    );
-    if !fragments.is_empty() {
-        let tid = store.start_transaction(&cap.owner).await?;
-        put_raw_blocks_signed(store.as_ref(), &cap.owner, signer, fragments, &tid).await?;
-        store.close_transaction(&cap.owner, &tid).await?;
-    }
-    reupload_node(cap, &new_node, signer, &store, mutable).await
+    // Now a thin wrapper over the any-size in-place rewrite.
+    rewrite_file_content(cap, new_content, signer, mirror_bat, store, mutable).await
 }
 
 /// Overwrite the bytes `[offset, offset+data.len())` of a file **in place**, fetching
@@ -2447,6 +2431,7 @@ pub async fn overwrite_file_section(
     offset: u64,
     data: &[u8],
     signer: &SigningPrivateKeyAndPublicHash,
+    mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<Vec<Vec<u8>>> {
@@ -2509,7 +2494,7 @@ pub async fn overwrite_file_section(
             &data_key,
             &CborObject::ByteString(chunk_data),
             MIN_FRAGMENT_SIZE,
-            None,
+            mirror_bat,
         )?;
         // Rebuild the chunk clearing the content hash-tree branch (Java removes the
         // hash on a partial write) and bumping the modified time; the base block
@@ -2582,6 +2567,7 @@ async fn move_fast_path(
     child: &DirEntry,
     name: &str,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<()> {
@@ -2635,11 +2621,11 @@ async fn move_fast_path(
         mime_type: child.mime_type.clone(),
         created_epoch: Some(props.created_epoch),
     };
-    let ctx = begin_dir_write(target_dir, entry_signer.clone(), &store, mutable).await?;
+    let ctx = begin_dir_write(target_dir, entry_signer.clone(), mirror_bat, &store, mutable).await?;
     finish_dir_write(ctx, target_dir, &store, mutable, child_link).await?;
 
     // 3. Remove the child link from the source (data stays in place).
-    remove_child_link(source_parent, name, entry_signer, store, mutable).await
+    remove_child_link(source_parent, name, entry_signer, mirror_bat, store, mutable).await
 }
 
 /// Copy `child` into `target_dir` under `target_name`, re-encrypting under fresh
@@ -2649,6 +2635,7 @@ async fn copy_into(
     child: &DirEntry,
     target_name: &str,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<AbsoluteCapability> {
@@ -2658,12 +2645,12 @@ async fn copy_into(
         .or(entry_signer)
         .ok_or_else(|| Error::Protocol("no writer signer for target".into()))?;
     if child.is_dir == Some(true) {
-        let new_dir = create_directory(target_dir, target_name, Some(signer.clone()), store.clone(), mutable).await?;
-        copy_dir_contents(&child.cap, &new_dir, &signer, store.clone(), mutable).await?;
+        let new_dir = create_directory(target_dir, target_name, Some(signer.clone()), mirror_bat, store.clone(), mutable).await?;
+        copy_dir_contents(&child.cap, &new_dir, &signer, mirror_bat, store.clone(), mutable).await?;
         Ok(new_dir)
     } else {
         let (props, bytes) = read_file(&child.cap, store.clone(), mutable).await?;
-        upload_file(target_dir, target_name, &bytes, props.thumbnail, Some(signer), store, mutable).await
+        upload_file(target_dir, target_name, &bytes, props.thumbnail, Some(signer), mirror_bat, store, mutable).await
     }
 }
 
@@ -2704,6 +2691,7 @@ pub async fn copy_to(
     name: &str,
     target_dir_cap: &AbsoluteCapability,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<AbsoluteCapability> {
@@ -2720,7 +2708,7 @@ pub async fn copy_to(
         .find(|e| e.name == name)
         .ok_or_else(|| Error::Protocol(format!("no such child: {name}")))?;
     let unique = pick_unique_copy_name(target_dir_cap, name, store.clone(), mutable).await?;
-    copy_into(target_dir_cap, &child, &unique, entry_signer, store, mutable).await
+    copy_into(target_dir_cap, &child, &unique, entry_signer, mirror_bat, store, mutable).await
 }
 
 /// Is `candidate` the same as, or a descendant of, the subtree rooted at `root`?
@@ -2766,6 +2754,7 @@ pub async fn move_to(
     target_dir_cap: &AbsoluteCapability,
     keep_access: bool,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<AbsoluteCapability> {
@@ -2794,12 +2783,12 @@ pub async fn move_to(
 
     // Fast path only when keeping access AND the target shares the source's writer.
     if keep_access && target_dir_cap.writer == source_parent_cap.writer {
-        move_fast_path(source_parent_cap, target_dir_cap, &target_node, &child, name, entry_signer, store, mutable)
+        move_fast_path(source_parent_cap, target_dir_cap, &target_node, &child, name, entry_signer, mirror_bat, store, mutable)
             .await?;
         Ok(child.cap)
     } else {
-        let new_cap = copy_into(target_dir_cap, &child, name, entry_signer.clone(), store.clone(), mutable).await?;
-        delete_child(source_parent_cap, name, entry_signer, store, mutable).await?;
+        let new_cap = copy_into(target_dir_cap, &child, name, entry_signer.clone(), mirror_bat, store.clone(), mutable).await?;
+        delete_child(source_parent_cap, name, entry_signer, mirror_bat, store, mutable).await?;
         Ok(new_cap)
     }
 }
@@ -2926,10 +2915,11 @@ pub async fn delete_child(
     dir_cap: &AbsoluteCapability,
     name: &str,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<()> {
-    let mut ctx = begin_dir_write(dir_cap, entry_signer, &store, mutable).await?;
+    let mut ctx = begin_dir_write(dir_cap, entry_signer, mirror_bat, &store, mutable).await?;
 
     // Walk the directory chunk chain, collecting each chunk's children.
     struct DirChunk {
@@ -2988,7 +2978,7 @@ pub async fn delete_child(
             &dir_cap.r_base_key,
             &ChildrenLinks::Named(chunk.children.clone()).to_cbor(),
             MIN_FRAGMENT_SIZE,
-            None,
+            ctx.mirror_bat.as_ref(),
         )?;
         put_raw_blocks_signed(store.as_ref(), &dir_cap.owner, &ctx.signer, fragments, &ctx.tid).await?;
         let new_node = chunk.node.with_children_or_data(children_data.to_cbor());
@@ -3080,7 +3070,7 @@ async fn recommit_dir_chunk(
         &dir_cap.r_base_key,
         &ChildrenLinks::Named(children).to_cbor(),
         MIN_FRAGMENT_SIZE,
-        None,
+        ctx.mirror_bat.as_ref(),
     )?;
     put_raw_blocks_signed(store.as_ref(), &dir_cap.owner, &ctx.signer, fragments, &ctx.tid).await?;
     let new_node = node.with_children_or_data(children_data.to_cbor());
@@ -3138,13 +3128,14 @@ pub async fn rename_child(
     old_name: &str,
     new_name: &str,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<()> {
     if new_name.is_empty() || new_name.contains('/') {
         return Err(Error::Protocol(format!("illegal file name: {new_name}")));
     }
-    let mut ctx = begin_dir_write(dir_cap, entry_signer, &store, mutable).await?;
+    let mut ctx = begin_dir_write(dir_cap, entry_signer, mirror_bat, &store, mutable).await?;
     let mut chunks = collect_dir_chunks(dir_cap, &ctx, &store).await?;
 
     // The target name must be free, and the source must exist.
@@ -3242,7 +3233,7 @@ async fn open_transaction(
 ) -> Result<bool> {
     let (tdir, signer) = transactions_dir(home_cap, store.clone(), mutable).await?;
     let existed = list_directory(&tdir, store.clone(), mutable).await?.iter().any(|e| e.name == txn.name);
-    upload_file(&tdir, &txn.name, &txn.to_cbor().to_bytes(), None, Some(signer), store, mutable).await?;
+    upload_file(&tdir, &txn.name, &txn.to_cbor().to_bytes(), None, Some(signer), None, store, mutable).await?;
     Ok(existed)
 }
 
@@ -3255,7 +3246,7 @@ async fn close_transaction_record(
 ) -> Result<()> {
     let (tdir, signer) = transactions_dir(home_cap, store.clone(), mutable).await?;
     if list_directory(&tdir, store.clone(), mutable).await?.iter().any(|e| e.name == name) {
-        delete_child(&tdir, name, Some(signer), store, mutable).await?;
+        delete_child(&tdir, name, Some(signer), None, store, mutable).await?;
     }
     Ok(())
 }
@@ -3323,11 +3314,13 @@ async fn upload_signer(
 /// each chunk** (so a failure leaves a resumable/cleanable partial upload). Keys,
 /// stream secret and properties all come from `txn`; `tree` is the content hash
 /// tree for a fresh upload (a resume reuses `txn.props.tree_hash` for chunk 0).
+#[allow(clippy::too_many_arguments)]
 async fn upload_txn_chunks<R, F>(
     dir_cap: &AbsoluteCapability,
     txn: &FileUploadTransaction,
     tree: Option<&hashtree::HashTree>,
     start_chunk: usize,
+    mirror_bat: Option<&BatId>,
     open: F,
     store: &Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
@@ -3389,7 +3382,7 @@ where
             &txn.data_key,
             &CborObject::ByteString(buf[..want].to_vec()),
             MIN_FRAGMENT_SIZE,
-            None,
+            mirror_bat,
         )?;
         let next_chunk = RelCap::subsequent_chunk(next_map_key.clone(), next_bat.clone(), txn.base_key.clone());
         let from_base = CborObject::map().put("k", txn.data_key.to_cbor()).put("n", next_chunk.to_cbor()).build();
@@ -3409,15 +3402,9 @@ where
             };
         }
         let from_parent = CborObject::map().put("p", to_parent.to_cbor()).put("s", props.to_cbor()).build();
-        let inline_bat = bat
-            .as_ref()
-            .map(|b| BatId::inline(b).map(|id| id.to_cbor()))
-            .transpose()?
-            .into_iter()
-            .collect();
         let node = CryptreeNode::new(
             false,
-            inline_bat,
+            node_bats_opt(bat.as_ref(), mirror_bat)?,
             PaddedCipherText::build(&txn.base_key, &from_base, BASE_BLOCK_PADDING_BLOCKSIZE)?,
             PaddedCipherText::build(&txn.base_key, &from_parent, META_DATA_PADDING_BLOCKSIZE)?,
             data.to_cbor(),
@@ -3448,6 +3435,7 @@ where
 async fn add_file_child_link(
     dir_cap: &AbsoluteCapability,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
     txn: &FileUploadTransaction,
     store: &Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
@@ -3460,7 +3448,7 @@ async fn add_file_child_link(
         txn.base_key.clone(),
         Some(txn.write_key.clone()),
     )?;
-    let ctx = begin_dir_write(dir_cap, entry_signer, store, mutable).await?;
+    let ctx = begin_dir_write(dir_cap, entry_signer, mirror_bat, store, mutable).await?;
     let w_link = dir_cap
         .w_base_key
         .as_ref()
@@ -3499,6 +3487,7 @@ pub async fn upload_file_with_transaction<R, F>(
     size: u64,
     thumbnail: Option<(String, Vec<u8>)>,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
     open: F,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
@@ -3550,8 +3539,8 @@ where
     if let Some(existing) = get_open_transaction(home_cap, &txn_name, store.clone(), mutable).await? {
         if existing.size == size && existing.props.tree_hash == props.tree_hash {
             let start = find_first_absent_chunk(&existing, &store, mutable).await? as usize;
-            upload_txn_chunks(dir_cap, &existing, None, start, &open, &store, mutable).await?;
-            let file_cap = add_file_child_link(dir_cap, Some(existing.writer.clone()), &existing, &store, mutable).await?;
+            upload_txn_chunks(dir_cap, &existing, None, start, mirror_bat, &open, &store, mutable).await?;
+            let file_cap = add_file_child_link(dir_cap, Some(existing.writer.clone()), mirror_bat, &existing, &store, mutable).await?;
             close_transaction_record(home_cap, &existing.name, store, mutable).await?;
             return Ok(file_cap);
         }
@@ -3575,9 +3564,9 @@ where
     };
 
     open_transaction(home_cap, &txn, store.clone(), mutable).await?;
-    upload_txn_chunks(dir_cap, &txn, Some(&tree), 0, &open, &store, mutable).await?;
+    upload_txn_chunks(dir_cap, &txn, Some(&tree), 0, mirror_bat, &open, &store, mutable).await?;
     // The transaction's writer is the parent's writer, so it links the child too.
-    let file_cap = add_file_child_link(dir_cap, Some(txn.writer.clone()), &txn, &store, mutable).await?;
+    let file_cap = add_file_child_link(dir_cap, Some(txn.writer.clone()), mirror_bat, &txn, &store, mutable).await?;
     close_transaction_record(home_cap, &txn.name, store, mutable).await?;
     Ok(file_cap)
 }
@@ -3598,6 +3587,7 @@ pub async fn upload_file_streaming_auto<R, F>(
     size: u64,
     thumbnail: Option<(String, Vec<u8>)>,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
     open: F,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
@@ -3607,10 +3597,10 @@ where
     F: Fn() -> std::io::Result<R>,
 {
     if size <= retrieve::CHUNK_MAX_SIZE {
-        upload_file_streaming(dir_cap, name, size, thumbnail, entry_signer, open, store, mutable).await
+        upload_file_streaming(dir_cap, name, size, thumbnail, entry_signer, mirror_bat, open, store, mutable).await
     } else {
         upload_file_with_transaction(
-            home_cap, dir_cap, path, name, size, thumbnail, entry_signer, open, store, mutable,
+            home_cap, dir_cap, path, name, size, thumbnail, entry_signer, mirror_bat, open, store, mutable,
         )
         .await
     }
@@ -3627,6 +3617,7 @@ pub async fn upload_file_auto(
     contents: &[u8],
     thumbnail: Option<(String, Vec<u8>)>,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<AbsoluteCapability> {
@@ -3638,6 +3629,7 @@ pub async fn upload_file_auto(
         contents.len() as u64,
         thumbnail,
         entry_signer,
+        mirror_bat,
         || Ok(std::io::Cursor::new(contents)),
         store,
         mutable,
@@ -3683,6 +3675,7 @@ pub async fn resume_transaction<R, F>(
     dir_cap: &AbsoluteCapability,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
     txn: &FileUploadTransaction,
+    mirror_bat: Option<&BatId>,
     open: F,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
@@ -3693,8 +3686,8 @@ where
 {
     let _ = &entry_signer; // the transaction records the parent's writer directly
     let start = find_first_absent_chunk(txn, &store, mutable).await? as usize;
-    upload_txn_chunks(dir_cap, txn, None, start, &open, &store, mutable).await?;
-    let file_cap = add_file_child_link(dir_cap, Some(txn.writer.clone()), txn, &store, mutable).await?;
+    upload_txn_chunks(dir_cap, txn, None, start, mirror_bat, &open, &store, mutable).await?;
+    let file_cap = add_file_child_link(dir_cap, Some(txn.writer.clone()), mirror_bat, txn, &store, mutable).await?;
     close_transaction_record(home_cap, &txn.name, store, mutable).await?;
     Ok(file_cap)
 }

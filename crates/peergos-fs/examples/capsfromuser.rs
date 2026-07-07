@@ -47,8 +47,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let signer = peergos_fs::recover_signer(&home, store.clone(), &mutable).await?;
     let n = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let dir = format!("docs{n}");
-    let docs = peergos_fs::create_directory(&home, &dir, Some(signer.clone()), store.clone(), &mutable).await?;
-    let a_cap = peergos_fs::upload_file(&docs, "a.txt", b"first shared file", None, Some(signer.clone()), store.clone(), &mutable).await?;
+    let docs = peergos_fs::create_directory(&home, &dir, Some(signer.clone()), None, store.clone(), &mutable).await?;
+    let a_cap = peergos_fs::upload_file(&docs, "a.txt", b"first shared file", None, Some(signer.clone()), None, store.clone(), &mutable).await?;
     peergos_fs::share_read_access(&alice, &format!("{dir}/a.txt"), &a_cap, bu, store.clone(), &mutable).await?;
     println!("{au:?} shared {dir}/a.txt with {bu:?}");
 
@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Alice shares a second file; bob resumes from the previous offset.
     let offset = first.bytes_read;
-    let b_cap = peergos_fs::upload_file(&docs, "b.txt", b"second shared file", None, Some(signer.clone()), store.clone(), &mutable).await?;
+    let b_cap = peergos_fs::upload_file(&docs, "b.txt", b"second shared file", None, Some(signer.clone()), None, store.clone(), &mutable).await?;
     peergos_fs::share_read_access(&alice, &format!("{dir}/b.txt"), &b_cap, bu, store.clone(), &mutable).await?;
     println!("\n{au:?} shared a second file; bob resumes from bytes_read={offset}");
 

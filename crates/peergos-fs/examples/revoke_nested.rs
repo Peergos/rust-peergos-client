@@ -71,7 +71,7 @@ async fn try_write(
             Ok(s) => s,
             Err(e) => { last_err = e.into(); continue; }
         };
-        match peergos_fs::upload_file(&cap, filename, content, None, Some(signer), store.clone(), mutable).await {
+        match peergos_fs::upload_file(&cap, filename, content, None, Some(signer), None, store.clone(), mutable).await {
             Ok(_) => return Ok(()),
             Err(e) => last_err = e.into(),
         }
@@ -102,8 +102,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let alice = peergos_fs::login(au, ap, &poster, store.clone(), &mutable, None).await?;
     let home = alice.home().ok_or("no home")?.clone();
     let signer = peergos_fs::recover_signer(&home, store.clone(), &mutable).await?;
-    let parent = peergos_fs::create_directory(&home, "parent", Some(signer.clone()), store.clone(), &mutable).await?;
-    peergos_fs::create_directory(&parent, "sub", Some(signer.clone()), store.clone(), &mutable).await?;
+    let parent = peergos_fs::create_directory(&home, "parent", Some(signer.clone()), None, store.clone(), &mutable).await?;
+    peergos_fs::create_directory(&parent, "sub", Some(signer.clone()), None, store.clone(), &mutable).await?;
     peergos_fs::share_write_access(&alice, "parent", &parent, "sub", bu, store.clone(), &mutable).await?;
     peergos_fs::share_write_access(&alice, "parent", &parent, "sub", cu, store.clone(), &mutable).await?;
     println!("{au:?} write-shared parent/sub with {bu:?} and {cu:?}");

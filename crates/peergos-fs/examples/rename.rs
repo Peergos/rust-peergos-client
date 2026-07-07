@@ -37,10 +37,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- File rename (content must survive) -----------------------------------
     println!("\n== File rename ==");
-    peergos_fs::upload_file(&home, "before.txt", b"rename me", None, Some(signer.clone()), store.clone(), &mutable).await?;
+    peergos_fs::upload_file(&home, "before.txt", b"rename me", None, Some(signer.clone()), None, store.clone(), &mutable).await?;
     names("after upload", &home, store.clone(), &mutable).await;
 
-    peergos_fs::rename_child(&home, "before.txt", "after.txt", Some(signer.clone()), store.clone(), &mutable).await?;
+    peergos_fs::rename_child(&home, "before.txt", "after.txt", Some(signer.clone()), None, store.clone(), &mutable).await?;
     let after = names("after rename", &home, store.clone(), &mutable).await;
     assert!(after.contains(&"after.txt".to_string()) && !after.contains(&"before.txt".to_string()), "rename did not take effect");
 
@@ -54,16 +54,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Directory rename -----------------------------------------------------
     println!("\n== Directory rename ==");
-    peergos_fs::create_directory(&home, "olddir", Some(signer.clone()), store.clone(), &mutable).await?;
+    peergos_fs::create_directory(&home, "olddir", Some(signer.clone()), None, store.clone(), &mutable).await?;
     names("after mkdir", &home, store.clone(), &mutable).await;
-    peergos_fs::rename_child(&home, "olddir", "newdir", Some(signer.clone()), store.clone(), &mutable).await?;
+    peergos_fs::rename_child(&home, "olddir", "newdir", Some(signer.clone()), None, store.clone(), &mutable).await?;
     let after = names("after rename", &home, store.clone(), &mutable).await;
     assert!(after.contains(&"newdir".to_string()) && !after.contains(&"olddir".to_string()), "dir rename did not take effect");
     println!("  directory rename OK");
 
     // --- Cleanup --------------------------------------------------------------
-    peergos_fs::delete_child(&home, "after.txt", Some(signer.clone()), store.clone(), &mutable).await?;
-    peergos_fs::delete_child(&home, "newdir", Some(signer.clone()), store.clone(), &mutable).await?;
+    peergos_fs::delete_child(&home, "after.txt", Some(signer.clone()), None, store.clone(), &mutable).await?;
+    peergos_fs::delete_child(&home, "newdir", Some(signer.clone()), None, store.clone(), &mutable).await?;
     names("after cleanup", &home, store.clone(), &mutable).await;
 
     println!("\nAll rename checks passed.");

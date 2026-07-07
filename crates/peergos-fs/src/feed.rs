@@ -503,7 +503,7 @@ impl SocialFeed {
         let home = self.ctx.get_home().await?;
         let signer = crate::recover_signer(home.capability(), self.ctx.store(), self.ctx.mutable().as_ref()).await?;
         // Overwrite the parent post in place so its capability (and any share) stays valid.
-        crate::overwrite_file(file.capability(), &parent.serialize(), &signer, self.ctx.store(), self.ctx.mutable().as_ref())
+        crate::overwrite_file(file.capability(), &parent.serialize(), &signer, self.ctx.mirror_bat_id().as_ref(), self.ctx.store(), self.ctx.mutable().as_ref())
             .await
     }
 

@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. A normal transactional upload completes and leaves no open transaction.
     println!("== Normal upload ==");
     let cap = peergos_fs::upload_file_with_transaction(
-        &home, &home, "/w2/normal.bin", "normal.bin", size as u64, None, None, reader.clone(),
+        &home, &home, "/w2/normal.bin", "normal.bin", size as u64, None, None, None, reader.clone(),
         store.clone(), &mutable).await?;
     let open = peergos_fs::list_open_transactions(&home, store.clone(), &mutable).await?;
     let (_p, back) = peergos_fs::read_file(&cap, store.clone(), &mutable).await?;
@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let err = peergos_fs::upload_file_with_transaction(
-        &home, &home, "/w2/big.bin", "big.bin", size as u64, None, None, open2,
+        &home, &home, "/w2/big.bin", "big.bin", size as u64, None, None, None, open2,
         store.clone(), &mutable).await;
     println!("  upload result: {:?}", err.as_ref().map(|_| "ok").map_err(|e| e.to_string()));
     assert!(err.is_err(), "upload should have been interrupted");
@@ -74,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n== Resume ==");
     let txn = open.into_iter().next().unwrap();
     let full = { let d = data.clone(); move || Ok(Cursor::new(d.clone())) };
-    let resumed = peergos_fs::resume_transaction(&home, &home, None, &txn, full, store.clone(), &mutable).await?;
+    let resumed = peergos_fs::resume_transaction(&home, &home, None, &txn, None, full, store.clone(), &mutable).await?;
     let after = peergos_fs::list_open_transactions(&home, store.clone(), &mutable).await?;
     let (_p, back) = peergos_fs::read_file(&resumed, store.clone(), &mutable).await?;
     println!("  resumed; open transactions: {}; read-back matches: {}", after.len(), back == data);
@@ -95,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let _ = peergos_fs::upload_file_with_transaction(
-        &home, &home, "/w2/scratch.bin", "scratch.bin", size as u64, None, None, open3, store.clone(), &mutable).await;
+        &home, &home, "/w2/scratch.bin", "scratch.bin", size as u64, None, None, None, open3, store.clone(), &mutable).await;
     let open = peergos_fs::list_open_transactions(&home, store.clone(), &mutable).await?;
     assert_eq!(open.len(), 1, "expected a stuck transaction to clear");
     peergos_fs::clear_transaction(&home, &open[0], store.clone(), &mutable).await?;

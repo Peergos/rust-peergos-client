@@ -32,8 +32,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- copy_to with unique naming ------------------------------------------
     println!("== copy_to (unique naming) ==");
     let c = format!("c{n}.txt");
-    peergos_fs::upload_file(&home, &c, b"copy me", None, Some(s.clone()), store.clone(), &mutable).await?;
-    let copy = peergos_fs::copy_to(&home, &c, &home, Some(s.clone()), store.clone(), &mutable).await?;
+    peergos_fs::upload_file(&home, &c, b"copy me", None, Some(s.clone()), None, store.clone(), &mutable).await?;
+    let copy = peergos_fs::copy_to(&home, &c, &home, Some(s.clone()), None, store.clone(), &mutable).await?;
     let (props, data) = peergos_fs::read_file(&copy, store.clone(), &mutable).await?;
     println!("  {c:?} copied to {:?}: {:?}", props.name, String::from_utf8_lossy(&data));
     assert_eq!(props.name, format!("c{n} (copy).txt"));
@@ -42,9 +42,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- descendant guard ----------------------------------------------------
     println!("\n== descendant guard ==");
     let adir = format!("a{n}");
-    let a = peergos_fs::create_directory(&home, &adir, Some(s.clone()), store.clone(), &mutable).await?;
-    let b = peergos_fs::create_directory(&a, "b", Some(s.clone()), store.clone(), &mutable).await?;
-    let guard = peergos_fs::move_to(&home, &adir, &b, true, Some(s.clone()), store.clone(), &mutable).await;
+    let a = peergos_fs::create_directory(&home, &adir, Some(s.clone()), None, store.clone(), &mutable).await?;
+    let b = peergos_fs::create_directory(&a, "b", Some(s.clone()), None, store.clone(), &mutable).await?;
+    let guard = peergos_fs::move_to(&home, &adir, &b, true, Some(s.clone()), None, store.clone(), &mutable).await;
     println!("  move {adir}/ into {adir}/b rejected: {:?}", guard.as_ref().err().map(|e| e.to_string()));
     assert!(guard.is_err(), "should refuse to move a folder into its own descendant");
 
@@ -52,9 +52,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n== keep_access=false (force slow path) ==");
     let kf = format!("k{n}.txt");
     let kd = format!("kdest{n}");
-    let k = peergos_fs::upload_file(&home, &kf, b"drop shares", None, Some(s.clone()), store.clone(), &mutable).await?;
+    let k = peergos_fs::upload_file(&home, &kf, b"drop shares", None, Some(s.clone()), None, store.clone(), &mutable).await?;
     peergos_fs::share_read_access(&user, &kf, &k, "bob", store.clone(), &mutable).await?;
-    let kdest = peergos_fs::create_directory(&home, &kd, Some(s.clone()), store.clone(), &mutable).await?;
+    let kdest = peergos_fs::create_directory(&home, &kd, Some(s.clone()), None, store.clone(), &mutable).await?;
     println!("  before: shared-with({kf})={:?}", peergos_fs::get_shared_with(&user, &kf, peergos_fs::Access::Read, store.clone(), &mutable).await?);
     let new_k = peergos_fs::move_file(&user, &home, "", &kf, &kdest, &kd, false, Some(s.clone()), store.clone(), &mutable).await?;
     let after = peergos_fs::get_shared_with(&user, &format!("{kd}/{kf}"), peergos_fs::Access::Read, store.clone(), &mutable).await?;
@@ -67,9 +67,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n== path-aware cache rewrite (fast move keeps shares at the new path) ==");
     let mf = format!("m{n}.txt");
     let md = format!("mdest{n}");
-    let m = peergos_fs::upload_file(&home, &mf, b"keep shares", None, Some(s.clone()), store.clone(), &mutable).await?;
+    let m = peergos_fs::upload_file(&home, &mf, b"keep shares", None, Some(s.clone()), None, store.clone(), &mutable).await?;
     peergos_fs::share_read_access(&user, &mf, &m, "bob", store.clone(), &mutable).await?;
-    let mdest = peergos_fs::create_directory(&home, &md, Some(s.clone()), store.clone(), &mutable).await?;
+    let mdest = peergos_fs::create_directory(&home, &md, Some(s.clone()), None, store.clone(), &mutable).await?;
     let new_m = peergos_fs::move_file(&user, &home, "", &mf, &mdest, &md, true, Some(s.clone()), store.clone(), &mutable).await?;
     let at_old = peergos_fs::get_shared_with(&user, &mf, peergos_fs::Access::Read, store.clone(), &mutable).await?;
     let at_new = peergos_fs::get_shared_with(&user, &format!("{md}/{mf}"), peergos_fs::Access::Read, store.clone(), &mutable).await?;

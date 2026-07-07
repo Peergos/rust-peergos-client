@@ -17,7 +17,7 @@ use crate::mfa::MultiFactorAuthResponse;
 use crate::signup::signup;
 use peergos_cbor::CborObject;
 use peergos_core::error::{Error, Result};
-use peergos_core::auth::BatWithId;
+use peergos_core::auth::{BatId, BatWithId};
 use peergos_core::keys::SecretSigningKey;
 use peergos_core::mutable::MutablePointers;
 use peergos_core::storage::{url_encode, ContentAddressedStorage};
@@ -150,6 +150,11 @@ impl UserContext {
     pub fn mutable(&self) -> Arc<dyn MutablePointers> {
         self.mutable.clone()
     }
+    /// The logged-in user's mirror BAT id (hash form), threaded into block writes
+    /// so raw fragments and cryptree nodes are gated for the storage mirror.
+    pub fn mirror_bat_id(&self) -> Option<BatId> {
+        self.user.as_ref().and_then(|u| u.mirror_bat_id())
+    }
     pub fn poster(&self) -> Arc<dyn HttpPoster> {
         self.poster.clone()
     }
@@ -189,7 +194,8 @@ impl UserContext {
                         self.mutable.clone(),
                     )
                     .await?
-                    .with_cache(self.cache.clone()),
+                    .with_cache(self.cache.clone())
+                    .with_mirror_bat(self.mirror_bat_id()),
                 );
             }
         } else {
@@ -241,20 +247,8 @@ impl UserContext {
     /// endpoint and authorised by a time-limited signed request. `None` if the
     /// account has no registered BAT. Used to keep secret-link data private.
     pub async fn get_mirror_bat(&self) -> Result<Option<BatWithId>> {
-        let user = self.require_user()?;
-        let path = "peergos/v0/bats/getUserBats";
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-        let req = CborObject::map()
-            .put("p", CborObject::Str(path.to_string()))
-            .put("t", CborObject::Long(now))
-            .build();
-        let auth = to_hex(&user.signer.secret.sign_message(&req.to_bytes())?);
-        let url = format!("{path}?username={}&auth={auth}", url_encode(&user.username));
-        let raw = self.poster.get(&url).await?;
-        match CborObject::from_bytes(&raw)? {
-            CborObject::List(items) => items.last().map(BatWithId::from_cbor).transpose(),
-            _ => Ok(None),
-        }
+        // Fetched once at login and cached on the user.
+        Ok(self.require_user()?.mirror_bat.clone())
     }
 
     /// Generate a shareable secret link to the file/dir at `path`
@@ -295,10 +289,11 @@ impl UserContext {
                 .child(name)
                 .await?
                 .ok_or_else(|| Error::Protocol(format!("no file at {path}")))?;
+            let mb = self.require_user()?.mirror_bat_id();
             let writable_cap = if target.is_directory() {
-                crate::move_dir_to_own_writer(&parent_cap, name, parent.signer().cloned(), self.store.clone(), self.mutable.as_ref()).await?
+                crate::move_dir_to_own_writer(&parent_cap, name, parent.signer().cloned(), mb.as_ref(), self.store.clone(), self.mutable.as_ref()).await?
             } else {
-                crate::move_file_to_own_writer(&parent_cap, name, parent.signer().cloned(), self.store.clone(), self.mutable.as_ref()).await?
+                crate::move_file_to_own_writer(&parent_cap, name, parent.signer().cloned(), mb.as_ref(), self.store.clone(), self.mutable.as_ref()).await?
             };
             // The relocation should have given it its own writer; assert the invariant.
             if writable_cap.writer == parent_cap.writer {

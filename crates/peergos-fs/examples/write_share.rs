@@ -37,8 +37,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // it, then grants bob write access — which rotates it into its own writer.
     let home = alice.home().ok_or("no home")?.clone();
     let signer0 = peergos_fs::recover_signer(&home, store.clone(), &mutable).await?;
-    let collab0 = peergos_fs::create_directory(&home, "collab", Some(signer0.clone()), store.clone(), &mutable).await?;
-    peergos_fs::upload_file(&collab0, "readme.txt", b"pre-existing content", None, Some(signer0), store.clone(), &mutable).await?;
+    let collab0 = peergos_fs::create_directory(&home, "collab", Some(signer0.clone()), None, store.clone(), &mutable).await?;
+    peergos_fs::upload_file(&collab0, "readme.txt", b"pre-existing content", None, Some(signer0), None, store.clone(), &mutable).await?;
     println!("{au:?} created ordinary dir 'collab' (writer == home writer: {})", collab0.writer == home.writer);
 
     println!("{au:?} granting {bu:?} write access to 'collab' (rotates to its own writer) ...");
@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bob_signer = peergos_fs::recover_signer(&collab_for_bob, store.clone(), &mutable).await?;
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let content = format!("written by bob #{nonce}");
-    peergos_fs::upload_file(&collab_for_bob, "from-bob.txt", content.as_bytes(), None, Some(bob_signer), store.clone(), &mutable).await?;
+    peergos_fs::upload_file(&collab_for_bob, "from-bob.txt", content.as_bytes(), None, Some(bob_signer), None, store.clone(), &mutable).await?;
     println!("{bu:?} wrote from-bob.txt = {content:?} into {au:?}'s directory");
 
     // Alice re-reads collab and sees bob's file with the right content.

@@ -37,24 +37,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- File deletion --------------------------------------------------------
     println!("\n== File deletion ==");
-    peergos_fs::upload_file(&home, "todelete.txt", b"delete me", None, Some(signer.clone()), store.clone(), &mutable).await?;
+    peergos_fs::upload_file(&home, "todelete.txt", b"delete me", None, Some(signer.clone()), None, store.clone(), &mutable).await?;
     let before = names("after upload", &home, store.clone(), &mutable).await;
     assert!(before.contains(&"todelete.txt".to_string()), "file should be present after upload");
 
-    peergos_fs::delete_child(&home, "todelete.txt", Some(signer.clone()), store.clone(), &mutable).await?;
+    peergos_fs::delete_child(&home, "todelete.txt", Some(signer.clone()), None, store.clone(), &mutable).await?;
     let after = names("after delete", &home, store.clone(), &mutable).await;
     assert!(!after.contains(&"todelete.txt".to_string()), "file should be gone after delete");
     println!("  file deletion OK");
 
     // --- Recursive directory deletion ----------------------------------------
     println!("\n== Directory deletion ==");
-    let subdir = peergos_fs::create_directory(&home, "dir-to-delete", Some(signer.clone()), store.clone(), &mutable).await?;
+    let subdir = peergos_fs::create_directory(&home, "dir-to-delete", Some(signer.clone()), None, store.clone(), &mutable).await?;
     // Put a file inside the subdir (subdirs share the entry point's signer).
-    peergos_fs::upload_file(&subdir, "inner.txt", b"inside", None, Some(signer.clone()), store.clone(), &mutable).await?;
+    peergos_fs::upload_file(&subdir, "inner.txt", b"inside", None, Some(signer.clone()), None, store.clone(), &mutable).await?;
     let before = names("after mkdir+upload", &home, store.clone(), &mutable).await;
     assert!(before.contains(&"dir-to-delete".to_string()), "subdir should be present");
 
-    peergos_fs::delete_child(&home, "dir-to-delete", Some(signer.clone()), store.clone(), &mutable).await?;
+    peergos_fs::delete_child(&home, "dir-to-delete", Some(signer.clone()), None, store.clone(), &mutable).await?;
     let after = names("after delete", &home, store.clone(), &mutable).await;
     assert!(!after.contains(&"dir-to-delete".to_string()), "subdir should be gone after delete");
     println!("  recursive directory deletion OK");

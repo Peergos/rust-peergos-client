@@ -40,6 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         size,
         None,
         None,
+        None,
         move || File::open(&path_up),
         store.clone(),
         &mutable,

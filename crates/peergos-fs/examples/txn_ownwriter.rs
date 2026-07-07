@@ -26,15 +26,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let data: Vec<u8> = (0..1500u32).map(|i| i as u8).collect();
 
-    let plain = peergos_fs::create_directory(&home, "plain", Some(signer.clone()), store.clone(), &mutable).await?;
-    peergos_fs::create_directory(&home, "own", Some(signer.clone()), store.clone(), &mutable).await?;
-    let own = peergos_fs::move_dir_to_own_writer(&home, "own", None, store.clone(), &mutable).await?;
+    let plain = peergos_fs::create_directory(&home, "plain", Some(signer.clone()), None, store.clone(), &mutable).await?;
+    peergos_fs::create_directory(&home, "own", Some(signer.clone()), None, store.clone(), &mutable).await?;
+    let own = peergos_fs::move_dir_to_own_writer(&home, "own", None, None, store.clone(), &mutable).await?;
 
     for (label, dir) in [("home", &home), ("plain-subdir", &plain), ("own-writer", &own)] {
         let d = data.clone();
         let path = format!("/w2/{label}/f.bin");
         let cap = peergos_fs::upload_file_with_transaction(
-            &home, dir, &path, "f.bin", data.len() as u64, None, None,
+            &home, dir, &path, "f.bin", data.len() as u64, None, None, None,
             move || Ok(Cursor::new(d.clone())), store.clone(), &mutable).await?;
         let open = peergos_fs::list_open_transactions(&home, store.clone(), &mutable).await?;
         let (_p, back) = peergos_fs::read_file(&cap, store.clone(), &mutable).await?;

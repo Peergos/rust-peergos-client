@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Alice shares a file with the followers group (not bob directly).
     let n = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let f1 = format!("group-a-{n}.txt");
-    let c1 = peergos_fs::upload_file(&home, &f1, b"hello followers", None, Some(signer.clone()), store.clone(), mutable.as_ref()).await?;
+    let c1 = peergos_fs::upload_file(&home, &f1, b"hello followers", None, Some(signer.clone()), None, store.clone(), mutable.as_ref()).await?;
     peergos_fs::share_read_with_group(&alice, &f1, &c1, peergos_fs::FOLLOWERS_GROUP, store.clone(), mutable.as_ref()).await?;
     println!("shared {f1:?} with the followers group");
 
@@ -83,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Incremental: a second file shared with the group is picked up next update.
     let f2 = format!("group-b-{n}.txt");
-    let c2 = peergos_fs::upload_file(&home, &f2, b"more for followers", None, Some(signer.clone()), store.clone(), mutable.as_ref()).await?;
+    let c2 = peergos_fs::upload_file(&home, &f2, b"more for followers", None, Some(signer.clone()), None, store.clone(), mutable.as_ref()).await?;
     peergos_fs::share_read_with_group(&alice, &f2, &c2, peergos_fs::FOLLOWERS_GROUP, store.clone(), mutable.as_ref()).await?;
     let added2 = cache.update_from_friend(au, &alice_entry.pointer).await?;
     println!("\nafter a 2nd group share, bob pulled {} cap(s)", added2.len());
@@ -93,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Write-sharing WITH a group (sender side): alice write-shares a directory with
     // her friends group; the friends uid is recorded in the WRITE shared-with cache.
     let wdir = format!("wgroup-{n}");
-    peergos_fs::create_directory(&home, &wdir, Some(signer.clone()), store.clone(), mutable.as_ref()).await?;
+    peergos_fs::create_directory(&home, &wdir, Some(signer.clone()), None, store.clone(), mutable.as_ref()).await?;
     peergos_fs::share_write_with_group(&alice, "", &home, &wdir, peergos_fs::FRIENDS_GROUP, store.clone(), mutable.as_ref()).await?;
     let friends_uid = groups.uid_for(peergos_fs::FRIENDS_GROUP).unwrap();
     let w_shared = peergos_fs::get_shared_with(&alice, &wdir, peergos_fs::Access::Write, store.clone(), mutable.as_ref()).await?;

@@ -46,8 +46,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let signer = peergos_fs::recover_signer(&home, store.clone(), mutable.as_ref()).await?;
     let n = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let proj = format!("proj{n}");
-    let projdir = peergos_fs::create_directory(&home, &proj, Some(signer.clone()), store.clone(), mutable.as_ref()).await?;
-    let notes = peergos_fs::upload_file(&projdir, "notes.txt", b"project notes", None, Some(signer.clone()), store.clone(), mutable.as_ref()).await?;
+    let projdir = peergos_fs::create_directory(&home, &proj, Some(signer.clone()), None, store.clone(), mutable.as_ref()).await?;
+    let notes = peergos_fs::upload_file(&projdir, "notes.txt", b"project notes", None, Some(signer.clone()), None, store.clone(), mutable.as_ref()).await?;
     peergos_fs::share_read_access(&alice, &format!("{proj}/notes.txt"), &notes, bu, store.clone(), mutable.as_ref()).await?;
     println!("{au:?} shared {proj}/notes.txt with {bu:?}");
 
@@ -74,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(children.iter().any(|(name, _)| name == "notes.txt"));
 
     // Incremental: share a second file, update again — only the new one is pulled.
-    let second = peergos_fs::upload_file(&projdir, "second.txt", b"more notes", None, Some(signer.clone()), store.clone(), mutable.as_ref()).await?;
+    let second = peergos_fs::upload_file(&projdir, "second.txt", b"more notes", None, Some(signer.clone()), None, store.clone(), mutable.as_ref()).await?;
     peergos_fs::share_read_access(&alice, &format!("{proj}/second.txt"), &second, bu, store.clone(), mutable.as_ref()).await?;
     let added2 = cache.update_from_friend(au, &alice_entry.pointer).await?;
     println!("\nafter sharing a 2nd file, bob pulled {} new cap(s)", added2.len());

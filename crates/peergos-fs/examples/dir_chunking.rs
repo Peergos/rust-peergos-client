@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Fresh subdirectory (unique name each run).
     let dirname = format!("chunk-test-{}", std::process::id());
     println!("Creating subdir {dirname:?} (max child links per blob = {limit}) ...");
-    let subdir = peergos_fs::create_directory(&entry_cap, &dirname, Some(signer.clone()), store.clone(), &mutable).await?;
+    let subdir = peergos_fs::create_directory(&entry_cap, &dirname, Some(signer.clone()), None, store.clone(), &mutable).await?;
 
     for i in 0..n {
         let name = format!("file{i:02}.txt");
@@ -41,6 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             format!("contents of {name}").as_bytes(),
             None,
             Some(signer.clone()),
+            None,
             store.clone(),
             &mutable,
         )

@@ -51,19 +51,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- (1) escalation: share a dir read-only, a subdir writable ------------
     let esc = format!("esc{n}");
-    let escdir = peergos_fs::create_directory(&home, &esc, Some(signer.clone()), store.clone(), mutable.as_ref()).await?;
-    peergos_fs::create_directory(&escdir, "sub", Some(signer.clone()), store.clone(), mutable.as_ref()).await?;
+    let escdir = peergos_fs::create_directory(&home, &esc, Some(signer.clone()), None, store.clone(), mutable.as_ref()).await?;
+    peergos_fs::create_directory(&escdir, "sub", Some(signer.clone()), None, store.clone(), mutable.as_ref()).await?;
     peergos_fs::share_read_access(&alice, &esc, &escdir, bu, store.clone(), mutable.as_ref()).await?;
     peergos_fs::share_write_access(&alice, &esc, &escdir, "sub", bu, store.clone(), mutable.as_ref()).await?;
     println!("{au:?} shared {esc}/ read-only and {esc}/sub writable with {bu:?}");
 
     // --- (2) group stand-in: a dir with a sharing.r holding one read cap ------
     let grp = format!("grp{n}");
-    let grpdir = peergos_fs::create_directory(&home, &grp, Some(signer.clone()), store.clone(), mutable.as_ref()).await?;
-    let gtarget = peergos_fs::upload_file(&home, &format!("gfile{n}.txt"), b"shared via a group", None, Some(signer.clone()), store.clone(), mutable.as_ref()).await?;
+    let grpdir = peergos_fs::create_directory(&home, &grp, Some(signer.clone()), None, store.clone(), mutable.as_ref()).await?;
+    let gtarget = peergos_fs::upload_file(&home, &format!("gfile{n}.txt"), b"shared via a group", None, Some(signer.clone()), None, store.clone(), mutable.as_ref()).await?;
     // A sharing file is a concatenation of AbsoluteCapability cbors.
     let sharing_r = gtarget.read_only().to_cbor().to_bytes();
-    peergos_fs::upload_file(&grpdir, "sharing.r", &sharing_r, None, Some(signer.clone()), store.clone(), mutable.as_ref()).await?;
+    peergos_fs::upload_file(&grpdir, "sharing.r", &sharing_r, None, Some(signer.clone()), None, store.clone(), mutable.as_ref()).await?;
     println!("{au:?} built a stand-in group dir {grp}/ sharing gfile{n}.txt");
 
     // Bob updates his mirror: direct shares + the group.

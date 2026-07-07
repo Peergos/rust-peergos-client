@@ -81,6 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &bytes,
         thumbnail,
         None,
+        None,
         store.clone(),
         &mutable,
     )

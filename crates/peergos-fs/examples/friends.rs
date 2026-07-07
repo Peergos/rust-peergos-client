@@ -66,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let content = format!("hello friend #{nonce}");
     let home = alice.home().ok_or("no home")?.clone();
     let signer = peergos_fs::recover_signer(&home, store.clone(), &mutable).await?;
-    let file_cap = peergos_fs::upload_file(&home, "note.txt", content.as_bytes(), None, Some(signer), store.clone(), &mutable).await?;
+    let file_cap = peergos_fs::upload_file(&home, "note.txt", content.as_bytes(), None, Some(signer), None, store.clone(), &mutable).await?;
     peergos_fs::share_read_access(&alice, "note.txt", &file_cap, bu, store.clone(), &mutable).await?;
     println!("\n{au:?} shared note.txt = {content:?}");
 

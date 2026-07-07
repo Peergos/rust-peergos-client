@@ -9,6 +9,7 @@
 use crate::capability::AbsoluteCapability;
 use crate::login::{EntryPoint, LoggedInUser};
 use crate::{create_directory, list_directory, recover_signer};
+use peergos_core::auth::BatId;
 use peergos_cbor::{CborObject, CborString, Cborable};
 use peergos_core::boxing::{BoxingKeyPair, PublicBoxingKey};
 use peergos_core::error::{Error, Result};
@@ -81,6 +82,7 @@ async fn get_or_mkdir(
     dir_cap: &AbsoluteCapability,
     name: &str,
     signer: &peergos_core::keys::SigningPrivateKeyAndPublicHash,
+    mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<AbsoluteCapability> {
@@ -90,7 +92,7 @@ async fn get_or_mkdir(
         .find(|e| e.name == name);
     match existing {
         Some(e) => Ok(e.cap),
-        None => create_directory(dir_cap, name, Some(signer.clone()), store, mutable).await,
+        None => create_directory(dir_cap, name, Some(signer.clone()), mirror_bat, store, mutable).await,
     }
 }
 
@@ -141,7 +143,7 @@ pub async fn send_follow_request(
     let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
     let signer = recover_signer(home, store.clone(), mutable).await?;
     let sharing = sharing_folder(user, store.clone(), mutable).await?;
-    let friend_root = get_or_mkdir(&sharing, target_username, &signer, store.clone(), mutable).await?;
+    let friend_root = get_or_mkdir(&sharing, target_username, &signer, user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
 
     let entry = EntryPoint { pointer: friend_root.read_only(), owner_name: user.username.clone() };
     let requested_key =
@@ -285,7 +287,7 @@ async fn persist_friend_entry_point(
         None => Vec::new(),
     };
     contents.extend_from_slice(&entry.to_cbor().to_bytes());
-    crate::upload_file(home, FROM_FRIENDS_FILE, &contents, None, Some(signer), store, mutable).await?;
+    crate::upload_file(home, FROM_FRIENDS_FILE, &contents, None, Some(signer), user.mirror_bat_id().as_ref(), store, mutable).await?;
     Ok(())
 }
 
@@ -466,7 +468,7 @@ pub async fn unfollow(
     let content = format!("{}\n", blocked.join("\n"));
     let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
     let signer = recover_signer(home, store.clone(), mutable).await?;
-    crate::upload_file(home, BLOCKED_USERNAMES_FILE, content.as_bytes(), None, Some(signer), store, mutable).await?;
+    crate::upload_file(home, BLOCKED_USERNAMES_FILE, content.as_bytes(), None, Some(signer), user.mirror_bat_id().as_ref(), store, mutable).await?;
     Ok(())
 }
 
@@ -521,7 +523,7 @@ pub async fn accept_follow_request(
     let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
     let signer = recover_signer(home, store.clone(), mutable).await?;
     let sharing = sharing_folder(user, store.clone(), mutable).await?;
-    let friend_root = get_or_mkdir(&sharing, &their_name, &signer, store.clone(), mutable).await?;
+    let friend_root = get_or_mkdir(&sharing, &their_name, &signer, user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
 
     // Reply with our entry point; if reciprocating, echo their read key.
     let our_entry = EntryPoint { pointer: friend_root.read_only(), owner_name: user.username.clone() };
@@ -597,7 +599,7 @@ async fn append_cap_to_friend(
     let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
     let signer = recover_signer(home, store.clone(), mutable).await?;
     let sharing = sharing_folder(user, store.clone(), mutable).await?;
-    let friend_dir = get_or_mkdir(&sharing, friend_username, &signer, store.clone(), mutable).await?;
+    let friend_dir = get_or_mkdir(&sharing, friend_username, &signer, user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
     let existing = list_directory(&friend_dir, store.clone(), mutable)
         .await?
         .into_iter()
@@ -607,7 +609,7 @@ async fn append_cap_to_friend(
         None => Vec::new(),
     };
     contents.extend_from_slice(&cap.to_cbor().to_bytes());
-    crate::upload_file(&friend_dir, store_filename, &contents, None, Some(signer), store, mutable).await?;
+    crate::upload_file(&friend_dir, store_filename, &contents, None, Some(signer), user.mirror_bat_id().as_ref(), store, mutable).await?;
     Ok(())
 }
 
@@ -656,9 +658,9 @@ pub async fn share_write_access(
 
     // Rotate the directory into its own writer if it doesn't have one yet.
     let dir_cap =
-        crate::move_dir_to_own_writer(parent_cap, child_name, Some(signer.clone()), store.clone(), mutable).await?;
+        crate::move_dir_to_own_writer(parent_cap, child_name, Some(signer.clone()), user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
     let sharing = sharing_folder(user, store.clone(), mutable).await?;
-    let friend_dir = get_or_mkdir(&sharing, friend_username, &signer, store.clone(), mutable).await?;
+    let friend_dir = get_or_mkdir(&sharing, friend_username, &signer, user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
 
     let existing = list_directory(&friend_dir, store.clone(), mutable)
         .await?
@@ -669,7 +671,7 @@ pub async fn share_write_access(
         None => Vec::new(),
     };
     contents.extend_from_slice(&dir_cap.to_cbor().to_bytes());
-    crate::upload_file(&friend_dir, EDIT_SHARING_FILE, &contents, None, Some(signer), store.clone(), mutable)
+    crate::upload_file(&friend_dir, EDIT_SHARING_FILE, &contents, None, Some(signer), user.mirror_bat_id().as_ref(), store.clone(), mutable)
         .await?;
     let file_path = join_path(parent_path, child_name);
     record_shared_with(user, &file_path, Access::Write, &[friend_username.to_string()], store, mutable).await
@@ -1073,9 +1075,9 @@ async fn cache_dir_for(
         .find(|e| e.name == CAP_CACHE_DIR)
         .ok_or_else(|| Error::Protocol("no capability cache directory".into()))?
         .cap;
-    let mut cur = get_or_mkdir(&cap_cache, OUTBOUND_DIR, &signer, store.clone(), mutable).await?;
+    let mut cur = get_or_mkdir(&cap_cache, OUTBOUND_DIR, &signer, user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
     for comp in dir_path {
-        cur = get_or_mkdir(&cur, comp, &signer, store.clone(), mutable).await?;
+        cur = get_or_mkdir(&cur, comp, &signer, user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
     }
     Ok((cur, signer))
 }
@@ -1110,7 +1112,7 @@ async fn write_shared_with_at(
     mutable: &dyn MutablePointers,
 ) -> Result<()> {
     let (dir, signer) = cache_dir_for(user, dir_path, store.clone(), mutable).await?;
-    crate::upload_file(&dir, DIR_CACHE_FILE, &state.to_cbor().to_bytes(), None, Some(signer), store, mutable)
+    crate::upload_file(&dir, DIR_CACHE_FILE, &state.to_cbor().to_bytes(), None, Some(signer), user.mirror_bat_id().as_ref(), store, mutable)
         .await?;
     Ok(())
 }
@@ -1224,7 +1226,7 @@ pub async fn unshare_read_access(
     // Rotate the child's keys: this re-encrypts and deletes the old content, so
     // any capability the revoked users cached no longer works.
     let new_cap =
-        crate::rotate_child_read_keys(parent_cap, child_name, Some(home_signer), store.clone(), mutable).await?;
+        crate::rotate_child_read_keys(parent_cap, child_name, Some(home_signer), user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
 
     // Update the cache: drop the revoked users.
     let mut state = read_shared_with_at(user, &dir_path, store.clone(), mutable).await?;
@@ -1277,7 +1279,7 @@ pub async fn unshare_write_access(
     // Rotate to a new writer subspace: invalidates the revoked users' cached
     // writable capabilities and deauthorises the old writer.
     let new_target =
-        crate::force_rotate_child_to_new_writer(parent_cap, child_name, Some(home_signer), store.clone(), mutable)
+        crate::force_rotate_child_to_new_writer(parent_cap, child_name, Some(home_signer), user.mirror_bat_id().as_ref(), store.clone(), mutable)
             .await?;
 
     // Update the cache: drop the revoked writers.
@@ -1379,9 +1381,9 @@ pub async fn get_or_create_groups(
 
     let groups = Groups::generate();
     for uid in groups.uid_to_name.keys() {
-        get_or_mkdir(&sharing, uid, &signer, store.clone(), mutable).await?;
+        get_or_mkdir(&sharing, uid, &signer, user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
     }
-    crate::upload_file(&sharing, GROUPS_FILE, &groups.to_cbor().to_bytes(), None, Some(signer), store.clone(), mutable)
+    crate::upload_file(&sharing, GROUPS_FILE, &groups.to_cbor().to_bytes(), None, Some(signer), user.mirror_bat_id().as_ref(), store.clone(), mutable)
         .await?;
     Ok(groups)
 }
@@ -1408,7 +1410,7 @@ async fn group_dir(
     let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
     let signer = recover_signer(home, store.clone(), mutable).await?;
     let sharing = sharing_folder(user, store.clone(), mutable).await?;
-    get_or_mkdir(&sharing, &uid, &signer, store, mutable).await
+    get_or_mkdir(&sharing, &uid, &signer, user.mirror_bat_id().as_ref(), store, mutable).await
 }
 
 /// Add `member` to the named group: grant them read access to the group's sharing
@@ -1493,7 +1495,7 @@ pub async fn move_file(
     let preserved = keep_access && target.writer == source_parent.writer;
 
     let new_cap =
-        crate::move_to(source_parent, name, target, keep_access, entry_signer, store.clone(), mutable).await?;
+        crate::move_to(source_parent, name, target, keep_access, entry_signer, user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
 
     // Clear the shares at the old path (`clearSharedWith`).
     let (old_dir, old_name) = split_path(&old_file_path);

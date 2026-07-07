@@ -58,14 +58,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let signer = peergos_fs::recover_signer(&home, store.clone(), &mutable).await?;
 
     // Upload doc.txt to home, share with bob, make dest/ subdir.
-    let doc = peergos_fs::upload_file(&home, "doc.txt", b"portable secret", None, Some(signer.clone()), store.clone(), &mutable).await?;
+    let doc = peergos_fs::upload_file(&home, "doc.txt", b"portable secret", None, Some(signer.clone()), None, store.clone(), &mutable).await?;
     peergos_fs::share_read_access(&alice, "doc.txt", &doc, "bob", store.clone(), &mutable).await?;
-    let dest = peergos_fs::create_directory(&home, "dest", Some(signer.clone()), store.clone(), &mutable).await?;
+    let dest = peergos_fs::create_directory(&home, "dest", Some(signer.clone()), None, store.clone(), &mutable).await?;
     println!("before: home={:?}, bob-reads-doc.txt={:?}", names(&home, store.clone(), &mutable).await, bob_reads("doc.txt", &poster, store.clone(), &mutable).await);
 
     // FAST move: doc.txt -> dest/ (both share home's writer).
     println!("\n== Fast move (same writer) ==");
-    let moved = peergos_fs::move_to(&home, "doc.txt", &dest, true, Some(signer.clone()), store.clone(), &mutable).await?;
+    let moved = peergos_fs::move_to(&home, "doc.txt", &dest, true, Some(signer.clone()), None, store.clone(), &mutable).await?;
     assert_eq!(moved.map_key, doc.map_key, "fast move should keep the same capability (map key)");
     let home_names = names(&home, store.clone(), &mutable).await;
     let dest_names = names(&dest, store.clone(), &mutable).await;
@@ -84,12 +84,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // SLOW move: a dir into an own-writer directory (different writer -> copy+delete).
     println!("\n== Slow move (different writer) ==");
-    let folder = peergos_fs::create_directory(&home, "folder", Some(signer.clone()), store.clone(), &mutable).await?;
-    peergos_fs::upload_file(&folder, "inner.txt", b"inner data", None, Some(signer.clone()), store.clone(), &mutable).await?;
-    peergos_fs::create_directory(&home, "vault", Some(signer.clone()), store.clone(), &mutable).await?;
-    let vault = peergos_fs::move_dir_to_own_writer(&home, "vault", None, store.clone(), &mutable).await?;
+    let folder = peergos_fs::create_directory(&home, "folder", Some(signer.clone()), None, store.clone(), &mutable).await?;
+    peergos_fs::upload_file(&folder, "inner.txt", b"inner data", None, Some(signer.clone()), None, store.clone(), &mutable).await?;
+    peergos_fs::create_directory(&home, "vault", Some(signer.clone()), None, store.clone(), &mutable).await?;
+    let vault = peergos_fs::move_dir_to_own_writer(&home, "vault", None, None, store.clone(), &mutable).await?;
     println!("  vault has its own writer: {}", vault.writer != home.writer);
-    let new_folder = peergos_fs::move_to(&home, "folder", &vault, true, Some(signer.clone()), store.clone(), &mutable).await?;
+    let new_folder = peergos_fs::move_to(&home, "folder", &vault, true, Some(signer.clone()), None, store.clone(), &mutable).await?;
     let home_names = names(&home, store.clone(), &mutable).await;
     let vault_names = names(&vault, store.clone(), &mutable).await;
     println!("  home now: {home_names:?}");

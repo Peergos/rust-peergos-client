@@ -118,6 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             size,
             thumbnail,
             Some(signer.clone()),
+            None,
             move || File::open(&path2),
             store.clone(),
             &mutable,

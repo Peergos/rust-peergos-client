@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let content = format!("shared secret #{nonce}");
     let filename = "shared.txt";
-    let file_cap = peergos_fs::upload_file(&home, filename, content.as_bytes(), None, Some(signer.clone()), store.clone(), &mutable).await?;
+    let file_cap = peergos_fs::upload_file(&home, filename, content.as_bytes(), None, Some(signer.clone()), None, store.clone(), &mutable).await?;
     println!("{alice_u:?} uploaded {filename:?} = {content:?}");
 
     peergos_fs::send_follow_request(&alice, bob_u, true, poster.as_ref(), store.clone(), &mutable).await?;

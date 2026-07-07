@@ -15,6 +15,7 @@ use crate::cryptree::FileProperties;
 use crate::login::LoggedInUser;
 use crate::DirEntry;
 use peergos_core::error::{Error, Result};
+use peergos_core::auth::BatId;
 use peergos_core::keys::SigningPrivateKeyAndPublicHash;
 use peergos_core::mutable::MutablePointers;
 use peergos_core::storage::ContentAddressedStorage;
@@ -46,6 +47,10 @@ pub struct FileWrapper {
     /// secret-link / public-link context (Java's `transactions == null`), where
     /// uploads are always atomic.
     home_cap: Option<AbsoluteCapability>,
+    /// The logged-in user's mirror BAT id (hash form), threaded into every block
+    /// write so raw fragments and cryptree nodes are gated for the storage mirror.
+    /// `None` in a secret-link context. Inherited by navigation.
+    mirror_bat: Option<BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: Arc<dyn MutablePointers>,
     /// Session-shared decrypted-cryptree-node cache; inherited by navigation so a
@@ -64,6 +69,7 @@ impl FileWrapper {
         let cache = CryptreeCache::new();
         let props = crate::retrieve_file_metadata_cached(&cap, store.clone(), mutable.as_ref(), &cache).await?.1;
         let signer = crate::recover_signer(&cap, store.clone(), mutable.as_ref()).await.ok();
+        let mirror_bat = user.mirror_bat_id();
         Ok(FileWrapper {
             name: user.username.clone(),
             home_cap: Some(cap.clone()),
@@ -71,6 +77,7 @@ impl FileWrapper {
             props,
             signer,
             path: String::new(),
+            mirror_bat,
             store,
             mutable,
             cache,
@@ -81,6 +88,13 @@ impl FileWrapper {
     /// share one cache across every wrapper it hands out).
     pub fn with_cache(mut self, cache: CryptreeCache) -> FileWrapper {
         self.cache = cache;
+        self
+    }
+
+    /// Set the user's mirror BAT (used by [`crate::UserContext`] to thread the
+    /// logged-in user's mirror bat into every wrapper it hands out).
+    pub fn with_mirror_bat(mut self, mirror_bat: Option<BatId>) -> FileWrapper {
+        self.mirror_bat = mirror_bat;
         self
     }
 
@@ -100,7 +114,7 @@ impl FileWrapper {
     ) -> Result<FileWrapper> {
         let cache = CryptreeCache::new();
         let props = crate::retrieve_file_metadata_cached(&cap, store.clone(), mutable.as_ref(), &cache).await?.1;
-        Ok(FileWrapper { name: name.into(), cap, props, signer, path: path.into(), home_cap, store, mutable, cache })
+        Ok(FileWrapper { name: name.into(), cap, props, signer, path: path.into(), home_cap, mirror_bat: None, store, mutable, cache })
     }
 
     // ---- accessors ---------------------------------------------------------
@@ -154,6 +168,7 @@ impl FileWrapper {
             props,
             signer: self.signer.clone(),
             home_cap: self.home_cap.clone(),
+            mirror_bat: self.mirror_bat.clone(),
             store: self.store.clone(),
             mutable: self.mutable.clone(),
             cache: self.cache.clone(),
@@ -171,7 +186,7 @@ impl FileWrapper {
         let cache = CryptreeCache::new();
         let props = crate::retrieve_file_metadata_cached(&cap, store.clone(), mutable.as_ref(), &cache).await?.1;
         let name = props.name.clone();
-        Ok(FileWrapper { name, cap, props, signer, path: String::new(), home_cap: None, store, mutable, cache })
+        Ok(FileWrapper { name, cap, props, signer, path: String::new(), home_cap: None, mirror_bat: None, store, mutable, cache })
     }
 
     /// The children of this directory (`getChildren`), link nodes followed.
@@ -199,6 +214,7 @@ impl FileWrapper {
                     props: rc.properties,
                     signer: self.signer.clone(),
                     home_cap: self.home_cap.clone(),
+                    mirror_bat: self.mirror_bat.clone(),
                     store: self.store.clone(),
                     mutable: self.mutable.clone(),
                     cache: self.cache.clone(),
@@ -272,7 +288,7 @@ impl FileWrapper {
             .or_else(|| self.signer.clone())
             .ok_or_else(|| Error::Protocol("no writer available to overwrite this file".into()))?;
         let prior = self.writer_root().await;
-        let changed = crate::overwrite_file_section(&self.cap, offset, data, &signer, self.store.clone(), self.mutable.as_ref()).await?;
+        let changed = crate::overwrite_file_section(&self.cap, offset, data, &signer, self.mirror_bat.as_ref(), self.store.clone(), self.mutable.as_ref()).await?;
         let changed_refs: Vec<&[u8]> = changed.iter().map(|k| k.as_slice()).collect();
         self.migrate_cache(prior, &changed_refs).await;
         Ok(())
@@ -335,7 +351,7 @@ impl FileWrapper {
     /// Create a subdirectory and return its wrapper (`mkdir`).
     pub async fn mkdir(&self, name: &str) -> Result<FileWrapper> {
         let prior = self.writer_root().await;
-        crate::create_directory(&self.cap, name, self.signer.clone(), self.store.clone(), self.mutable.as_ref())
+        crate::create_directory(&self.cap, name, self.signer.clone(), self.mirror_bat.as_ref(), self.store.clone(), self.mutable.as_ref())
             .await?;
         self.migrate_cache(prior, &[&self.cap.map_key]).await;
         self.child(name).await?.ok_or_else(|| Error::Protocol("mkdir did not create the directory".into()))
@@ -397,7 +413,7 @@ impl FileWrapper {
             .or_else(|| self.signer.clone())
             .ok_or_else(|| Error::Protocol("no writer available to modify this file".into()))?;
         let prior = self.writer_root().await;
-        crate::rewrite_file_content(&self.cap, content, &signer, self.store.clone(), self.mutable.as_ref()).await?;
+        crate::rewrite_file_content(&self.cap, content, &signer, self.mirror_bat.as_ref(), self.store.clone(), self.mutable.as_ref()).await?;
         self.migrate_cache(prior, &[&self.cap.map_key]).await;
         Ok(())
     }
@@ -418,13 +434,14 @@ impl FileWrapper {
                     data,
                     None,
                     self.signer.clone(),
+                    self.mirror_bat.as_ref(),
                     self.store.clone(),
                     self.mutable.as_ref(),
                 )
                 .await?;
             }
             None => {
-                crate::upload_file(&self.cap, name, data, None, self.signer.clone(), self.store.clone(), self.mutable.as_ref())
+                crate::upload_file(&self.cap, name, data, None, self.signer.clone(), self.mirror_bat.as_ref(), self.store.clone(), self.mutable.as_ref())
                     .await?;
             }
         }
@@ -451,6 +468,7 @@ impl FileWrapper {
                     size,
                     None,
                     self.signer.clone(),
+                    self.mirror_bat.as_ref(),
                     open,
                     self.store.clone(),
                     self.mutable.as_ref(),
@@ -464,6 +482,7 @@ impl FileWrapper {
                     size,
                     None,
                     self.signer.clone(),
+                    self.mirror_bat.as_ref(),
                     open,
                     self.store.clone(),
                     self.mutable.as_ref(),
@@ -481,7 +500,7 @@ impl FileWrapper {
         // not merely re-keyed) along with this directory's node. Best-effort.
         let child_key = self.child(name).await.ok().flatten().map(|c| c.cap.map_key.clone());
         let prior = self.writer_root().await;
-        crate::delete_child(&self.cap, name, self.signer.clone(), self.store.clone(), self.mutable.as_ref()).await?;
+        crate::delete_child(&self.cap, name, self.signer.clone(), self.mirror_bat.as_ref(), self.store.clone(), self.mutable.as_ref()).await?;
         let mut changed: Vec<&[u8]> = vec![&self.cap.map_key];
         if let Some(k) = &child_key {
             changed.push(k);
@@ -494,7 +513,7 @@ impl FileWrapper {
     pub async fn rename_child(&self, old_name: &str, new_name: &str) -> Result<()> {
         let child_key = self.child(old_name).await.ok().flatten().map(|c| c.cap.map_key.clone());
         let prior = self.writer_root().await;
-        crate::rename_child(&self.cap, old_name, new_name, self.signer.clone(), self.store.clone(), self.mutable.as_ref())
+        crate::rename_child(&self.cap, old_name, new_name, self.signer.clone(), self.mirror_bat.as_ref(), self.store.clone(), self.mutable.as_ref())
             .await?;
         let mut changed: Vec<&[u8]> = vec![&self.cap.map_key];
         if let Some(k) = &child_key {
@@ -510,7 +529,7 @@ impl FileWrapper {
         let child_key = self.child(name).await.ok().flatten().map(|c| c.cap.map_key.clone());
         let src_prior = self.writer_root().await;
         let dst_prior = target.writer_root().await;
-        let moved = crate::move_to(&self.cap, name, &target.cap, keep_access, self.signer.clone(), self.store.clone(), self.mutable.as_ref())
+        let moved = crate::move_to(&self.cap, name, &target.cap, keep_access, self.signer.clone(), self.mirror_bat.as_ref(), self.store.clone(), self.mutable.as_ref())
             .await?;
         // Both the source directory (child removed) and destination (child added)
         // changed. They may share a writer/tree or not; migrate each independently.
@@ -525,7 +544,7 @@ impl FileWrapper {
 
     /// Copy a child of this directory into `target` (`copyTo`, unique-named).
     pub async fn copy_child(&self, name: &str, target: &FileWrapper) -> Result<AbsoluteCapability> {
-        crate::copy_to(&self.cap, name, &target.cap, self.signer.clone(), self.store.clone(), self.mutable.as_ref())
+        crate::copy_to(&self.cap, name, &target.cap, self.signer.clone(), self.mirror_bat.as_ref(), self.store.clone(), self.mutable.as_ref())
             .await
     }
 }
