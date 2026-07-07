@@ -3,9 +3,9 @@
 //! server. Every server call the client makes goes through `HttpPoster::{get,post}`,
 //! so we parse the URL + body and service it from memory. See `server.md`.
 //!
-//! This module currently covers the **storage** endpoints (blocks, champ lookup,
-//! transactions, id). Mutable pointers, signup/login, social, etc. are layered on
-//! in later milestones.
+//! Covers storage (blocks, champ lookup, transactions, id, secret-link reads),
+//! mutable pointers (CAS), signup + login, space usage, social follow-requests,
+//! BATs, and link-host — enough to run the client's end-to-end tests in-process.
 
 use async_trait::async_trait;
 use peergos_cbor::{Cborable, CborObject};
@@ -17,7 +17,7 @@ use peergos_core::storage::{
     champ_lookup_local, BlockWriteGroup, ChunkMirrorCap, ContentAddressedStorage, TransactionId,
     API_PREFIX,
 };
-use peergos_core::{build_cid, hash_to_cid, RamStorage};
+use peergos_core::{build_cid, hash_to_cid, identity_key_hasher, ChampWrapper, RamStorage};
 use peergos_multiformats::Cid;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -35,8 +35,6 @@ pub struct MockServer {
     accounts: Arc<Mutex<HashMap<String, Account>>>,
     /// Pending follow-request blobs, keyed by recipient identity.
     follow_requests: Arc<Mutex<HashMap<Vec<u8>, Vec<Vec<u8>>>>>,
-    /// Secret links: (owner, label) → the encrypted capability cbor.
-    secret_links: Arc<Mutex<HashMap<(Vec<u8>, i64), CborObject>>>,
     /// A stable fake node identity.
     server_id: Cid,
 }
@@ -63,7 +61,6 @@ impl MockServer {
             pointers: Arc::new(Mutex::new(HashMap::new())),
             accounts: Arc::new(Mutex::new(HashMap::new())),
             follow_requests: Arc::new(Mutex::new(HashMap::new())),
-            secret_links: Arc::new(Mutex::new(HashMap::new())),
             // A deterministic non-identity CID; its Display round-trips through the
             // client's `Cid::decode_peer_id`.
             server_id: build_cid(vec![7u8; 32], false).expect("server id"),
@@ -396,6 +393,42 @@ impl MockServer {
             "transaction/start" => Ok(b"1".to_vec()),
             "transaction/close" => Ok(b"true".to_vec()),
             "link-host" => Ok(b"localhost:mock".to_vec()),
+
+            "link/get" => {
+                // Walk the identity writer's "links" champ for sha256(label) and
+                // return the target block (the encrypted capability).
+                let owner = q.pkh("owner")?;
+                let label: i64 = q
+                    .get("label")
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| Error::Protocol("bad link label".into()))?;
+                let wd_cid = {
+                    let map = self.pointers.lock().unwrap();
+                    map.get(&(pkh_key(&owner), pkh_key(&owner)))
+                        .and_then(|p| parse_pointer_update(p).ok())
+                        .and_then(|u| u.updated)
+                }
+                .ok_or_else(|| Error::Http("status 404: no writer data".into()))?;
+                let wd = self.blocks.get(&owner, &wd_cid, None).await?.ok_or_else(|| Error::Http("status 404: wd missing".into()))?;
+                let links_root = wd
+                    .get("links")
+                    .and_then(|c| c.as_link())
+                    .map(Cid::cast)
+                    .transpose()?
+                    .ok_or_else(|| Error::Http("status 404: no links".into()))?;
+                let store: Arc<dyn ContentAddressedStorage> = self.blocks.clone();
+                let champ = ChampWrapper::create(owner.clone(), links_root, None, store, identity_key_hasher()).await?;
+                let value = champ
+                    .get(&peergos_crypto::hash::sha256(&label.to_le_bytes()))
+                    .await?
+                    .ok_or_else(|| Error::Http("status 404: no such link".into()))?;
+                let value_cid = Cid::cast(value.as_link().ok_or_else(|| Error::Protocol("link value not a link".into()))?)?;
+                // The stored value is a SecretLinkTarget `{cap, expiry, max}`; the
+                // server returns just its `cap` (the encrypted capability).
+                let target = self.blocks.get(&owner, &value_cid, None).await?.ok_or_else(|| Error::Http("status 404: link target missing".into()))?;
+                let cap = target.get("cap").ok_or_else(|| Error::Protocol("link target missing 'cap'".into()))?;
+                Ok(cap.to_bytes())
+            }
 
             "block/put/bulk" => {
                 let owner = q.pkh("owner")?;

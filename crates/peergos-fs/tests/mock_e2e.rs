@@ -80,3 +80,22 @@ async fn share_read_between_users() {
     }
     assert_eq!(found.as_deref(), Some(content.as_slice()), "bob could not read the shared file");
 }
+
+#[tokio::test]
+async fn secret_link_roundtrip() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = UserContext::sign_up("carol", "cpw", None, poster, store.clone(), mutable).await.expect("sign up");
+    ctx.get_home().await.unwrap().upload("secret.txt", b"top secret").await.unwrap();
+
+    // Read-only link resolves; a password link needs the password.
+    let link = ctx.create_secret_link("secret.txt", false, "", None, None).await.expect("create link");
+    let cap = peergos_fs::retrieve_secret_link_capability(&link, store.as_ref(), None).await.expect("resolve link");
+    let (_p, data) = peergos_fs::read_file(&cap, store.clone(), ctx.mutable().as_ref()).await.expect("read");
+    assert_eq!(data, b"top secret");
+
+    let protected = ctx.create_secret_link("secret.txt", false, "hunter2", None, None).await.expect("create pw link");
+    assert!(peergos_fs::retrieve_secret_link_capability(&protected, store.as_ref(), None).await.is_err(), "needs password");
+    let cap2 = peergos_fs::retrieve_secret_link_capability(&protected, store.as_ref(), Some("hunter2")).await.expect("with pw");
+    assert_eq!(peergos_fs::read_file(&cap2, store.clone(), ctx.mutable().as_ref()).await.unwrap().1, b"top secret");
+}
