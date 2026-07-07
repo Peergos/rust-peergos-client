@@ -943,14 +943,29 @@ async fn put_child_chunk(
     Ok(())
 }
 
-/// Append `child_link` to the directory (chunking at MAX_CHILD_LINKS_PER_BLOB),
-/// then commit: champ CAS-update, new WriterData, mutable pointer, close txn.
+/// Append one `child_link` to the directory and commit. Thin wrapper over
+/// [`finish_dir_write_multi`].
 async fn finish_dir_write(
     ctx: DirWriteContext,
     dir_cap: &AbsoluteCapability,
     store: &Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
     child_link: NamedRelativeCapability,
+) -> Result<()> {
+    finish_dir_write_multi(ctx, dir_cap, store, mutable, vec![child_link]).await
+}
+
+/// Append `child_links` to the directory (chunking at MAX_CHILD_LINKS_PER_BLOB,
+/// overflowing into fresh dir chunks as needed), then commit ONCE: champ
+/// CAS-updates, new WriterData, a single mutable-pointer write, close txn. Adding
+/// many links in one call is how `upload_subtree` batches child additions instead
+/// of one dir rewrite per file. Mirrors `CryptreeNode.addChildrenAndCommit`.
+async fn finish_dir_write_multi(
+    ctx: DirWriteContext,
+    dir_cap: &AbsoluteCapability,
+    store: &Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+    child_links: Vec<NamedRelativeCapability>,
 ) -> Result<()> {
     let DirWriteContext {
         mut champ,
@@ -966,14 +981,13 @@ async fn finish_dir_write(
     } = ctx;
     let mirror_bat = mirror_bat.as_ref();
 
-    // Add the child link, respecting the per-blob cap: a directory splits into
-    // subsequent chunks of MAX_CHILD_LINKS_PER_BLOB links each. Mirrors
-    // CryptreeNode.addChildrenAndCommit.
     struct DirChunk {
         map_key: Vec<u8>,
         node: CryptreeNode,
         children: Vec<NamedRelativeCapability>,
-        champ_value: CborObject,
+        // `Some` = an existing chunk (champ CAS against this value); `None` = a
+        // fresh overflow chunk (champ insert).
+        champ_value: Option<CborObject>,
         next_map_key: Vec<u8>,
         next_bat: Option<Bat>,
         modified: bool,
@@ -1003,7 +1017,7 @@ async fn finish_dir_write(
             map_key,
             node,
             children,
-            champ_value,
+            champ_value: Some(champ_value),
             next_map_key,
             next_bat,
             modified: false,
@@ -1011,58 +1025,67 @@ async fn finish_dir_write(
         cursor = next;
     }
 
-    // 2. Dedup by name across ALL chunks (overwrite an existing same-named child).
+    // The base chunk's parent key + link, needed to build any overflow chunk.
+    let parent_key = dir_chunks[0].node.base_block(&dir_cap.r_base_key)?.parent_or_data;
+    let parent_link = dir_chunks[0].node.parent_link(&dir_cap.r_base_key)?;
+    let max_links = max_child_links_per_blob();
+
+    // 2. Dedup by name across ALL chunks (overwrite existing same-named children).
+    let new_names: std::collections::HashSet<&str> = child_links.iter().map(|l| l.name.as_str()).collect();
     for chunk in &mut dir_chunks {
         let before = chunk.children.len();
-        chunk.children.retain(|c| c.name != child_link.name);
+        chunk.children.retain(|c| !new_names.contains(c.name.as_str()));
         chunk.modified |= chunk.children.len() != before;
     }
 
-    // 3. Add to the first chunk with room, else overflow into a fresh chunk at
-    //    the last chunk's next-chunk location.
-    let mut overflow: Option<(Vec<u8>, Vec<u8>, Vec<Vec<u8>>)> = None;
-    let max_links = max_child_links_per_blob();
-    if let Some(chunk) = dir_chunks.iter_mut().find(|c| c.children.len() < max_links) {
-        chunk.children.push(child_link);
-        chunk.modified = true;
-    } else {
-        let base = &dir_chunks[0].node;
-        let parent_key = base.base_block(&dir_cap.r_base_key)?.parent_or_data;
-        let parent_link = base.parent_link(&dir_cap.r_base_key)?;
-        let last = dir_chunks.last().unwrap();
-        let new_map_key = last.next_map_key.clone();
-        let new_bat = last.next_bat.clone();
-        let next_chunk = RelCap::subsequent_chunk(
-            random_bytes(32),
-            Some(Bat::new(random_bytes(32))?),
-            dir_cap.r_base_key.clone(),
-        );
-        let from_base = CborObject::map()
-            .put("k", parent_key.to_cbor())
-            .put("n", next_chunk.to_cbor())
-            .build();
-        let mut fp = CborObject::map();
-        if let Some(p) = &parent_link {
-            fp = fp.put("p", p.to_cbor());
+    // 3. Add each link to the first chunk with room, else overflow into a fresh
+    //    chunk at the current last chunk's next-chunk location (chained onward).
+    for link in child_links {
+        if let Some(chunk) = dir_chunks.iter_mut().find(|c| c.children.len() < max_links) {
+            chunk.children.push(link);
+            chunk.modified = true;
+        } else {
+            let last = dir_chunks.last().unwrap();
+            let new_map_key = last.next_map_key.clone();
+            let new_bat = last.next_bat.clone();
+            // This new chunk gets its own fresh next-chunk location for future growth.
+            let next_chunk = RelCap::subsequent_chunk(
+                random_bytes(32),
+                Some(Bat::new(random_bytes(32))?),
+                dir_cap.r_base_key.clone(),
+            );
+            let next_map_key = next_chunk.map_key.clone();
+            let next_bat = next_chunk.bat.clone();
+            let from_base = CborObject::map()
+                .put("k", parent_key.to_cbor())
+                .put("n", next_chunk.to_cbor())
+                .build();
+            let mut fp = CborObject::map();
+            if let Some(p) = &parent_link {
+                fp = fp.put("p", p.to_cbor());
+            }
+            let from_parent = fp.put("s", FileProperties::empty_subsequent_chunk().to_cbor()).build();
+            let node = CryptreeNode::new(
+                true,
+                node_bats_opt(new_bat.as_ref(), mirror_bat)?,
+                PaddedCipherText::build(&dir_cap.r_base_key, &from_base, BASE_BLOCK_PADDING_BLOCKSIZE)?,
+                PaddedCipherText::build(&parent_key, &from_parent, META_DATA_PADDING_BLOCKSIZE)?,
+                // Placeholder; the real children are re-encrypted at commit below.
+                FragmentedPaddedCipherText::build_inline(&dir_cap.r_base_key, &ChildrenLinks::Named(Vec::new()).to_cbor(), MIN_FRAGMENT_SIZE)?.to_cbor(),
+            );
+            dir_chunks.push(DirChunk {
+                map_key: new_map_key,
+                node,
+                children: vec![link],
+                champ_value: None,
+                next_map_key,
+                next_bat,
+                modified: true,
+            });
         }
-        let from_parent = fp.put("s", FileProperties::empty_subsequent_chunk().to_cbor()).build();
-        let (children_data, fragments) = retrieve::FragmentedPaddedCipherText::build(
-            &dir_cap.r_base_key,
-            &ChildrenLinks::Named(vec![child_link]).to_cbor(),
-            MIN_FRAGMENT_SIZE,
-            mirror_bat,
-        )?;
-        let node = CryptreeNode::new(
-            true,
-            node_bats_opt(new_bat.as_ref(), mirror_bat)?,
-            PaddedCipherText::build(&dir_cap.r_base_key, &from_base, BASE_BLOCK_PADDING_BLOCKSIZE)?,
-            PaddedCipherText::build(&parent_key, &from_parent, META_DATA_PADDING_BLOCKSIZE)?,
-            children_data.to_cbor(),
-        );
-        overflow = Some((new_map_key, node.to_cbor().to_bytes(), fragments));
     }
 
-    // 4. Commit every modified chunk (CAS) and any overflow chunk (insert).
+    // 4. Commit every modified/new chunk (existing → CAS, new → insert).
     for chunk in &dir_chunks {
         if !chunk.modified {
             continue;
@@ -1077,19 +1100,8 @@ async fn finish_dir_write(
         let new_node = chunk.node.with_children_or_data(children_data.to_cbor());
         let cid = put_block_signed(store.as_ref(), &dir_cap.owner, &signer, new_node.to_cbor().to_bytes(), &tid).await?;
         champ
-            .put(
-                &signer,
-                &chunk.map_key,
-                &Some(chunk.champ_value.clone()),
-                Some(CborObject::MerkleLink(cid.to_bytes())),
-                &tid,
-            )
+            .put(&signer, &chunk.map_key, &chunk.champ_value, Some(CborObject::MerkleLink(cid.to_bytes())), &tid)
             .await?;
-    }
-    if let Some((map_key, node_cbor, fragments)) = overflow {
-        put_raw_blocks_signed(store.as_ref(), &dir_cap.owner, &signer, fragments, &tid).await?;
-        let cid = put_block_signed(store.as_ref(), &dir_cap.owner, &signer, node_cbor, &tid).await?;
-        champ.put(&signer, &map_key, &None, Some(CborObject::MerkleLink(cid.to_bytes())), &tid).await?;
     }
     let new_tree_root = champ.root_hash().clone();
     let new_wd = writer_data_with_tree(&wd_cbor, &new_tree_root)?;
@@ -3972,6 +3984,13 @@ pub async fn upload_subtree(
         // Files in a plain subdirectory share the base writer's signer.
         let mut files = folder.files;
         files.sort_by_key(|f| f.size);
+
+        // Small (single-chunk) files are staged and their parent links added in one
+        // dir write per ~10 MiB group (Java's uploadFolder batching); large files go
+        // through the crash-safe transaction path individually, after flushing any
+        // pending small-file batch so the directory stays consistent.
+        let mut batch: Vec<FileUpload> = Vec::new();
+        let mut batch_bytes = 0u64;
         for f in files {
             // Skip unchanged files (identical content already present) when we can
             // tell without reading — the caller supplied a content hash.
@@ -3980,27 +3999,143 @@ pub async fn upload_subtree(
                     continue;
                 }
             }
-            let file_path = if dir_path.is_empty() { f.name.clone() } else { format!("{dir_path}/{}", f.name) };
-            let open = f.open.clone();
-            // Small files: atomic; large files: crash-safe transaction (per-chunk
-            // commits, so the buffer auto-flushes mid-file — bounded RAM).
-            upload_file_streaming_auto(
-                home_cap,
-                &dir_cap,
-                &file_path,
-                &f.name,
-                f.size,
-                None,
-                Some(base_signer.clone()),
-                mirror_bat,
-                move || open(),
-                bstore.clone(),
-                bmutable.as_ref(),
-            )
-            .await?;
+            if f.size > retrieve::CHUNK_MAX_SIZE {
+                if !batch.is_empty() {
+                    commit_small_batch(&dir_cap, &base_signer, mirror_bat, std::mem::take(&mut batch), &bstore, bmutable.as_ref()).await?;
+                    batch_bytes = 0;
+                }
+                let file_path = if dir_path.is_empty() { f.name.clone() } else { format!("{dir_path}/{}", f.name) };
+                let open = f.open.clone();
+                upload_file_streaming_auto(
+                    home_cap,
+                    &dir_cap,
+                    &file_path,
+                    &f.name,
+                    f.size,
+                    None,
+                    Some(base_signer.clone()),
+                    mirror_bat,
+                    move || open(),
+                    bstore.clone(),
+                    bmutable.as_ref(),
+                )
+                .await?;
+            } else {
+                batch_bytes += f.size;
+                batch.push(f);
+                if batch_bytes >= SUBTREE_PROGRESS_BATCH {
+                    commit_small_batch(&dir_cap, &base_signer, mirror_bat, std::mem::take(&mut batch), &bstore, bmutable.as_ref()).await?;
+                    batch_bytes = 0;
+                }
+            }
+        }
+        if !batch.is_empty() {
+            commit_small_batch(&dir_cap, &base_signer, mirror_bat, batch, &bstore, bmutable.as_ref()).await?;
         }
     }
     net.commit(&owner).await
+}
+
+/// The progress/commit batch size within a folder (Java `uploadFolder` batchSize).
+const SUBTREE_PROGRESS_BATCH: u64 = 10 * 1024 * 1024;
+
+/// Stage a batch of small (single-chunk) files into `dir_cap` and add all their
+/// child links in ONE dir write: write each file's chunk blocks + champ entries,
+/// then `finish_dir_write_multi` adds every link and commits once. Each file's data
+/// (≤ one 5 MiB chunk) is read from its lazy reader only while it is being staged.
+async fn commit_small_batch(
+    dir_cap: &AbsoluteCapability,
+    signer: &SigningPrivateKeyAndPublicHash,
+    mirror_bat: Option<&BatId>,
+    files: Vec<FileUpload>,
+    store: &Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let owner = &dir_cap.owner;
+    let mut ctx = begin_dir_write(dir_cap, Some(signer.clone()), mirror_bat, store, mutable).await?;
+    let epoch = now_epoch();
+    let mut links = Vec::with_capacity(files.len());
+    for f in files {
+        let mut data = Vec::new();
+        (f.open)()
+            .map_err(|e| Error::Protocol(format!("open error: {e}")))?
+            .read_to_end(&mut data)
+            .map_err(|e| Error::Protocol(format!("read error: {e}")))?;
+
+        let file_r_base = random_symmetric_key()?;
+        let file_data_key = loop {
+            let k = random_symmetric_key()?;
+            if k != file_r_base {
+                break k;
+            }
+        };
+        let file_write_key = random_symmetric_key()?;
+        let stream_secret = random_bytes(32);
+        let first_map_key = random_bytes(32);
+        let first_bat = Bat::new(random_bytes(32))?;
+        let to_parent = RelCap {
+            writer: None,
+            map_key: dir_cap.map_key.clone(),
+            bat: dir_cap.bat.clone(),
+            r_base_key: ctx.dir_parent_key.clone(),
+            w_base_key_link: None,
+        };
+        let mime = mimetype::calculate_mime_type(
+            &data[..data.len().min(mimetype::HEADER_BYTES_TO_IDENTIFY_MIME_TYPE)],
+            &f.name,
+        );
+        // Writes the file's chunk nodes (content hash tree computed inside) and
+        // returns their (map-key, cid); we champ-put each into this dir write.
+        let chunks = write_file_chunks(
+            owner,
+            signer,
+            &first_map_key,
+            &Some(first_bat.clone()),
+            &file_r_base,
+            &file_data_key,
+            &stream_secret,
+            &to_parent,
+            None,
+            &f.name,
+            &mime,
+            epoch,
+            &None,
+            mirror_bat,
+            &data,
+            store,
+            &ctx.tid,
+        )
+        .await?;
+        for (mk, cid) in &chunks {
+            let expected = ctx.champ.get(mk).await?;
+            ctx.champ
+                .put(signer, mk, &expected, Some(CborObject::MerkleLink(cid.to_bytes())), &ctx.tid)
+                .await?;
+        }
+        // The write key lives only in the child link (the file shares the parent writer).
+        let w_link = dir_cap
+            .w_base_key
+            .as_ref()
+            .map(|pw| peergos_core::symmetric::CipherText::build(pw, &file_write_key).map(|c| c.to_cbor()))
+            .transpose()?;
+        links.push(NamedRelativeCapability {
+            name: f.name.clone(),
+            cap: RelCap {
+                writer: None,
+                map_key: first_map_key,
+                bat: Some(first_bat),
+                r_base_key: file_r_base,
+                w_base_key_link: w_link,
+            },
+            is_dir: Some(false),
+            mime_type: Some(mime),
+            created_epoch: Some(epoch),
+        });
+    }
+    finish_dir_write_multi(ctx, dir_cap, store, mutable, links).await
 }
 
 /// The index of the first chunk not yet present in the writer's champ (the
