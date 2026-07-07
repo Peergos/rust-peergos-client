@@ -1117,11 +1117,30 @@ fn read_exact(r: &mut impl std::io::Read, buf: &mut [u8]) -> Result<()> {
 /// is called twice: once to compute the content hash tree, once to encrypt and
 /// upload. The thumbnail (if any) goes on chunk 0.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub async fn upload_file_streaming<R, F>(
     dir_cap: &AbsoluteCapability,
     name: &str,
     size: u64,
+    thumbnail: Option<(String, Vec<u8>)>,
+    entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
+    open: F,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<AbsoluteCapability>
+where
+    R: std::io::Read,
+    F: Fn() -> std::io::Result<R>,
+{
+    upload_file_streaming_inner(dir_cap, name, size, false, thumbnail, entry_signer, mirror_bat, open, store, mutable).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upload_file_streaming_inner<R, F>(
+    dir_cap: &AbsoluteCapability,
+    name: &str,
+    size: u64,
+    hidden: bool,
     thumbnail: Option<(String, Vec<u8>)>,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
     mirror_bat: Option<&BatId>,
@@ -1222,6 +1241,7 @@ where
             stream_secret.clone(),
             if i == 0 { thumbnail.take() } else { None },
         );
+        props.is_hidden = hidden;
         if i % 1024 == 0 {
             props.tree_hash = Some(tree.branch(i as u64));
         }
@@ -1295,11 +1315,68 @@ pub async fn upload_file(
     .await
 }
 
+/// Like [`upload_file`] but marks the file hidden (`is_hidden` / Java's
+/// `isHidden`), used for internal system files (`.blocked-usernames.txt`,
+/// `.social-state.cbor`, `.annotations`, `.from-friends.cbor`, feed/sharing
+/// metadata) that a UI should not surface. Single-chunk only.
+#[allow(clippy::too_many_arguments)]
+pub async fn upload_file_hidden(
+    dir_cap: &AbsoluteCapability,
+    name: &str,
+    contents: &[u8],
+    thumbnail: Option<(String, Vec<u8>)>,
+    entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<AbsoluteCapability> {
+    upload_file_streaming_inner(
+        dir_cap,
+        name,
+        contents.len() as u64,
+        true,
+        thumbnail,
+        entry_signer,
+        mirror_bat,
+        || Ok(std::io::Cursor::new(contents)),
+        store,
+        mutable,
+    )
+    .await
+}
+
 /// Create an empty subdirectory inside a writable directory, returning its
 /// (writable) capability.
+/// Create an empty subdirectory `name` under `dir_cap` and return its capability.
 pub async fn create_directory(
     dir_cap: &AbsoluteCapability,
     name: &str,
+    entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<AbsoluteCapability> {
+    create_directory_inner(dir_cap, name, false, entry_signer, mirror_bat, store, mutable).await
+}
+
+/// Like [`create_directory`] but marks the new directory hidden (`is_hidden` /
+/// Java's `isSystemFolder`), used for the special signup folders (`shared`,
+/// `.transactions`, `.capabilitycache`) that a UI should not surface.
+pub async fn mkdir_hidden(
+    dir_cap: &AbsoluteCapability,
+    name: &str,
+    entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<AbsoluteCapability> {
+    create_directory_inner(dir_cap, name, true, entry_signer, mirror_bat, store, mutable).await
+}
+
+async fn create_directory_inner(
+    dir_cap: &AbsoluteCapability,
+    name: &str,
+    hidden: bool,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
     mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
@@ -1329,7 +1406,8 @@ pub async fn create_directory(
 
     // Build the (empty) subdirectory node: base block encrypted with its rBaseKey,
     // parent block with its parentKey.
-    let props = FileProperties::new_directory(name.to_string(), epoch);
+    let mut props = FileProperties::new_directory(name.to_string(), epoch);
+    props.is_hidden = hidden;
     let parent_cap = RelCap {
         writer: None,
         map_key: dir_cap.map_key.clone(),

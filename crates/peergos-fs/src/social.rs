@@ -287,7 +287,7 @@ async fn persist_friend_entry_point(
         None => Vec::new(),
     };
     contents.extend_from_slice(&entry.to_cbor().to_bytes());
-    crate::upload_file(home, FROM_FRIENDS_FILE, &contents, None, Some(signer), user.mirror_bat_id().as_ref(), store, mutable).await?;
+    crate::upload_file_hidden(home, FROM_FRIENDS_FILE, &contents, None, Some(signer), user.mirror_bat_id().as_ref(), store, mutable).await?;
     Ok(())
 }
 
@@ -463,7 +463,7 @@ async fn write_blocked(
     let content: String = blocked.iter().map(|u| format!("{u}\n")).collect();
     let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
     let signer = recover_signer(home, store.clone(), mutable).await?;
-    crate::upload_file(home, BLOCKED_USERNAMES_FILE, content.as_bytes(), None, Some(signer), user.mirror_bat_id().as_ref(), store, mutable).await?;
+    crate::upload_file_hidden(home, BLOCKED_USERNAMES_FILE, content.as_bytes(), None, Some(signer), user.mirror_bat_id().as_ref(), store, mutable).await?;
     Ok(())
 }
 
@@ -587,7 +587,7 @@ pub async fn add_friend_annotation(
     }
     let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
     let signer = recover_signer(home, store.clone(), mutable).await?;
-    crate::upload_file(home, FRIEND_ANNOTATIONS_FILE, &content, None, Some(signer), user.mirror_bat_id().as_ref(), store, mutable).await?;
+    crate::upload_file_hidden(home, FRIEND_ANNOTATIONS_FILE, &content, None, Some(signer), user.mirror_bat_id().as_ref(), store, mutable).await?;
     Ok(())
 }
 

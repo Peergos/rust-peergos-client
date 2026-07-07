@@ -561,7 +561,7 @@ pub async fn signup(
 
     // --- 5. The special directories -------------------------------------------
     for dir in ["shared", ".transactions", ".capabilitycache"] {
-        crate::create_directory(&root_cap, dir, Some(writer.clone()), Some(&mirror_id), store.clone(), oplog.as_ref()).await?;
+        crate::mkdir_hidden(&root_cap, dir, Some(writer.clone()), Some(&mirror_id), store.clone(), oplog.as_ref()).await?;
     }
 
     // --- 6. Username claim chain + proof of work, then POST signup -------------
