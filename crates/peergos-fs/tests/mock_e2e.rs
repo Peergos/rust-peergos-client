@@ -1,7 +1,52 @@
 //! End-to-end tests against the in-process mock Peergos server (no live server).
 
+use peergos_core::mutable::MutablePointers;
+use peergos_core::{ContentAddressedStorage, HttpPoster};
 use peergos_fs::UserContext;
 use peergos_mock_server::MockServer;
+use std::sync::Arc;
+
+type Poster = Arc<dyn HttpPoster>;
+type Store = Arc<dyn ContentAddressedStorage>;
+type Mut = Arc<dyn MutablePointers>;
+
+/// Establish mutual friendship a <-> b.
+async fn befriend(a: (&str, &str), b: (&str, &str), poster: &Poster, store: &Store, mutable: &Mut) {
+    let alice = peergos_fs::login(a.0, a.1, poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    peergos_fs::send_follow_request(&alice, b.0, true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+    let bob = peergos_fs::login(b.0, b.1, poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&bob, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some(a.0) {
+            peergos_fs::accept_follow_request(&bob, &r, true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+    let alice = peergos_fs::login(a.0, a.1, poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&alice, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some(b.0) {
+            peergos_fs::process_follow_reply(&alice, &r, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+}
+
+/// Try to write into `owner`'s write-shared `child` dir as `writer`. Ok = wrote.
+async fn try_write(writer: (&str, &str), owner: &str, name: &str, poster: &Poster, store: &Store, mutable: &Mut) -> bool {
+    let w = peergos_fs::login(writer.0, writer.1, poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let entry = match peergos_fs::get_friends(&w, store.clone(), mutable.as_ref()).await.unwrap().into_iter().find(|e| e.owner_name == owner) {
+        Some(e) => e,
+        None => return false,
+    };
+    let caps = peergos_fs::read_write_shared_capabilities(&entry.pointer, store.clone(), mutable.as_ref()).await.unwrap();
+    for cap in caps.into_iter().rev() {
+        let signer = match peergos_fs::recover_signer(&cap, store.clone(), mutable.as_ref()).await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if peergos_fs::upload_file(&cap, name, b"x", None, Some(signer), None, store.clone(), mutable.as_ref()).await.is_ok() {
+            return true;
+        }
+    }
+    false
+}
 
 #[tokio::test]
 async fn signup_login_upload_read() {
@@ -132,4 +177,29 @@ async fn change_password_then_sign_in() {
     // Old password no longer works; new one does.
     assert!(UserContext::sign_in("erin", "old-pw", None, poster.clone(), store.clone(), mutable.clone()).await.is_err());
     UserContext::sign_in("erin", "new-pw", None, poster, store, mutable).await.expect("sign in with new pw");
+}
+
+#[tokio::test]
+async fn revoke_write_denies_writer() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.expect("sign up");
+    }
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+
+    // Alice creates "project" and write-shares it with bob.
+    let alice = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let home = alice.home().unwrap().clone();
+    let signer = peergos_fs::recover_signer(&home, store.clone(), mutable.as_ref()).await.unwrap();
+    peergos_fs::create_directory(&home, "project", Some(signer), None, store.clone(), mutable.as_ref()).await.unwrap();
+    peergos_fs::share_write_access(&alice, "", &home, "project", "bob", store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Bob can write; then alice revokes and bob can no longer write.
+    assert!(try_write(("bob", "bpw"), "alice", "before.txt", &poster, &store, &mutable).await, "bob should write before revoke");
+
+    let alice = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    peergos_fs::unshare_write_access(&alice, "", &home, "project", &["bob".to_string()], store.clone(), mutable.as_ref()).await.unwrap();
+
+    assert!(!try_write(("bob", "bpw"), "alice", "after.txt", &poster, &store, &mutable).await, "REVOCATION FAILED: bob still wrote");
 }

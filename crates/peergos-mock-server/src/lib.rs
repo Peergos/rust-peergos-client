@@ -17,7 +17,7 @@ use peergos_core::storage::{
     champ_lookup_local, BlockWriteGroup, ChunkMirrorCap, ContentAddressedStorage, TransactionId,
     API_PREFIX,
 };
-use peergos_core::{build_cid, hash_to_cid, identity_key_hasher, ChampWrapper, RamStorage};
+use peergos_core::{build_cid, hash_to_cid, identity_key_hasher, Champ, ChampWrapper, Payload, RamStorage};
 use peergos_multiformats::Cid;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -99,7 +99,7 @@ impl MockServer {
         }
         // Mutable pointers (peergos/v0/mutable/…).
         if let Some(rest) = path.strip_prefix(MUTABLE_POINTERS_URL) {
-            return self.handle_mutable(rest, &query, body);
+            return self.handle_mutable(rest, &query, body).await;
         }
         // Core / PKI (peergos/v0/core/…).
         if let Some(rest) = path.strip_prefix("peergos/v0/core/") {
@@ -340,7 +340,7 @@ impl MockServer {
         }
     }
 
-    fn handle_mutable(&self, rest: &str, q: &Query, body: Vec<u8>) -> Result<Vec<u8>> {
+    async fn handle_mutable(&self, rest: &str, q: &Query, body: Vec<u8>) -> Result<Vec<u8>> {
         match rest {
             "getPointer" => {
                 let key = (pkh_key(&q.pkh("owner")?), pkh_key(&q.pkh("writer")?));
@@ -349,6 +349,12 @@ impl MockServer {
             "setPointer" => {
                 let owner = q.pkh("owner")?;
                 let writer = q.pkh("writer")?;
+                // Reject writes by a writer not (transitively) owned by the owner —
+                // this is what makes a deauthorized writer's writes fail after a
+                // write-access revocation.
+                if !self.is_authorized(&owner, &writer).await? {
+                    return Ok(vec![0]);
+                }
                 Ok(vec![self.apply_cas(&owner, &writer, body)? as u8])
             }
             "setPointers" => {
@@ -360,12 +366,96 @@ impl MockServer {
                 };
                 let mut ok = true;
                 for u in updates {
-                    ok &= self.apply_cas(&owner, &u.writer, u.signed)?;
+                    ok &= self.is_authorized(&owner, &u.writer).await? && self.apply_cas(&owner, &u.writer, u.signed)?;
                 }
                 Ok(vec![ok as u8])
             }
             other => Err(Error::Http(format!("status 404: mock mutable has no route for {other}"))),
         }
+    }
+
+    /// Whether `writer` may write under `owner`: it is the owner itself, or it is
+    /// reachable in the owner's owned-writer tree (each WriterData's `owned` champ
+    /// lists the writers it owns). A writer removed from that tree by
+    /// `deAuthoriseSigner` is rejected.
+    async fn is_authorized(&self, owner: &PublicKeyHash, writer: &PublicKeyHash) -> Result<bool> {
+        let target = pkh_key(writer);
+        if pkh_key(owner) == target {
+            return Ok(true);
+        }
+        // Only enforce for real accounts (the identity has its own WriterData set up
+        // at signup); raw pointer tests without an owned tree are left unrestricted.
+        let owner_registered = self.pointers.lock().unwrap().contains_key(&(pkh_key(owner), pkh_key(owner)));
+        if !owner_registered {
+            return Ok(true);
+        }
+        let mut visited: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut frontier = vec![owner.clone()];
+        while let Some(w) = frontier.pop() {
+            if !visited.insert(pkh_key(&w)) {
+                continue;
+            }
+            for owned in self.owned_writers(owner, &w).await? {
+                if pkh_key(&owned) == target {
+                    return Ok(true);
+                }
+                frontier.push(owned);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The writers directly owned by `writer` (the keys of its WriterData's `owned`
+    /// champ, each `reverse(writer.to_cbor())`).
+    async fn owned_writers(&self, owner: &PublicKeyHash, writer: &PublicKeyHash) -> Result<Vec<PublicKeyHash>> {
+        let wd_cid = {
+            let map = self.pointers.lock().unwrap();
+            map.get(&(pkh_key(owner), pkh_key(writer)))
+                .and_then(|p| parse_pointer_update(p).ok())
+                .and_then(|u| u.updated)
+        };
+        let wd = match wd_cid {
+            Some(c) => match self.blocks.get(owner, &c, None).await? {
+                Some(wd) => wd,
+                None => return Ok(Vec::new()),
+            },
+            None => return Ok(Vec::new()),
+        };
+        let owned_root = match wd.get("owned").and_then(|c| c.as_link()) {
+            Some(l) => Cid::cast(l)?,
+            None => return Ok(Vec::new()),
+        };
+        let mut out = Vec::new();
+        for mut key in self.champ_all_keys(owner, &owned_root).await? {
+            key.reverse();
+            if let Ok(cbor) = CborObject::from_bytes(&key) {
+                if let Ok(pkh) = PublicKeyHash::from_cbor(&cbor) {
+                    out.push(pkh);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every key stored in the champ rooted at `root` (walks inline mappings and
+    /// shard links).
+    async fn champ_all_keys(&self, owner: &PublicKeyHash, root: &Cid) -> Result<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(cid) = stack.pop() {
+            let node = match self.blocks.get(owner, &cid, None).await? {
+                Some(n) => n,
+                None => continue,
+            };
+            let champ = Champ::from_cbor(&node)?;
+            for payload in &champ.contents {
+                match payload {
+                    Payload::Mappings(ms) => out.extend(ms.iter().map(|m| m.key.clone())),
+                    Payload::Link(c) => stack.push(c.clone()),
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Apply a signed CAS pointer update: accept iff its `original` matches the
