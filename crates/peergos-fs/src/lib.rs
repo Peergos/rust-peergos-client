@@ -3008,6 +3008,37 @@ pub async fn delete_child(
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<()> {
+    // A write-shared file/dir is a link node here pointing to a target in its OWN
+    // writer subspace. Removing only the link node would leak that whole subspace,
+    // so reclaim it too — delete its pointer (while still authorised) and, after
+    // the link is gone, deauthorise the writer — mirroring force_rotate.
+    let own_writer_target = match list_directory(dir_cap, store.clone(), mutable)
+        .await?
+        .into_iter()
+        .find(|e| e.name == name)
+    {
+        Some(e) => {
+            let (_n, props) = retrieve_file_metadata(&e.cap, store.clone(), mutable).await?;
+            if props.is_link {
+                let target = list_directory(&e.cap, store.clone(), mutable)
+                    .await?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| Error::Protocol("link node has no target".into()))?
+                    .cap;
+                (target.writer != dir_cap.writer).then_some(target)
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+    let deauth_signer = entry_signer.clone();
+    if let Some(target) = &own_writer_target {
+        let target_signer = recover_signer(target, store.clone(), mutable).await?;
+        delete_writer_subspace(&dir_cap.owner, &target_signer, &store, mutable).await?;
+    }
+
     let mut ctx = begin_dir_write(dir_cap, entry_signer, mirror_bat, &store, mutable).await?;
 
     // Walk the directory chunk chain, collecting each chunk's children.
@@ -3108,6 +3139,12 @@ pub async fn delete_child(
         return Err(Error::Protocol("setPointer rejected (concurrent modification?)".into()));
     }
     store.close_transaction(&dir_cap.owner, &ctx.tid).await?;
+
+    // The link node is gone: deauthorise the now-orphaned writer so nothing keeps
+    // its (already-emptied) subspace reachable.
+    if let Some(target) = &own_writer_target {
+        deauthorize_writer(dir_cap, &target.writer, deauth_signer, store.clone(), mutable).await?;
+    }
     Ok(())
 }
 
