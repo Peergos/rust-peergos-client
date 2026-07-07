@@ -31,8 +31,19 @@ pub struct MockServer {
     blocks: Arc<RamStorage>,
     /// Mutable pointers: (owner, writer) → the last signed CAS payload.
     pointers: Arc<Mutex<HashMap<(Vec<u8>, Vec<u8>), Vec<u8>>>>,
+    /// Registered accounts, keyed by username.
+    accounts: Arc<Mutex<HashMap<String, Account>>>,
     /// A stable fake node identity.
     server_id: Cid,
+}
+
+/// A registered user: their identity key hash, login data (encrypted entry
+/// points, served by `getLogin`), and mirror BATs.
+#[derive(Clone)]
+struct Account {
+    identity: PublicKeyHash,
+    login: CborObject,
+    bats: Vec<CborObject>,
 }
 
 impl Default for MockServer {
@@ -46,6 +57,7 @@ impl MockServer {
         MockServer {
             blocks: Arc::new(RamStorage::new()),
             pointers: Arc::new(Mutex::new(HashMap::new())),
+            accounts: Arc::new(Mutex::new(HashMap::new())),
             // A deterministic non-identity CID; its Display round-trips through the
             // client's `Cid::decode_peer_id`.
             server_id: build_cid(vec![7u8; 32], false).expect("server id"),
@@ -56,6 +68,20 @@ impl MockServer {
     /// real HTTP poster.
     pub fn poster(&self) -> Arc<dyn HttpPoster> {
         Arc::new(MockPoster { server: self.clone() })
+    }
+
+    /// The `(poster, store, mutable)` a client needs, all backed by this server —
+    /// drop-in for the `ReqwestPoster` + `HttpStorage` + `HttpMutablePointers` trio
+    /// the examples build against a live server.
+    pub fn connect(
+        &self,
+    ) -> (Arc<dyn HttpPoster>, Arc<dyn ContentAddressedStorage>, Arc<dyn peergos_core::mutable::MutablePointers>) {
+        let poster = self.poster();
+        let store: Arc<dyn ContentAddressedStorage> =
+            Arc::new(peergos_core::HttpStorage::new(poster.clone(), true));
+        let mutable: Arc<dyn peergos_core::mutable::MutablePointers> =
+            Arc::new(peergos_core::mutable::HttpMutablePointers::new(poster.clone()));
+        (poster, store, mutable)
     }
 
     // ---- request dispatch -------------------------------------------------
@@ -72,7 +98,120 @@ impl MockServer {
         if let Some(rest) = path.strip_prefix(MUTABLE_POINTERS_URL) {
             return self.handle_mutable(rest, &query, body);
         }
+        // Core / PKI (peergos/v0/core/…).
+        if let Some(rest) = path.strip_prefix("peergos/v0/core/") {
+            return self.handle_core(rest, body).await;
+        }
+        // Login (peergos/v0/login/…).
+        if let Some(rest) = path.strip_prefix("peergos/v0/login/") {
+            return self.handle_login(rest, &query, body);
+        }
         Err(Error::Http(format!("status 404: mock has no route for {path}")))
+    }
+
+    async fn handle_core(&self, rest: &str, body: Vec<u8>) -> Result<Vec<u8>> {
+        match rest {
+            "signup" => {
+                // body = serialize(username) bytes(chain) bytes(oplog) bytes(proof) serialize(token)
+                let mut r = Reader::new(&body);
+                let username = r.string()?;
+                let chain = r.bytes()?;
+                let oplog = r.bytes()?;
+                let _proof = r.bytes()?; // PoW accepted at difficulty 0 for the mock
+                let _token = r.string()?;
+
+                if self.accounts.lock().unwrap().contains_key(&username) {
+                    // Taken: a 4xx with an empty reason means "already exists" to the client.
+                    return Err(Error::Http("status 409: ".into()));
+                }
+                let identity = PublicKeyHash::from_cbor(
+                    CborObject::from_bytes(&chain)?
+                        .get("owner")
+                        .ok_or_else(|| Error::Protocol("claim chain missing owner".into()))?,
+                )?;
+                self.apply_oplog(&identity, &username, &oplog).await?;
+                Ok(vec![1]) // readBoolean = success
+            }
+            "getPublicKey" => {
+                // body = serialize_string(username); response [bool][len BE][cbor].
+                let username = Reader::new(&body).string()?;
+                match self.accounts.lock().unwrap().get(&username) {
+                    Some(a) => {
+                        let cbor = a.identity.to_cbor().to_bytes();
+                        let mut out = vec![1u8];
+                        out.extend_from_slice(&(cbor.len() as u32).to_be_bytes());
+                        out.extend_from_slice(&cbor);
+                        Ok(out)
+                    }
+                    None => Ok(vec![0]),
+                }
+            }
+            other => Err(Error::Http(format!("status 404: mock core has no route for {other}"))),
+        }
+    }
+
+    /// Apply a signup OpLog: store its block writes, apply its pointer writes (owned
+    /// by `identity`), record the login data + mirror BATs, and register the account.
+    async fn apply_oplog(&self, identity: &PublicKeyHash, username: &str, oplog: &[u8]) -> Result<()> {
+        let log = CborObject::from_bytes(oplog)?;
+        let tid = TransactionId("1".into());
+        if let Some(CborObject::List(ops)) = log.get("ops").cloned() {
+            for op in ops {
+                if let Some(block) = op.get("b").and_then(|c| c.as_bytes()) {
+                    // Block write: {w, s, b, r}.
+                    let is_raw = op.get("r").and_then(|c| c.as_bool()).unwrap_or(false);
+                    let (block, writer) = (block.to_vec(), identity.clone());
+                    if is_raw {
+                        self.blocks.put_raw(identity, &writer, vec![vec![0]], vec![block], &tid).await?;
+                    } else {
+                        self.blocks.put(identity, &writer, vec![vec![0]], vec![block], &tid).await?;
+                    }
+                } else if let (Some(w), Some(s)) = (op.get("w"), op.get("s").and_then(|c| c.as_bytes())) {
+                    // Pointer write: {w, s}, owned by the identity.
+                    let writer = PublicKeyHash::from_cbor(w)?;
+                    self.apply_cas(identity, &writer, s.to_vec())?;
+                }
+            }
+        }
+        // The oplog `login` is LoginData `{u, e, r}`; getLogin serves its `e`
+        // (the UserStaticData / encrypted entry points).
+        let login = log.get("login").and_then(|ld| ld.get("e").cloned()).unwrap_or(CborObject::Null);
+        let bats = log.get("b").cloned().into_iter().collect();
+        self.accounts
+            .lock()
+            .unwrap()
+            .insert(username.to_string(), Account { identity: identity.clone(), login, bats });
+        Ok(())
+    }
+
+    fn handle_login(&self, rest: &str, q: &Query, body: Vec<u8>) -> Result<Vec<u8>> {
+        match rest {
+            "getLogin" => {
+                let username = q.get("username").unwrap_or_default();
+                let accounts = self.accounts.lock().unwrap();
+                let login = accounts
+                    .get(username)
+                    .map(|a| a.login.clone())
+                    .ok_or_else(|| Error::Http("status 404: no such user".into()))?;
+                // LoginResponse: {a: authorized (no MFA needed), r: UserStaticData}.
+                Ok(CborObject::map().put("a", CborObject::Boolean(true)).put("r", login).build().to_bytes())
+            }
+            "setLogin" => {
+                // body = LoginData `{u: username, e: UserStaticData, r: login_pub}`.
+                let data = CborObject::from_bytes(&body)?;
+                let username = data.get("u").and_then(|c| c.as_string()).unwrap_or_default().to_string();
+                let new_static = data.get("e").cloned().unwrap_or(CborObject::Null);
+                let mut accounts = self.accounts.lock().unwrap();
+                match accounts.get_mut(&username) {
+                    Some(a) => {
+                        a.login = new_static;
+                        Ok(vec![1])
+                    }
+                    None => Err(Error::Http("status 404: no such user".into())),
+                }
+            }
+            other => Err(Error::Http(format!("status 404: mock login has no route for {other}"))),
+        }
     }
 
     fn handle_mutable(&self, rest: &str, q: &Query, body: Vec<u8>) -> Result<Vec<u8>> {
@@ -255,6 +394,35 @@ fn split_url(url: &str) -> (&str, Query) {
         map.insert(k.to_string(), url_decode(v));
     }
     (path, Query(map))
+}
+
+/// Reads Java `DataInputStream`-style length-prefixed fields (4-byte big-endian
+/// length, then bytes; strings are UTF-8) — the signup request body encoding.
+struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+impl<'a> Reader<'a> {
+    fn new(buf: &'a [u8]) -> Reader<'a> {
+        Reader { buf, pos: 0 }
+    }
+    fn bytes(&mut self) -> Result<Vec<u8>> {
+        if self.pos + 4 > self.buf.len() {
+            return Err(Error::Protocol("truncated request".into()));
+        }
+        let len = u32::from_be_bytes([self.buf[self.pos], self.buf[self.pos + 1], self.buf[self.pos + 2], self.buf[self.pos + 3]]) as usize;
+        self.pos += 4;
+        if self.pos + len > self.buf.len() {
+            return Err(Error::Protocol("truncated request field".into()));
+        }
+        let out = self.buf[self.pos..self.pos + len].to_vec();
+        self.pos += len;
+        Ok(out)
+    }
+    fn string(&mut self) -> Result<String> {
+        // char count == byte count for the ASCII usernames/tokens tests use.
+        Ok(String::from_utf8_lossy(&self.bytes()?).into_owned())
+    }
 }
 
 /// A stable map key for a public-key hash (its multibase string).
