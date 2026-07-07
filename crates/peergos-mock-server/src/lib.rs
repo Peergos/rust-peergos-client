@@ -33,6 +33,10 @@ pub struct MockServer {
     pointers: Arc<Mutex<HashMap<(Vec<u8>, Vec<u8>), Vec<u8>>>>,
     /// Registered accounts, keyed by username.
     accounts: Arc<Mutex<HashMap<String, Account>>>,
+    /// Pending follow-request blobs, keyed by recipient identity.
+    follow_requests: Arc<Mutex<HashMap<Vec<u8>, Vec<Vec<u8>>>>>,
+    /// Secret links: (owner, label) → the encrypted capability cbor.
+    secret_links: Arc<Mutex<HashMap<(Vec<u8>, i64), CborObject>>>,
     /// A stable fake node identity.
     server_id: Cid,
 }
@@ -58,6 +62,8 @@ impl MockServer {
             blocks: Arc::new(RamStorage::new()),
             pointers: Arc::new(Mutex::new(HashMap::new())),
             accounts: Arc::new(Mutex::new(HashMap::new())),
+            follow_requests: Arc::new(Mutex::new(HashMap::new())),
+            secret_links: Arc::new(Mutex::new(HashMap::new())),
             // A deterministic non-identity CID; its Display round-trips through the
             // client's `Cid::decode_peer_id`.
             server_id: build_cid(vec![7u8; 32], false).expect("server id"),
@@ -110,7 +116,70 @@ impl MockServer {
         if let Some(rest) = path.strip_prefix("peergos/v0/storage/") {
             return self.handle_usage(rest, &query).await;
         }
+        // Social follow requests (peergos/v0/social/…).
+        if let Some(rest) = path.strip_prefix("peergos/v0/social/") {
+            return self.handle_social(rest, &query, body);
+        }
+        // BATs (peergos/v0/bats/…).
+        if let Some(rest) = path.strip_prefix("peergos/v0/bats/") {
+            return self.handle_bats(rest, &query, body);
+        }
         Err(Error::Http(format!("status 404: mock has no route for {path}")))
+    }
+
+    fn handle_social(&self, rest: &str, q: &Query, body: Vec<u8>) -> Result<Vec<u8>> {
+        match rest {
+            "followRequest" => {
+                // Append the (blinded) blob to the recipient's inbox.
+                let owner = pkh_key(&q.pkh("owner")?);
+                self.follow_requests.lock().unwrap().entry(owner).or_default().push(body);
+                Ok(vec![1])
+            }
+            "getFollowRequests" => {
+                // Response: [4-byte BE length][cbor list of blobs].
+                let owner = pkh_key(&q.pkh("owner")?);
+                let map = self.follow_requests.lock().unwrap();
+                // Each stored blob is a serialized blind-request cbor object.
+                let items: Vec<CborObject> = map
+                    .get(&owner)
+                    .map(|v| v.iter().filter_map(|b| CborObject::from_bytes(b).ok()).collect())
+                    .unwrap_or_default();
+                let cbor = CborObject::List(items).to_bytes();
+                let mut out = (cbor.len() as u32).to_be_bytes().to_vec();
+                out.extend_from_slice(&cbor);
+                Ok(out)
+            }
+            "removeFollowRequest" => {
+                // body = identity.sign(blob); remove the matching blob.
+                let owner = pkh_key(&q.pkh("owner")?);
+                if body.len() >= 64 {
+                    let blob = &body[64..];
+                    if let Some(queue) = self.follow_requests.lock().unwrap().get_mut(&owner) {
+                        queue.retain(|b| b.as_slice() != blob);
+                    }
+                }
+                Ok(vec![1])
+            }
+            other => Err(Error::Http(format!("status 404: mock social has no route for {other}"))),
+        }
+    }
+
+    fn handle_bats(&self, rest: &str, q: &Query, _body: Vec<u8>) -> Result<Vec<u8>> {
+        match rest {
+            "getUserBats" => {
+                let username = q.get("username").unwrap_or_default();
+                let bats = self
+                    .accounts
+                    .lock()
+                    .unwrap()
+                    .get(username)
+                    .map(|a| a.bats.clone())
+                    .unwrap_or_default();
+                Ok(CborObject::List(bats).to_bytes())
+            }
+            "addBat" => Ok(vec![1]), // accepted; the mirror BAT already came in via signup
+            other => Err(Error::Http(format!("status 404: mock bats has no route for {other}"))),
+        }
     }
 
     async fn handle_usage(&self, rest: &str, q: &Query) -> Result<Vec<u8>> {
@@ -326,6 +395,7 @@ impl MockServer {
             "ids" => Ok(format!("[\"{}\"]", self.server_id).into_bytes()),
             "transaction/start" => Ok(b"1".to_vec()),
             "transaction/close" => Ok(b"true".to_vec()),
+            "link-host" => Ok(b"localhost:mock".to_vec()),
 
             "block/put/bulk" => {
                 let owner = q.pkh("owner")?;
