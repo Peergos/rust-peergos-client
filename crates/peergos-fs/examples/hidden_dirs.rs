@@ -47,6 +47,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(!doc.properties().is_hidden, "an ordinary file must not be hidden");
     println!("  doc.txt: is_hidden={}", doc.properties().is_hidden);
 
-    println!("\nHidden signup directories + system files OK.");
+    // children() filters hidden entries; all_children() includes them.
+    let home = ctx.get_home().await?;
+    let visible: Vec<String> = home.children().await?.into_iter().map(|c| c.name().to_string()).collect();
+    let all: Vec<String> = home.all_children().await?.into_iter().map(|c| c.name().to_string()).collect();
+    for h in ["shared", ".transactions", ".capabilitycache", ".blocked-usernames.txt", ".annotations"] {
+        assert!(!visible.contains(&h.to_string()), "children() must hide {h}");
+        assert!(all.contains(&h.to_string()), "all_children() must include {h}");
+    }
+    assert!(visible.contains(&"doc.txt".to_string()) && visible.contains(&format!("plain{n}")), "visible entries listed");
+    println!("  children() = {visible:?}");
+    println!("  all_children() has {} entries (incl. hidden)", all.len());
+
+    // Explicit navigation to a hidden path still works (child/get_by_path unfiltered).
+    assert!(ctx.get_by_path(".transactions").await?.is_some(), "explicit get_by_path to a hidden dir still resolves");
+    println!("  get_by_path(\".transactions\") still resolves");
+
+    println!("\nHidden signup directories + system files + list filtering OK.");
     Ok(())
 }

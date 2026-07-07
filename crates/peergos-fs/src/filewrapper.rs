@@ -189,10 +189,18 @@ impl FileWrapper {
         Ok(FileWrapper { name, cap, props, signer, path: String::new(), home_cap: None, mirror_bat: None, store, mutable, cache })
     }
 
-    /// The children of this directory (`getChildren`), link nodes followed.
-    /// Resolves all child caps in batched, locally-verified `champ/get` calls
-    /// (via [`crate::retrieve_all_metadata`]) rather than one round-trip per child.
+    /// The children of this directory (`getChildren`), link nodes followed, with
+    /// hidden entries (system folders / files — [`FileProperties::is_hidden`])
+    /// filtered out. Use [`FileWrapper::all_children`] to include them.
     pub async fn children(&self) -> Result<Vec<FileWrapper>> {
+        let mut children = self.all_children().await?;
+        children.retain(|c| !c.props.is_hidden);
+        Ok(children)
+    }
+
+    /// Every child of this directory, including hidden ones. See
+    /// [`FileWrapper::children`] for the filtered listing used by the external API.
+    pub async fn all_children(&self) -> Result<Vec<FileWrapper>> {
         if !self.is_directory() {
             return Err(Error::Protocol("not a directory".into()));
         }
