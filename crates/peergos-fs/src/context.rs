@@ -371,6 +371,13 @@ impl UserContext {
         crate::unfollow(user, username, self.store.clone(), self.mutable.as_ref()).await
     }
 
+    /// The sharing state of every child of the directory at home-relative `dir_path`
+    /// (`getDirectorySharingState`) — read/write recipients and links per child.
+    pub async fn get_directory_sharing_state(&self, dir_path: &str) -> Result<crate::SharedWithState> {
+        let user = self.require_user()?;
+        crate::get_directory_sharing_state(user, dir_path, self.store.clone(), self.mutable.as_ref()).await
+    }
+
     /// The usernames the user has blocked (`getBlocked`).
     pub async fn get_blocked(&self) -> Result<Vec<String>> {
         let user = self.require_user()?;

@@ -775,9 +775,20 @@ pub async fn share_write_access(
     let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
     let signer = recover_signer(home, store.clone(), mutable).await?;
 
-    // Rotate the directory into its own writer if it doesn't have one yet.
-    let dir_cap =
-        crate::move_dir_to_own_writer(parent_cap, child_name, Some(signer.clone()), user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
+    // Rotate the child into its own writer subspace (files and directories alike)
+    // if it doesn't have one yet, so write access to it can be granted.
+    let is_dir = list_directory(parent_cap, store.clone(), mutable)
+        .await?
+        .into_iter()
+        .find(|e| e.name == child_name)
+        .ok_or_else(|| Error::Protocol(format!("no such child: {child_name}")))?
+        .is_dir
+        == Some(true);
+    let dir_cap = if is_dir {
+        crate::move_dir_to_own_writer(parent_cap, child_name, Some(signer.clone()), user.mirror_bat_id().as_ref(), store.clone(), mutable).await?
+    } else {
+        crate::move_file_to_own_writer(parent_cap, child_name, Some(signer.clone()), user.mirror_bat_id().as_ref(), store.clone(), mutable).await?
+    };
     let sharing = sharing_folder(user, store.clone(), mutable).await?;
     let friend_dir = get_or_mkdir(&sharing, friend_username, &signer, user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
 
@@ -1076,13 +1087,47 @@ impl LinkProperties {
 /// Who the children of a directory are shared with (`SharedWithState`). Keyed by
 /// child filename → set of usernames (read/write) or list of links.
 #[derive(Debug, Default, Clone)]
-struct SharedWithState {
+pub struct SharedWithState {
     read: BTreeMap<String, BTreeSet<String>>,
     write: BTreeMap<String, BTreeSet<String>>,
     links: BTreeMap<String, Vec<LinkProperties>>,
 }
 
+/// The sharing state of a single file (`FileSharedWithState`): who has read /
+/// write access and any secret links to it.
+#[derive(Debug, Default, Clone)]
+pub struct FileSharedWithState {
+    pub read: BTreeSet<String>,
+    pub write: BTreeSet<String>,
+    pub links: Vec<LinkProperties>,
+}
+
 impl SharedWithState {
+    /// Per-child read-access usernames (`readShares`).
+    pub fn read_shares(&self) -> &BTreeMap<String, BTreeSet<String>> {
+        &self.read
+    }
+    /// Per-child write-access usernames (`writeShares`).
+    pub fn write_shares(&self) -> &BTreeMap<String, BTreeSet<String>> {
+        &self.write
+    }
+    /// Per-child secret links (`links`).
+    pub fn links(&self) -> &BTreeMap<String, Vec<LinkProperties>> {
+        &self.links
+    }
+    /// True if nothing in this directory is shared (`isEmpty`; links ignored, as in Java).
+    pub fn is_empty(&self) -> bool {
+        self.read.is_empty() && self.write.is_empty()
+    }
+    /// The sharing state of a single child by name (`get`).
+    pub fn get(&self, filename: &str) -> FileSharedWithState {
+        FileSharedWithState {
+            read: self.read.get(filename).cloned().unwrap_or_default(),
+            write: self.write.get(filename).cloned().unwrap_or_default(),
+            links: self.links.get(filename).cloned().unwrap_or_default(),
+        }
+    }
+
     fn from_cbor(cbor: &CborObject) -> SharedWithState {
         let parse = |field: &str| -> BTreeMap<String, BTreeSet<String>> {
             let mut out = BTreeMap::new();
@@ -1214,6 +1259,39 @@ async fn read_shared_with_at(
         .into_iter()
         .find(|e| e.name == DIR_CACHE_FILE);
     match file {
+        Some(e) => {
+            let bytes = crate::read_file(&e.cap, store, mutable).await?.1;
+            Ok(SharedWithState::from_cbor(&CborObject::from_bytes(&bytes)?))
+        }
+        None => Ok(SharedWithState::default()),
+    }
+}
+
+/// The sharing state of every child of the directory at home-relative `dir_path`
+/// (`getDirectorySharingState`): who has read / write access and any links, read
+/// from that directory's `sharedWith.cbor`. Read-only — never creates cache dirs;
+/// returns empty if nothing under `dir_path` has been shared.
+pub async fn get_directory_sharing_state(
+    user: &LoggedInUser,
+    dir_path: &str,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<SharedWithState> {
+    let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
+    // Walk .capabilitycache/outbound/<dir_path> without creating anything.
+    let mut cur = match list_directory(home, store.clone(), mutable).await?.into_iter().find(|e| e.name == CAP_CACHE_DIR) {
+        Some(e) => e.cap,
+        None => return Ok(SharedWithState::default()),
+    };
+    let mut components = vec![OUTBOUND_DIR.to_string()];
+    components.extend(dir_path.trim_matches('/').split('/').filter(|s| !s.is_empty()).map(|s| s.to_string()));
+    for comp in &components {
+        cur = match list_directory(&cur, store.clone(), mutable).await?.into_iter().find(|e| &e.name == comp) {
+            Some(e) => e.cap,
+            None => return Ok(SharedWithState::default()),
+        };
+    }
+    match list_directory(&cur, store.clone(), mutable).await?.into_iter().find(|e| e.name == DIR_CACHE_FILE) {
         Some(e) => {
             let bytes = crate::read_file(&e.cap, store, mutable).await?.1;
             Ok(SharedWithState::from_cbor(&CborObject::from_bytes(&bytes)?))
