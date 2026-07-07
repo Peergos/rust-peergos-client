@@ -87,6 +87,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         social.pending_outgoing.len(),
     );
 
-    println!("\nUI methods OK: getOrMkdirs, directChildrenCount, contentHash, truncate, append, deleteChildren, deleteSecretLink, unfollow, socialState.");
+    // getLinkHost: the hostname serving this user's links.
+    let link_host = ctx.get_link_host().await?;
+    assert!(!link_host.is_empty(), "getLinkHost must return a host");
+    println!("getLinkHost: {link_host:?}");
+
+    println!("\nUI methods OK: getOrMkdirs, directChildrenCount, contentHash, truncate, append, deleteChildren, deleteSecretLink, unfollow, socialState, getLinkHost.");
     Ok(())
 }

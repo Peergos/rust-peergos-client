@@ -254,6 +254,9 @@ impl ContentAddressedStorage for BufferedStorage {
     async fn get_secret_link(&self, owner: &PublicKeyHash, label: &str) -> Result<CborObject> {
         self.target.get_secret_link(owner, label).await
     }
+    async fn link_host(&self, owner: &PublicKeyHash) -> Result<String> {
+        self.target.link_host(owner).await
+    }
 
     async fn get_size(&self, owner: &PublicKeyHash, block: &Multihash) -> Result<Option<u64>> {
         if block.is_identity() {

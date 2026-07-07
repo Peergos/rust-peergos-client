@@ -151,6 +151,13 @@ pub trait ContentAddressedStorage: Send + Sync {
     /// Fetch the encrypted capability behind a secret link label (`link/get`).
     async fn get_secret_link(&self, owner: &PublicKeyHash, label: &str) -> Result<CborObject>;
 
+    /// The hostname that serves `owner`'s secret/public links (`linkHost`). The
+    /// default (and non-Peergos-server case) is `"localhost"`; the [`HttpStorage`]
+    /// override asks the server, and buffering/fallback wrappers delegate.
+    async fn link_host(&self, _owner: &PublicKeyHash) -> Result<String> {
+        Ok("localhost".to_string())
+    }
+
     /// Look up a set of champ keys under `root`, returning every block on each
     /// key's path plus its value block, in one call (`getChampLookup` /
     /// `champ/get/bulk`). The default walks the champ locally; the peergos-server
@@ -321,6 +328,9 @@ impl ContentAddressedStorage for FallbackStorage {
     }
     async fn get_secret_link(&self, owner: &PublicKeyHash, label: &str) -> Result<CborObject> {
         self.secondary.get_secret_link(owner, label).await
+    }
+    async fn link_host(&self, owner: &PublicKeyHash) -> Result<String> {
+        self.secondary.link_host(owner).await
     }
 }
 
@@ -555,6 +565,12 @@ impl ContentAddressedStorage for HttpStorage {
         );
         let raw = self.poster.get(&url).await?;
         Ok(CborObject::from_bytes(&raw)?)
+    }
+
+    async fn link_host(&self, owner: &PublicKeyHash) -> Result<String> {
+        let url = format!("{API_PREFIX}link-host?owner={}", url_encode(&owner.to_string()));
+        let raw = self.poster.get(&url).await?;
+        Ok(String::from_utf8_lossy(&raw).into_owned())
     }
 
     async fn get_champ_lookup(

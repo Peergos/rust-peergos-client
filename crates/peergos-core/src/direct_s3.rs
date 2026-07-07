@@ -290,6 +290,9 @@ impl ContentAddressedStorage for DirectS3Storage {
     async fn get_secret_link(&self, owner: &PublicKeyHash, label: &str) -> Result<CborObject> {
         self.fallback.get_secret_link(owner, label).await
     }
+    async fn link_host(&self, owner: &PublicKeyHash) -> Result<String> {
+        self.fallback.link_host(owner).await
+    }
 
     async fn get(&self, owner: &PublicKeyHash, hash: &Cid, bat: Option<&BatWithId>) -> Result<Option<CborObject>> {
         match self.get_raw(owner, hash, bat).await? {

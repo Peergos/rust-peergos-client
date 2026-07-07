@@ -558,6 +558,14 @@ impl UserContext {
         parse_cbor_long(&self.poster.get(&url).await?)
     }
 
+    /// The hostname serving this user's secret/public links (`getLinkHost`), for
+    /// building shareable link URLs. `"localhost"` when the store isn't a Peergos
+    /// server.
+    pub async fn get_link_host(&self) -> Result<String> {
+        let user = self.require_user()?;
+        self.store.link_host(&user.identity).await
+    }
+
     /// The storage currently used by this account across the network, in bytes
     /// (`getSpaceUsage`).
     pub async fn get_usage(&self) -> Result<i64> {
