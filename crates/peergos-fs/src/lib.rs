@@ -2997,6 +2997,46 @@ fn remove_all_chunks<'a>(
     })
 }
 
+/// Recursively collect every own-writer subspace reachable under `cap` (crossing
+/// link nodes at every level), in pre-order (a parent writer before its children).
+/// `owned_by_parent` is true while still within the original parent writer's space:
+/// such own-writers are pushed to `first_level` (they must be deauthorised from
+/// that writer), whereas deeper ones are owned by an own-writer that is itself
+/// being nulled. Every own-writer target is pushed to `to_null`.
+fn collect_own_writer_targets<'a>(
+    cap: &'a AbsoluteCapability,
+    owned_by_parent: bool,
+    to_null: &'a mut Vec<AbsoluteCapability>,
+    first_level: &'a mut Vec<PublicKeyHash>,
+    store: &'a Arc<dyn ContentAddressedStorage>,
+    mutable: &'a dyn MutablePointers,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
+    Box::pin(async move {
+        let (_n, props) = retrieve_file_metadata(cap, store.clone(), mutable).await?;
+        if props.is_link {
+            // A link node: its single child is the target in its own writer subspace.
+            let target = list_directory(cap, store.clone(), mutable)
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::Protocol("link node has no target".into()))?
+                .cap;
+            if owned_by_parent {
+                first_level.push(target.writer.clone());
+            }
+            to_null.push(target.clone());
+            // The target's own children are owned by the target writer, not the parent.
+            collect_own_writer_targets(&target, false, to_null, first_level, store, mutable).await?;
+        } else if props.is_directory {
+            // A same-writer directory: its children share this writer's ownership.
+            for e in list_directory(cap, store.clone(), mutable).await? {
+                collect_own_writer_targets(&e.cap, owned_by_parent, to_null, first_level, store, mutable).await?;
+            }
+        }
+        Ok(())
+    })
+}
+
 /// Delete a child (file or directory) by name from a writable directory. The
 /// child link is removed from the parent and all of the child's cryptree chunks
 /// are removed from the writer's champ. Mirrors `FileWrapper.remove`.
@@ -3009,32 +3049,30 @@ pub async fn delete_child(
     mutable: &dyn MutablePointers,
 ) -> Result<()> {
     // A write-shared file/dir is a link node here pointing to a target in its OWN
-    // writer subspace. Removing only the link node would leak that whole subspace,
-    // so reclaim it too — delete its pointer (while still authorised) and, after
-    // the link is gone, deauthorise the writer — mirroring force_rotate.
-    let own_writer_target = match list_directory(dir_cap, store.clone(), mutable)
+    // writer subspace; deleting only the link node would leak that whole subspace.
+    // Reclaim every own-writer subspace in the subtree being deleted, regardless of
+    // nesting: collect them, null their pointers deepest-FIRST (a writer must be
+    // nulled while its owner still authorises it — like Java's leaf-to-root delete),
+    // and deauthorise the first-level ones from this directory's writer afterwards.
+    let child_cap = list_directory(dir_cap, store.clone(), mutable)
         .await?
         .into_iter()
         .find(|e| e.name == name)
-    {
-        Some(e) => {
-            let (_n, props) = retrieve_file_metadata(&e.cap, store.clone(), mutable).await?;
-            if props.is_link {
-                let target = list_directory(&e.cap, store.clone(), mutable)
-                    .await?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| Error::Protocol("link node has no target".into()))?
-                    .cap;
-                (target.writer != dir_cap.writer).then_some(target)
-            } else {
-                None
-            }
+        .map(|e| e.cap);
+    let (mut to_null, first_level) = match &child_cap {
+        Some(cc) => {
+            let mut to_null = Vec::new();
+            let mut first_level = Vec::new();
+            collect_own_writer_targets(cc, true, &mut to_null, &mut first_level, &store, mutable).await?;
+            (to_null, first_level)
         }
-        None => None,
+        None => (Vec::new(), Vec::new()),
     };
     let deauth_signer = entry_signer.clone();
-    if let Some(target) = &own_writer_target {
+    // Discovery is parent-before-child (pre-order); reverse so descendants are
+    // nulled before their owning writer.
+    to_null.reverse();
+    for target in &to_null {
         let target_signer = recover_signer(target, store.clone(), mutable).await?;
         delete_writer_subspace(&dir_cap.owner, &target_signer, &store, mutable).await?;
     }
@@ -3140,10 +3178,11 @@ pub async fn delete_child(
     }
     store.close_transaction(&dir_cap.owner, &ctx.tid).await?;
 
-    // The link node is gone: deauthorise the now-orphaned writer so nothing keeps
-    // its (already-emptied) subspace reachable.
-    if let Some(target) = &own_writer_target {
-        deauthorize_writer(dir_cap, &target.writer, deauth_signer, store.clone(), mutable).await?;
+    // The link node(s) are gone: deauthorise the first-level orphaned writers from
+    // this directory's writer's owned champ. Deeper writers were owned by an
+    // own-writer we already nulled, so they need no deauthorisation.
+    for w in &first_level {
+        deauthorize_writer(dir_cap, w, deauth_signer.clone(), store.clone(), mutable).await?;
     }
     Ok(())
 }

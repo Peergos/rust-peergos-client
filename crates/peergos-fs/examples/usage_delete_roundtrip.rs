@@ -74,8 +74,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let after_delete2 = settled_usage(&ctx).await?;
     println!("after deleting: {after_delete2} (baseline was {baseline2})");
     assert_eq!(after_delete2, baseline2, "deleting a writable-shared file must return usage to exactly the prior value");
-    println!("writable-shared file: usage round-trips exactly");
+    println!("writable-shared file: usage round-trips exactly\n");
 
-    println!("\nUsage round-trip OK: multi-chunk upload + delete reclaims exactly, plain and writable-shared.");
+    // --- Case 3: nested own writers — a write-shared dir holding a write-shared
+    // file — deleted at the top. Every descendant subspace must be reclaimed,
+    // regardless of writing space. ------------------------------------------
+    let baseline3 = settled_usage(&ctx).await?;
+    println!("baseline usage: {baseline3}");
+
+    peergos_fs::create_directory(home.capability(), "outer", Some(signer.clone()), mb.as_ref(), store.clone(), mutable.as_ref()).await?;
+    // Move `outer` into its own writer (W1).
+    let outer = peergos_fs::move_dir_to_own_writer(home.capability(), "outer", Some(signer.clone()), mb.as_ref(), store.clone(), mutable.as_ref()).await?;
+    let outer_signer = peergos_fs::recover_signer(&outer, store.clone(), mutable.as_ref()).await?;
+    // Upload an 11 MiB file into W1, then move it into its OWN writer (W2).
+    peergos_fs::upload_file(&outer, "inner.bin", &content, None, Some(outer_signer.clone()), mb.as_ref(), store.clone(), mutable.as_ref()).await?;
+    peergos_fs::move_file_to_own_writer(&outer, "inner.bin", Some(outer_signer.clone()), mb.as_ref(), store.clone(), mutable.as_ref()).await?;
+    let after_nested = settled_usage(&ctx).await?;
+    println!("after nested own-writer tree (home->outer(W1)->inner(W2)): {after_nested} (+{})", after_nested - baseline3);
+    assert!(after_nested > baseline3, "the nested tree must use space");
+
+    // Delete `outer` at the top — must reclaim W1 AND the nested W2.
+    peergos_fs::delete_child(home.capability(), "outer", Some(signer.clone()), mb.as_ref(), store.clone(), mutable.as_ref()).await?;
+    let after_delete3 = settled_usage(&ctx).await?;
+    println!("after deleting outer: {after_delete3} (baseline was {baseline3})");
+    assert_eq!(after_delete3, baseline3, "deleting a directory must reclaim every descendant subspace, regardless of writer");
+    println!("nested own-writer tree: usage round-trips exactly");
+
+    println!("\nUsage round-trip OK: multi-chunk upload + delete reclaims exactly — plain, writable-shared, and nested across writers.");
     Ok(())
 }
