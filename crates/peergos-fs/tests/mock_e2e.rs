@@ -203,3 +203,54 @@ async fn revoke_write_denies_writer() {
 
     assert!(!try_write(("bob", "bpw"), "alice", "after.txt", &poster, &store, &mutable).await, "REVOCATION FAILED: bob still wrote");
 }
+
+/// Covers multichunk_edit, file_section, upload_subtree, js_methods, block_annotate,
+/// and a writable secret link — all under one signup to amortise the cost.
+#[tokio::test]
+async fn single_user_filesystem_flows() {
+    use peergos_fs::{FileUpload, FolderUpload, FriendAnnotation};
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = UserContext::sign_up("frank", "fpw", None, poster.clone(), store.clone(), mutable).await.expect("sign up");
+    let home = ctx.get_home().await.unwrap();
+
+    // multichunk_edit: truncate + append across chunks.
+    let big = vec![3u8; 11 * 1024 * 1024]; // 3 chunks
+    let f = home.upload("big.bin", &big).await.unwrap();
+    f.truncate(6 * 1024 * 1024).await.unwrap();
+    assert_eq!(ctx.get_by_path("big.bin").await.unwrap().unwrap().size(), 6 * 1024 * 1024);
+    ctx.get_by_path("big.bin").await.unwrap().unwrap().append(&vec![4u8; 2 * 1024 * 1024]).await.unwrap();
+    assert_eq!(ctx.get_by_path("big.bin").await.unwrap().unwrap().size(), 8 * 1024 * 1024);
+
+    // file_section: ranged read + in-place overwrite.
+    let sf = home.get_latest().await.unwrap().upload("sect.bin", &vec![1u8; 6 * 1024 * 1024]).await.unwrap();
+    let edit = vec![0xABu8; 100];
+    sf.overwrite_section(5 * 1024 * 1024 - 50, &edit).await.unwrap();
+    let re = ctx.get_by_path("sect.bin").await.unwrap().unwrap().read_section(5 * 1024 * 1024 - 50, 100).await.unwrap();
+    assert_eq!(re, edit);
+
+    // upload_subtree: batched small files (+ streaming).
+    let files: Vec<FileUpload> = (0..50).map(|i| FileUpload::from_bytes(format!("s{i}.txt"), vec![(i % 251) as u8; 512])).collect();
+    let dir = home.get_latest().await.unwrap().mkdir("bulk").await.unwrap();
+    dir.upload_subtree(vec![FolderUpload { rel_path: vec![], files }]).await.unwrap();
+    assert_eq!(ctx.get_by_path("bulk").await.unwrap().unwrap().direct_children_count().await.unwrap(), 50);
+
+    // js_methods: getOrMkdirs, contentHash.
+    let leaf = home.get_latest().await.unwrap().get_or_mkdirs("a/b/c").await.unwrap();
+    assert_eq!(leaf.name(), "c");
+    let doc = home.get_latest().await.unwrap().upload("hash.txt", b"hash me").await.unwrap();
+    assert_eq!(doc.content_hash().await.unwrap(), peergos_crypto::hash::sha256(b"hash me"));
+
+    // block_annotate: block/unblock + friend annotations.
+    ctx.block("spammer").await.unwrap();
+    assert_eq!(ctx.get_blocked().await.unwrap(), vec!["spammer".to_string()]);
+    ctx.unblock("spammer").await.unwrap();
+    assert!(ctx.get_blocked().await.unwrap().is_empty());
+    ctx.add_friend_annotation(FriendAnnotation::new("alice", true, vec![])).await.unwrap();
+    assert!(ctx.get_friend_annotations().await.unwrap()["alice"].is_verified);
+
+    // writable secret link to a file (create_secret_link).
+    let wlink = ctx.create_secret_link("hash.txt", true, "", None, None).await.unwrap();
+    let wcap = peergos_fs::retrieve_secret_link_capability(&wlink, store.as_ref(), None).await.unwrap();
+    assert!(wcap.is_writable(), "writable link must yield a writable cap");
+}
