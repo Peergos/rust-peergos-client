@@ -513,7 +513,20 @@ impl FileWrapper {
             Some(s) => s.clone(),
             None => crate::recover_signer(&self.cap, self.store.clone(), self.mutable.as_ref()).await?,
         };
-        crate::upload_subtree(&self.cap, signer, self.mirror_bat.as_ref(), folders, self.store.clone(), self.mutable.clone()).await
+        // Large files route through .transactions under the user's home; fall back
+        // to this directory (uploads then stay atomic) for a secret-link context.
+        let home = self.home_cap.clone().unwrap_or_else(|| self.cap.clone());
+        crate::upload_subtree(
+            &home,
+            &self.cap,
+            &self.path,
+            signer,
+            self.mirror_bat.as_ref(),
+            folders,
+            self.store.clone(),
+            self.mutable.clone(),
+        )
+        .await
     }
 
     /// Remove a child (file or directory) from this directory (`remove`).

@@ -158,7 +158,7 @@ fn diff<'a>(
     higher_right: Vec<KeyElement>,
     out: &'a mut Vec<DiffEntry>,
     storage: &'a dyn ContentAddressedStorage,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         if original == updated {
             return Ok(()); // identical subtree (same CID, or both absent) — never loaded

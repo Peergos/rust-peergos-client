@@ -3803,9 +3803,69 @@ pub async fn upload_file_auto(
 }
 
 /// A file to place in a subtree upload.
+/// A lazily-opened byte source: called once per read pass, never holding the whole
+/// file in memory (like Java's `AsyncReader` supplier).
+type ReaderFactory = Arc<dyn Fn() -> std::io::Result<Box<dyn std::io::Read + Send>> + Send + Sync>;
+
+/// A file to place in a subtree upload. Content is provided LAZILY via `open`, so
+/// huge files stream chunk-by-chunk and are never held whole in RAM. `hash`, if
+/// present, lets an unchanged file be skipped without reading it.
 pub struct FileUpload {
     pub name: String,
-    pub data: Vec<u8>,
+    pub size: u64,
+    open: ReaderFactory,
+    hash: Option<hashtree::RootHash>,
+}
+
+impl FileUpload {
+    /// A file whose bytes come from a reader factory (`open` is called once per
+    /// pass — the hash pass and the upload pass — so it must re-yield the same bytes).
+    pub fn from_reader<F, R>(name: impl Into<String>, size: u64, open: F) -> FileUpload
+    where
+        F: Fn() -> std::io::Result<R> + Send + Sync + 'static,
+        R: std::io::Read + Send + 'static,
+    {
+        FileUpload {
+            name: name.into(),
+            size,
+            open: Arc::new(move || open().map(|r| Box::new(r) as Box<dyn std::io::Read + Send>)),
+            hash: None,
+        }
+    }
+
+    /// Stream a file from disk (size read from the filesystem, content re-opened
+    /// lazily each pass — never fully buffered).
+    pub fn from_path(name: impl Into<String>, path: impl AsRef<std::path::Path>) -> std::io::Result<FileUpload> {
+        let path = path.as_ref().to_path_buf();
+        let size = std::fs::metadata(&path)?.len();
+        Ok(FileUpload {
+            name: name.into(),
+            size,
+            open: Arc::new(move || std::fs::File::open(&path).map(|f| Box::new(f) as Box<dyn std::io::Read + Send>)),
+            hash: None,
+        })
+    }
+
+    /// A small in-memory file. Its content hash is precomputed so re-uploading an
+    /// unchanged copy is skipped.
+    pub fn from_bytes(name: impl Into<String>, data: Vec<u8>) -> FileUpload {
+        let size = data.len() as u64;
+        let hash = content_root_hash(&data).ok();
+        let data = Arc::new(data);
+        FileUpload {
+            name: name.into(),
+            size,
+            open: Arc::new(move || Ok(Box::new(std::io::Cursor::new((*data).clone())) as Box<dyn std::io::Read + Send>)),
+            hash,
+        }
+    }
+
+    /// Attach a precomputed content hash-tree root (from a prior scan) so this file
+    /// can be deduped against an unchanged remote copy without reading it.
+    pub fn with_hash(mut self, hash: hashtree::RootHash) -> FileUpload {
+        self.hash = Some(hash);
+        self
+    }
 }
 
 /// A directory relative to the upload base and the files to place directly in it.
@@ -3854,15 +3914,24 @@ async fn get_or_mkdirs_cap(
 }
 
 /// Efficiently upload a whole directory tree in as few server commits as possible
-/// (ports `FileWrapper.uploadSubtree`). All writes go through a [`BufferedNetwork`]
+/// (ports `FileWrapper.uploadSubtree`). Every write goes through a [`BufferedNetwork`]
 /// over `store`/`mutable`: blocks and pointer updates are buffered and flushed in
-/// bulk once the buffer reaches ~20 MiB (and finally at the end), and the buffer is
-/// garbage-collected to the reachable set before each flush so superseded
-/// intermediate champ nodes are never sent. Within each folder, files are uploaded
-/// sorted by ascending size. `base_signer` signs writes into `base` and its plain
-/// subdirectories (they share its writer).
+/// bulk once the buffer reaches ~20 MiB (and at the end), GC'd to the reachable set
+/// before each flush so superseded intermediate champ nodes are never sent.
+///
+/// Files STREAM — their bytes are read chunk-by-chunk from [`FileUpload::open`],
+/// never held whole in RAM. Small (single-chunk) files are written atomically;
+/// large (multi-chunk) files go through the crash-safe transaction path, which
+/// commits each chunk, so the auto-commit flushes mid-file and memory stays bounded
+/// to ~one 5 MiB chunk plus the ~20 MiB buffer regardless of file size. Within each
+/// folder files are uploaded sorted by ascending size, and any file whose content
+/// hash matches the stored one is skipped. `base_signer` signs writes into `base`
+/// and its plain subdirectories (they share its writer); `home_cap`/`base_path`
+/// anchor the `.transactions` records for large files.
 pub async fn upload_subtree(
+    home_cap: &AbsoluteCapability,
     base: &AbsoluteCapability,
+    base_path: &str,
     base_signer: SigningPrivateKeyAndPublicHash,
     mirror_bat: Option<&BatId>,
     folders: Vec<FolderUpload>,
@@ -3892,28 +3961,41 @@ pub async fn upload_subtree(
                 .collect()
         };
 
+        // Home-relative path of this folder (for transaction records of large files).
+        let mut dir_path = base_path.trim_matches('/').to_string();
+        for comp in &folder.rel_path {
+            dir_path = if dir_path.is_empty() { comp.clone() } else { format!("{dir_path}/{comp}") };
+        }
+
         // Files in a plain subdirectory share the base writer's signer.
         let mut files = folder.files;
-        files.sort_by_key(|f| f.data.len());
+        files.sort_by_key(|f| f.size);
         for f in files {
-            // Skip unchanged files (identical content already present).
-            if let Some(remote) = existing_hash.get(&f.name) {
-                if content_root_hash(&f.data)? == *remote {
+            // Skip unchanged files (identical content already present) when we can
+            // tell without reading — the caller supplied a content hash.
+            if let (Some(remote), Some(local)) = (existing_hash.get(&f.name), &f.hash) {
+                if local == remote {
                     continue;
                 }
             }
-            upload_file(
+            let file_path = if dir_path.is_empty() { f.name.clone() } else { format!("{dir_path}/{}", f.name) };
+            let open = f.open.clone();
+            // Small files: atomic; large files: crash-safe transaction (per-chunk
+            // commits, so the buffer auto-flushes mid-file — bounded RAM).
+            upload_file_streaming_auto(
+                home_cap,
                 &dir_cap,
+                &file_path,
                 &f.name,
-                &f.data,
+                f.size,
                 None,
                 Some(base_signer.clone()),
                 mirror_bat,
+                move || open(),
                 bstore.clone(),
                 bmutable.as_ref(),
             )
             .await?;
-            net.maybe_commit(&owner).await?;
         }
     }
     net.commit(&owner).await

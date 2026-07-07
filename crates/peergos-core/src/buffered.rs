@@ -330,14 +330,60 @@ struct WriterUpdate {
 /// A `MutablePointers` that buffers updates until [`BufferedPointers::commit_pointers`].
 /// Updates are kept in an **ordered list** (write order matters for commit
 /// sequencing); only *consecutive* writes to the same writer are condensed.
+///
+/// If given an auto-commit context (block buffer + threshold + safety flag), each
+/// buffered pointer write flushes the whole buffer once it crosses the threshold —
+/// mirroring Java's `BufferedNetworkAccess.buildCommitter` wrapping every commit
+/// with `maybeCommit`. This is what bounds memory during a large multi-chunk file
+/// upload (which commits per chunk), not just between files.
 pub struct BufferedPointers {
     target: Arc<dyn MutablePointers>,
     updates: Mutex<Vec<WriterUpdate>>,
+    auto: Option<AutoCommit>,
+}
+
+struct AutoCommit {
+    blocks: Arc<BufferedStorage>,
+    buffer_size: usize,
+    safe: Arc<AtomicBool>,
 }
 
 impl BufferedPointers {
     pub fn new(target: Arc<dyn MutablePointers>) -> BufferedPointers {
-        BufferedPointers { target, updates: Mutex::new(Vec::new()) }
+        BufferedPointers { target, updates: Mutex::new(Vec::new()), auto: None }
+    }
+
+    /// A buffered-pointers that auto-flushes the shared block buffer once it reaches
+    /// `buffer_size` and `safe` is set (used by [`BufferedNetwork`]).
+    pub fn with_auto_commit(
+        target: Arc<dyn MutablePointers>,
+        blocks: Arc<BufferedStorage>,
+        buffer_size: usize,
+        safe: Arc<AtomicBool>,
+    ) -> BufferedPointers {
+        BufferedPointers { target, updates: Mutex::new(Vec::new()), auto: Some(AutoCommit { blocks, buffer_size, safe }) }
+    }
+
+    /// Flush the buffer (GC to roots, write blocks, commit pointers) if an
+    /// auto-commit context is present, it is safe to commit, and the buffer is full.
+    /// Called after each buffered pointer write.
+    async fn maybe_auto_commit(&self, owner: &PublicKeyHash) -> Result<()> {
+        let auto = match &self.auto {
+            Some(a) => a,
+            None => return Ok(()),
+        };
+        if !auto.safe.load(Ordering::SeqCst) || auto.blocks.total_size() < auto.buffer_size {
+            return Ok(());
+        }
+        let roots = self.roots();
+        if roots.is_empty() {
+            return Ok(());
+        }
+        let tid = auto.blocks.target().start_transaction(owner).await?;
+        auto.blocks.commit_blocks(owner, &roots, &tid).await?;
+        self.commit_pointers(owner, &auto.blocks, &tid).await?;
+        auto.blocks.target().close_transaction(owner, &tid).await?;
+        Ok(())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -427,19 +473,23 @@ impl MutablePointers for BufferedPointers {
     /// interleaved writes to other writers keep their order.
     async fn set_pointer_update(
         &self,
-        _owner: &PublicKeyHash,
+        owner: &PublicKeyHash,
         writer: &SigningPrivateKeyAndPublicHash,
         update: &PointerUpdate,
     ) -> Result<bool> {
-        let mut list = self.updates.lock().unwrap();
-        match list.last_mut() {
-            Some(last) if last.writer == writer.public_key_hash => last.update.updated = update.updated.clone(),
-            _ => list.push(WriterUpdate {
-                writer: writer.public_key_hash.clone(),
-                update: update.clone(),
-                signer: writer.clone(),
-            }),
+        {
+            let mut list = self.updates.lock().unwrap();
+            match list.last_mut() {
+                Some(last) if last.writer == writer.public_key_hash => last.update.updated = update.updated.clone(),
+                _ => list.push(WriterUpdate {
+                    writer: writer.public_key_hash.clone(),
+                    update: update.clone(),
+                    signer: writer.clone(),
+                }),
+            }
         }
+        // Auto-flush at the buffer threshold (Java's committer → maybeCommit).
+        self.maybe_auto_commit(owner).await?;
         Ok(true)
     }
 
@@ -469,7 +519,7 @@ pub struct BufferedNetwork {
     blocks: Arc<BufferedStorage>,
     pointers: Arc<BufferedPointers>,
     buffer_size: usize,
-    safe_to_commit: AtomicBool,
+    safe_to_commit: Arc<AtomicBool>,
 }
 
 /// The buffered-block threshold before an auto-flush, matching Java's main
@@ -494,12 +544,15 @@ impl BufferedNetwork {
         buffer_size: usize,
         read_cache_size: usize,
     ) -> BufferedNetwork {
-        BufferedNetwork {
-            blocks: Arc::new(BufferedStorage::new(target_storage, read_cache_size)),
-            pointers: Arc::new(BufferedPointers::new(target_pointers)),
+        let blocks = Arc::new(BufferedStorage::new(target_storage, read_cache_size));
+        let safe_to_commit = Arc::new(AtomicBool::new(true));
+        let pointers = Arc::new(BufferedPointers::with_auto_commit(
+            target_pointers,
+            blocks.clone(),
             buffer_size,
-            safe_to_commit: AtomicBool::new(true),
-        }
+            safe_to_commit.clone(),
+        ));
+        BufferedNetwork { blocks, pointers, buffer_size, safe_to_commit }
     }
 
     /// The buffered block store to pass as `store` to filesystem operations.
