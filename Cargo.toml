@@ -6,6 +6,7 @@ members = [
     "crates/peergos-crypto",
     "crates/peergos-core",
     "crates/peergos-fs",
+    "crates/peergos-mock-server",
 ]
 
 [workspace.package]

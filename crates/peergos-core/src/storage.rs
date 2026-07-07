@@ -40,6 +40,16 @@ impl ChunkMirrorCap {
             .put_opt("b", self.bat.as_ref().map(|b| b.to_cbor()))
             .build()
     }
+
+    pub fn from_cbor(cbor: &CborObject) -> Result<ChunkMirrorCap> {
+        let map_key = cbor
+            .get("m")
+            .and_then(|c| c.as_bytes())
+            .ok_or_else(|| Error::Cbor("ChunkMirrorCap missing 'm'".into()))?
+            .to_vec();
+        let bat = cbor.get("b").map(BatWithId::from_cbor).transpose()?;
+        Ok(ChunkMirrorCap { map_key, bat })
+    }
 }
 
 pub const API_PREFIX: &str = "api/v0/";
@@ -69,6 +79,21 @@ impl Cborable for BlockWriteGroup {
             .put("b", to_list(&self.blocks))
             .put("s", to_list(&self.signatures))
             .build()
+    }
+}
+
+impl BlockWriteGroup {
+    pub fn from_cbor(cbor: &CborObject) -> Result<BlockWriteGroup> {
+        let list = |field: &str| -> Result<Vec<Vec<u8>>> {
+            Ok(cbor
+                .get(field)
+                .and_then(|c| c.as_list())
+                .ok_or_else(|| Error::Cbor(format!("BlockWriteGroup missing '{field}'")))?
+                .iter()
+                .filter_map(|b| b.as_bytes().map(|x| x.to_vec()))
+                .collect())
+        };
+        Ok(BlockWriteGroup { blocks: list("b")?, signatures: list("s")? })
     }
 }
 
