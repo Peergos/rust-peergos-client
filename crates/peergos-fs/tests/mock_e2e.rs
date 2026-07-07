@@ -99,3 +99,37 @@ async fn secret_link_roundtrip() {
     let cap2 = peergos_fs::retrieve_secret_link_capability(&protected, store.as_ref(), Some("hunter2")).await.expect("with pw");
     assert_eq!(peergos_fs::read_file(&cap2, store.clone(), ctx.mutable().as_ref()).await.unwrap().1, b"top secret");
 }
+
+#[tokio::test]
+async fn mutate_move_rename_delete() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = UserContext::sign_up("dave", "dpw", None, poster, store, mutable).await.expect("sign up");
+    let home = ctx.get_home().await.unwrap();
+
+    home.upload("a.txt", b"aaa").await.unwrap();
+    let dst = home.mkdir("dst").await.unwrap();
+
+    // rename, then move into a subdir, then delete.
+    let home = home.get_latest().await.unwrap();
+    home.rename_child("a.txt", "b.txt").await.unwrap();
+    let home = home.get_latest().await.unwrap();
+    home.move_child("b.txt", &dst.get_latest().await.unwrap(), true).await.unwrap();
+    let moved = ctx.get_by_path("dst/b.txt").await.unwrap().expect("moved file");
+    assert_eq!(moved.read().await.unwrap(), b"aaa");
+
+    dst.get_latest().await.unwrap().remove_child("b.txt").await.unwrap();
+    assert!(ctx.get_by_path("dst/b.txt").await.unwrap().is_none(), "deleted");
+}
+
+#[tokio::test]
+async fn change_password_then_sign_in() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    UserContext::sign_up("erin", "old-pw", None, poster.clone(), store.clone(), mutable.clone()).await.expect("sign up");
+    peergos_fs::change_password("erin", "old-pw", "new-pw", None, poster.as_ref(), store.clone(), mutable.as_ref()).await.expect("change pw");
+
+    // Old password no longer works; new one does.
+    assert!(UserContext::sign_in("erin", "old-pw", None, poster.clone(), store.clone(), mutable.clone()).await.is_err());
+    UserContext::sign_in("erin", "new-pw", None, poster, store, mutable).await.expect("sign in with new pw");
+}
