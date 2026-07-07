@@ -106,7 +106,67 @@ impl MockServer {
         if let Some(rest) = path.strip_prefix("peergos/v0/login/") {
             return self.handle_login(rest, &query, body);
         }
+        // Space usage (peergos/v0/storage/…).
+        if let Some(rest) = path.strip_prefix("peergos/v0/storage/") {
+            return self.handle_usage(rest, &query).await;
+        }
         Err(Error::Http(format!("status 404: mock has no route for {path}")))
+    }
+
+    async fn handle_usage(&self, rest: &str, q: &Query) -> Result<Vec<u8>> {
+        match rest {
+            // A generous fixed quota.
+            "quota" => Ok(CborObject::Long(10 * 1024 * 1024 * 1024).to_bytes()),
+            "usage" => {
+                let owner = q.pkh("owner")?;
+                let bytes = self.reachable_usage(&owner).await? as i64;
+                Ok(CborObject::Long(bytes).to_bytes())
+            }
+            other => Err(Error::Http(format!("status 404: mock storage has no route for {other}"))),
+        }
+    }
+
+    /// Total bytes of the blocks reachable from all of `owner`'s pointers (walking
+    /// each WriterData → champ → nodes → fragments, unique blocks only). Because the
+    /// client's delete path repoints away from removed blocks, this reproduces the
+    /// "delete returns usage to exactly the prior value" property without a real GC.
+    async fn reachable_usage(&self, owner: &PublicKeyHash) -> Result<u64> {
+        let owner_key = pkh_key(owner);
+        let mut stack: Vec<Cid> = Vec::new();
+        {
+            let map = self.pointers.lock().unwrap();
+            for ((o, _w), payload) in map.iter() {
+                if *o == owner_key {
+                    if let Ok(upd) = parse_pointer_update(payload) {
+                        if let Some(cid) = upd.updated {
+                            stack.push(cid);
+                        }
+                    }
+                }
+            }
+        }
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut total = 0u64;
+        while let Some(cid) = stack.pop() {
+            if !seen.insert(cid.to_bytes()) {
+                continue;
+            }
+            let block = match self.blocks.get_raw(owner, &cid, None).await? {
+                Some(b) => b,
+                None => continue,
+            };
+            total += block.len() as u64;
+            if !cid.is_raw() {
+                if let Ok(cbor) = CborObject::from_bytes(&block) {
+                    for link in cbor.links() {
+                        if let Ok(c) = Cid::cast(&link) {
+                            stack.push(c);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(total)
     }
 
     async fn handle_core(&self, rest: &str, body: Vec<u8>) -> Result<Vec<u8>> {

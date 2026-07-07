@@ -22,3 +22,23 @@ async fn signup_login_upload_read() {
     let file = ctx2.get_by_path("docs/note.txt").await.expect("resolve").expect("file present");
     assert_eq!(file.read().await.expect("read"), content);
 }
+
+#[tokio::test]
+async fn usage_delete_roundtrip() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = UserContext::sign_up("bob", "bobpw", None, poster, store, mutable).await.expect("sign up");
+
+    let home = ctx.get_home().await.expect("home");
+    let baseline = ctx.get_usage().await.expect("usage");
+
+    // 11 MiB (3 chunks): usage rises, then a delete returns it to exactly baseline.
+    let content = vec![9u8; 11 * 1024 * 1024];
+    home.upload("big.bin", &content).await.expect("upload");
+    let after = ctx.get_usage().await.expect("usage");
+    assert!(after > baseline, "upload must raise usage ({after} !> {baseline})");
+
+    home.get_latest().await.expect("latest").remove_child("big.bin").await.expect("delete");
+    let after_delete = ctx.get_usage().await.expect("usage");
+    assert_eq!(after_delete, baseline, "delete must return usage to exactly the prior value");
+}
