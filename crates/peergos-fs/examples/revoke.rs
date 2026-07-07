@@ -9,6 +9,7 @@
 use peergos_core::mutable::HttpMutablePointers;
 use peergos_core::{ContentAddressedStorage, HttpStorage, ReqwestPoster};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 type Store = Arc<dyn ContentAddressedStorage>;
 
@@ -70,9 +71,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let poster = ReqwestPoster::new(&base, false)?;
     let store: Store = Arc::new(HttpStorage::new(Arc::new(ReqwestPoster::new(&base, false)?), true));
     let mutable = HttpMutablePointers::new(Arc::new(ReqwestPoster::new(&base, false)?));
-    let (au, ap) = ("w2", "w2pass");
-    let (bu, bp) = ("bob", "bobpass");
-    let (cu, cp) = ("carol", "carolpass");
+    // Unique per-run usernames: this example asserts a security property that
+    // depends on a clean slate. Reusing fixed names against a persistent server
+    // accumulates sharing state across runs (directories are not de-duplicated by
+    // name and shared-cap files only ever append), which defeats the assertion.
+    let s = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let (au_s, bu_s, cu_s) = (format!("alice{s}"), format!("bob{s}"), format!("carol{s}"));
+    let (au, ap) = (au_s.as_str(), "w2pass");
+    let (bu, bp) = (bu_s.as_str(), "bobpass");
+    let (cu, cp) = (cu_s.as_str(), "carolpass");
     for (u, p) in [(au, ap), (bu, bp), (cu, cp)] {
         match peergos_fs::signup(u, p, None, &poster, store.as_ref()).await {
             Ok(()) => println!("signed up {u:?}"),
