@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use peergos_cbor::{Cborable, CborObject};
 use peergos_core::error::{Error, Result};
 use peergos_core::keys::PublicKeyHash;
+use peergos_core::mutable::{PointerUpdate, SignedPointerUpdate, MUTABLE_POINTERS_URL};
 use peergos_core::poster::HttpPoster;
 use peergos_core::storage::{
     champ_lookup_local, BlockWriteGroup, ChunkMirrorCap, ContentAddressedStorage, TransactionId,
@@ -19,7 +20,7 @@ use peergos_core::storage::{
 use peergos_core::{build_cid, hash_to_cid, RamStorage};
 use peergos_multiformats::Cid;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// The in-memory state behind a mock server. Cheap to clone (`Arc`-shared), so a
 /// single server can back a client's store, mutable pointers, and poster at once.
@@ -28,6 +29,8 @@ pub struct MockServer {
     /// Content-addressed blocks (its own interior `Mutex`, so no lock is held
     /// across an await).
     blocks: Arc<RamStorage>,
+    /// Mutable pointers: (owner, writer) → the last signed CAS payload.
+    pointers: Arc<Mutex<HashMap<(Vec<u8>, Vec<u8>), Vec<u8>>>>,
     /// A stable fake node identity.
     server_id: Cid,
 }
@@ -42,6 +45,7 @@ impl MockServer {
     pub fn new() -> MockServer {
         MockServer {
             blocks: Arc::new(RamStorage::new()),
+            pointers: Arc::new(Mutex::new(HashMap::new())),
             // A deterministic non-identity CID; its Display round-trips through the
             // client's `Cid::decode_peer_id`.
             server_id: build_cid(vec![7u8; 32], false).expect("server id"),
@@ -64,7 +68,57 @@ impl MockServer {
         if let Some(rest) = path.strip_prefix(API_PREFIX) {
             return self.handle_storage(rest, &query, body).await;
         }
+        // Mutable pointers (peergos/v0/mutable/…).
+        if let Some(rest) = path.strip_prefix(MUTABLE_POINTERS_URL) {
+            return self.handle_mutable(rest, &query, body);
+        }
         Err(Error::Http(format!("status 404: mock has no route for {path}")))
+    }
+
+    fn handle_mutable(&self, rest: &str, q: &Query, body: Vec<u8>) -> Result<Vec<u8>> {
+        match rest {
+            "getPointer" => {
+                let key = (pkh_key(&q.pkh("owner")?), pkh_key(&q.pkh("writer")?));
+                Ok(self.pointers.lock().unwrap().get(&key).cloned().unwrap_or_default())
+            }
+            "setPointer" => {
+                let owner = q.pkh("owner")?;
+                let writer = q.pkh("writer")?;
+                Ok(vec![self.apply_cas(&owner, &writer, body)? as u8])
+            }
+            "setPointers" => {
+                // body = MultiWriterCommit `{p:[SignedPointerUpdate]}`; all-or-nothing.
+                let owner = q.pkh("owner")?;
+                let updates = match CborObject::from_bytes(&body)?.get("p").and_then(|c| c.as_list().map(|l| l.to_vec())) {
+                    Some(list) => list.iter().map(SignedPointerUpdate::from_cbor).collect::<Result<Vec<_>>>()?,
+                    None => Vec::new(),
+                };
+                let mut ok = true;
+                for u in updates {
+                    ok &= self.apply_cas(&owner, &u.writer, u.signed)?;
+                }
+                Ok(vec![ok as u8])
+            }
+            other => Err(Error::Http(format!("status 404: mock mutable has no route for {other}"))),
+        }
+    }
+
+    /// Apply a signed CAS pointer update: accept iff its `original` matches the
+    /// writer's current target, then store the new signed payload. Returns whether
+    /// it was accepted (a rejected CAS drives the client's 3-way merge path).
+    fn apply_cas(&self, owner: &PublicKeyHash, writer: &PublicKeyHash, signed: Vec<u8>) -> Result<bool> {
+        let new = parse_pointer_update(&signed)?;
+        let key = (pkh_key(owner), pkh_key(writer));
+        let mut map = self.pointers.lock().unwrap();
+        let current_target = match map.get(&key) {
+            Some(p) => parse_pointer_update(p)?.updated,
+            None => None,
+        };
+        if new.original != current_target {
+            return Ok(false);
+        }
+        map.insert(key, signed);
+        Ok(true)
     }
 
     async fn handle_storage(&self, rest: &str, q: &Query, body: Vec<u8>) -> Result<Vec<u8>> {
@@ -203,6 +257,21 @@ fn split_url(url: &str) -> (&str, Query) {
     (path, Query(map))
 }
 
+/// A stable map key for a public-key hash (its multibase string).
+fn pkh_key(pkh: &PublicKeyHash) -> Vec<u8> {
+    pkh.to_string().into_bytes()
+}
+
+/// Extract the `PointerUpdate` from a writer's signed CAS payload
+/// (`sign_message` = 64-byte signature || cbor). The mock trusts the signature
+/// for now (verification is a later milestone); it only needs the fields to CAS.
+fn parse_pointer_update(signed: &[u8]) -> Result<PointerUpdate> {
+    if signed.len() < 64 {
+        return Err(Error::Protocol("signed pointer payload too short".into()));
+    }
+    PointerUpdate::from_cbor(&CborObject::from_bytes(&signed[64..])?)
+}
+
 fn url_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -253,5 +322,35 @@ mod tests {
         // A missing block reads back as None.
         let absent = MockServer::cid_of(b"nope", true).unwrap();
         assert!(store.get_raw(&owner, &absent, None).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn pointer_cas_accept_and_reject() {
+        use peergos_core::keys::SigningKeyPair;
+        use peergos_core::mutable::{HttpMutablePointers, MutablePointers, PointerUpdate};
+
+        let server = MockServer::new();
+        let mp = HttpMutablePointers::new(server.poster());
+        let owner = PublicKeyHash::identity(vec![2u8; 4]).unwrap();
+        let (_p, sk) = peergos_crypto::sign::random_keypair();
+        let writer = SigningKeyPair::from_secret(sk.to_vec()).unwrap().to_private_and_hash().unwrap();
+
+        let t1 = MockServer::cid_of(b"wd1", false).unwrap();
+        let u1 = PointerUpdate::new(None, Some(t1.clone()), Some(1));
+        assert!(mp.set_pointer_update(&owner, &writer, &u1).await.unwrap(), "first write accepted");
+
+        let raw = mp.get_pointer(&owner, &writer.public_key_hash).await.unwrap().expect("pointer present");
+        assert_eq!(parse_pointer_update(&raw).unwrap().updated, Some(t1.clone()));
+
+        // A stale CAS (original still None, not the current target) is rejected.
+        let t2 = MockServer::cid_of(b"wd2", false).unwrap();
+        let stale = PointerUpdate::new(None, Some(t2.clone()), Some(2));
+        assert!(!mp.set_pointer_update(&owner, &writer, &stale).await.unwrap(), "stale CAS rejected");
+
+        // A valid CAS (original == current target) is accepted.
+        let valid = PointerUpdate::new(Some(t1), Some(t2.clone()), Some(2));
+        assert!(mp.set_pointer_update(&owner, &writer, &valid).await.unwrap(), "valid CAS accepted");
+        let raw2 = mp.get_pointer(&owner, &writer.public_key_hash).await.unwrap().unwrap();
+        assert_eq!(parse_pointer_update(&raw2).unwrap().updated, Some(t2));
     }
 }
