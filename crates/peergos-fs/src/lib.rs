@@ -72,8 +72,8 @@ use peergos_core::storage::{
 };
 use peergos_core::symmetric::SymmetricKey;
 use peergos_core::{
-    identity_key_hasher, BatWithId, Champ, ChampWrapper, ChunkMirrorCap, FallbackStorage, RamStorage,
-    MAX_CHAMP_GETS,
+    identity_key_hasher, BatWithId, BufferedNetwork, Champ, ChampWrapper, ChunkMirrorCap, FallbackStorage,
+    RamStorage, MAX_CHAMP_GETS,
 };
 use peergos_crypto::random_bytes;
 use peergos_multiformats::Cid;
@@ -3800,6 +3800,123 @@ pub async fn upload_file_auto(
         mutable,
     )
     .await
+}
+
+/// A file to place in a subtree upload.
+pub struct FileUpload {
+    pub name: String,
+    pub data: Vec<u8>,
+}
+
+/// A directory relative to the upload base and the files to place directly in it.
+/// `rel_path` is the `/`-free component list under the base (empty = the base dir).
+pub struct FolderUpload {
+    pub rel_path: Vec<String>,
+    pub files: Vec<FileUpload>,
+}
+
+/// The content hash-tree root a file's bytes would produce on upload (the same
+/// `HashTree` upload builds), for content-based dedup against a remote file's
+/// stored `tree_hash`.
+fn content_root_hash(data: &[u8]) -> Result<hashtree::RootHash> {
+    let chunk = retrieve::CHUNK_MAX_SIZE as usize;
+    let n = if data.is_empty() { 1 } else { data.len().div_ceil(chunk) };
+    let mut hashes = Vec::with_capacity(n);
+    for i in 0..n {
+        let end = ((i + 1) * chunk).min(data.len());
+        hashes.push(peergos_crypto::hash::sha256(&data[i * chunk..end]));
+    }
+    Ok(hashtree::HashTree::build(&hashes)?.root_hash)
+}
+
+/// Navigate `components` under `base`, creating any missing directories, through
+/// the given store/mutable. Returns the leaf directory's capability.
+async fn get_or_mkdirs_cap(
+    base: &AbsoluteCapability,
+    components: &[String],
+    signer: &SigningPrivateKeyAndPublicHash,
+    mirror_bat: Option<&BatId>,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<AbsoluteCapability> {
+    let mut cur = base.clone();
+    for comp in components {
+        let existing = list_directory(&cur, store.clone(), mutable)
+            .await?
+            .into_iter()
+            .find(|e| &e.name == comp);
+        cur = match existing {
+            Some(e) => e.cap,
+            None => create_directory(&cur, comp, Some(signer.clone()), mirror_bat, store.clone(), mutable).await?,
+        };
+    }
+    Ok(cur)
+}
+
+/// Efficiently upload a whole directory tree in as few server commits as possible
+/// (ports `FileWrapper.uploadSubtree`). All writes go through a [`BufferedNetwork`]
+/// over `store`/`mutable`: blocks and pointer updates are buffered and flushed in
+/// bulk once the buffer reaches ~20 MiB (and finally at the end), and the buffer is
+/// garbage-collected to the reachable set before each flush so superseded
+/// intermediate champ nodes are never sent. Within each folder, files are uploaded
+/// sorted by ascending size. `base_signer` signs writes into `base` and its plain
+/// subdirectories (they share its writer).
+pub async fn upload_subtree(
+    base: &AbsoluteCapability,
+    base_signer: SigningPrivateKeyAndPublicHash,
+    mirror_bat: Option<&BatId>,
+    folders: Vec<FolderUpload>,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: Arc<dyn MutablePointers>,
+) -> Result<()> {
+    let owner = base.owner.clone();
+    let net = BufferedNetwork::with_defaults(store, mutable);
+    let bstore: Arc<dyn ContentAddressedStorage> = net.storage();
+    let bmutable: Arc<dyn MutablePointers> = net.pointers();
+
+    for folder in folders {
+        let dir_cap =
+            get_or_mkdirs_cap(base, &folder.rel_path, &base_signer, mirror_bat, bstore.clone(), bmutable.as_ref()).await?;
+
+        // Pre-load the directory's existing children ONCE, so we can skip files
+        // whose content is unchanged without a per-file lookup (Java's fast path).
+        let existing = list_directory(&dir_cap, bstore.clone(), bmutable.as_ref()).await?;
+        let existing_hash: std::collections::HashMap<String, hashtree::RootHash> = if existing.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            let caps: Vec<_> = existing.iter().map(|e| e.cap.clone()).collect();
+            let (retrieved, _) = retrieve_all_metadata(&caps, bstore.clone(), bmutable.as_ref()).await?;
+            retrieved
+                .into_iter()
+                .filter_map(|rc| rc.properties.tree_hash.map(|h| (rc.properties.name, h.root_hash)))
+                .collect()
+        };
+
+        // Files in a plain subdirectory share the base writer's signer.
+        let mut files = folder.files;
+        files.sort_by_key(|f| f.data.len());
+        for f in files {
+            // Skip unchanged files (identical content already present).
+            if let Some(remote) = existing_hash.get(&f.name) {
+                if content_root_hash(&f.data)? == *remote {
+                    continue;
+                }
+            }
+            upload_file(
+                &dir_cap,
+                &f.name,
+                &f.data,
+                None,
+                Some(base_signer.clone()),
+                mirror_bat,
+                bstore.clone(),
+                bmutable.as_ref(),
+            )
+            .await?;
+            net.maybe_commit(&owner).await?;
+        }
+    }
+    net.commit(&owner).await
 }
 
 /// The index of the first chunk not yet present in the writer's champ (the

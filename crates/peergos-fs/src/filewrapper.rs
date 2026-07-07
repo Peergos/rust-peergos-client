@@ -502,6 +502,20 @@ impl FileWrapper {
         self.child(name).await?.ok_or_else(|| Error::Protocol("upload did not create the file".into()))
     }
 
+    /// Upload a whole directory tree under this directory in as few server commits
+    /// as possible (`uploadSubtree`) — see [`crate::upload_subtree`]. Writes are
+    /// buffered and flushed in bulk (GC'd to the reachable set first), so many small
+    /// files cost far fewer round-trips than uploading each individually. Because
+    /// the buffered cryptree cache would be bypassed, callers should re-fetch this
+    /// directory (`get_latest`) afterwards to see the new children.
+    pub async fn upload_subtree(&self, folders: Vec<crate::FolderUpload>) -> Result<()> {
+        let signer = match &self.signer {
+            Some(s) => s.clone(),
+            None => crate::recover_signer(&self.cap, self.store.clone(), self.mutable.as_ref()).await?,
+        };
+        crate::upload_subtree(&self.cap, signer, self.mirror_bat.as_ref(), folders, self.store.clone(), self.mutable.clone()).await
+    }
+
     /// Remove a child (file or directory) from this directory (`remove`).
     pub async fn remove_child(&self, name: &str) -> Result<()> {
         // Resolve the child first so we can drop its own cache entry (it is removed,
