@@ -4,6 +4,7 @@
 //! Currently implemented: the secret-link → [`AbsoluteCapability`] path. The
 //! cryptree node decryption and file-content retrieval are the next increments.
 
+pub mod admin;
 pub mod account;
 pub mod cache;
 pub mod capability;
@@ -46,6 +47,10 @@ pub use cryptree::{
     ChildrenLinks, CryptreeNode, FileProperties, NamedRelativeCapability, RelativeCapability,
 };
 pub use account::{add_totp_factor, delete_second_factor, enable_totp_factor, list_second_factors};
+pub use admin::{
+    accepting_signups, add_to_waitlist, approve_space_request, get_pending_space_requests, get_version_info,
+    AllowedSignups, LabelledSignedSpaceRequest, VersionInfo,
+};
 pub use cache::CryptreeCache;
 pub use context::{PaymentProperties, UserContext};
 pub use feed::{Content, FileRef, Resharing, SharedItem, SocialFeed, SocialPost};

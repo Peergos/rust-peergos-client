@@ -702,6 +702,37 @@ impl UserContext {
         PaymentProperties::from_cbor(&CborObject::from_bytes(&res)?)
     }
 
+    // ---- admin operations --------------------------------------------------
+
+    /// Get the server's version info (`version`).
+    pub async fn get_version_info(&self) -> Result<crate::admin::VersionInfo> {
+        crate::admin::get_version_info(self.poster.as_ref()).await
+    }
+
+    /// Check whether the server is accepting signups (`signups`).
+    pub async fn accepting_signups(&self) -> Result<crate::admin::AllowedSignups> {
+        crate::admin::accepting_signups(self.poster.as_ref()).await
+    }
+
+    /// Add an email to the server's waitlist (`waitlist`).
+    pub async fn add_to_waitlist(&self, email: &str) -> Result<bool> {
+        crate::admin::add_to_waitlist(email, self.poster.as_ref()).await
+    }
+
+    /// Get the list of pending space requests (`pending`). The signed-in user must
+    /// be an admin on the server identified by `instance` (its peer ID).
+    pub async fn get_pending_space_requests(&self, instance: &peergos_multiformats::Cid) -> Result<Vec<crate::admin::LabelledSignedSpaceRequest>> {
+        let user = self.require_user()?;
+        crate::admin::get_pending_space_requests(user, instance, self.poster.as_ref()).await
+    }
+
+    /// Approve a pending space request (`approve`). The signed-in user must be an
+    /// admin on the server identified by `instance`.
+    pub async fn approve_space_request(&self, instance: &peergos_multiformats::Cid, request: &crate::admin::LabelledSignedSpaceRequest) -> Result<bool> {
+        let user = self.require_user()?;
+        crate::admin::approve_space_request(user, instance, request, self.poster.as_ref()).await
+    }
+
     // ---- second-factor (MFA) management -----------------------------------
 
     /// The account's registered second factors (`listMfa`).
