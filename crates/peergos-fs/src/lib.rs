@@ -47,7 +47,7 @@ pub use cryptree::{
 };
 pub use account::{add_totp_factor, delete_second_factor, enable_totp_factor, list_second_factors};
 pub use cache::CryptreeCache;
-pub use context::UserContext;
+pub use context::{PaymentProperties, UserContext};
 pub use feed::{Content, FileRef, Resharing, SharedItem, SocialFeed, SocialPost};
 pub use filewrapper::FileWrapper;
 pub use profile::Profile;

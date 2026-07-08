@@ -15,7 +15,7 @@ use crate::filewrapper::FileWrapper;
 use crate::login::{login, LoggedInUser, MfaResponder};
 use crate::mfa::MultiFactorAuthResponse;
 use crate::signup::signup;
-use peergos_cbor::CborObject;
+use peergos_cbor::{CborObject, Cborable};
 use peergos_core::error::{Error, Result};
 use peergos_core::auth::{BatId, BatWithId};
 use peergos_core::keys::SecretSigningKey;
@@ -42,6 +42,82 @@ fn parse_cbor_long(res: &[u8]) -> Result<i64> {
     CborObject::from_bytes(res)?
         .as_long()
         .ok_or_else(|| Error::Protocol("expected a CBOR long response".into()))
+}
+
+/// The payload signed and sent to `requestQuota`, mirroring `QuotaControl.SpaceRequest`.
+struct SpaceRequest {
+    username: String,
+    bytes: i64,
+    annual: bool,
+    utc_millis: i64,
+    payment_proof: Option<Vec<u8>>,
+}
+
+impl Cborable for SpaceRequest {
+    fn to_cbor(&self) -> CborObject {
+        CborObject::map()
+            .put("u", CborObject::Str(self.username.clone()))
+            .put("s", CborObject::Long(self.bytes))
+            .put("a", CborObject::Boolean(self.annual))
+            .put("t", CborObject::Long(self.utc_millis))
+            .put_opt("p", self.payment_proof.as_ref().map(|p| CborObject::ByteString(p.clone())))
+            .build()
+    }
+}
+
+/// The response from `requestQuota`, mirroring `PaymentProperties`.
+#[derive(Debug, Clone)]
+pub struct PaymentProperties {
+    pub payment_server_url: Option<String>,
+    pub client_secret: Option<String>,
+    pub error: Option<String>,
+    pub free_quota: i64,
+    pub desired_quota: i64,
+    pub annual: bool,
+    pub expiry_epoch_secs: Option<i64>,
+    pub next_charge: i64,
+}
+
+impl PaymentProperties {
+    fn from_cbor(cbor: &CborObject) -> Result<Self> {
+        Ok(PaymentProperties {
+            payment_server_url: cbor.get("url").and_then(|v| v.as_string().map(|s| s.to_string())),
+            client_secret: cbor.get("client_secret").and_then(|v| v.as_string().map(|s| s.to_string())),
+            error: cbor.get("err").and_then(|v| v.as_string().map(|s| s.to_string())),
+            free_quota: cbor.get("freeQuota").and_then(|v| v.as_long()).unwrap_or(0),
+            desired_quota: cbor.get("desiredQuota").and_then(|v| v.as_long()).unwrap_or(0),
+            annual: cbor.get("annual").and_then(|v| v.as_bool()).unwrap_or(false),
+            expiry_epoch_secs: cbor.get("expiry").and_then(|v| v.as_long()),
+            next_charge: cbor.get("nextCharge").and_then(|v| v.as_long()).unwrap_or(0),
+        })
+    }
+}
+
+impl Cborable for PaymentProperties {
+    fn to_cbor(&self) -> CborObject {
+        let b = CborObject::map()
+            .put("freeQuota", CborObject::Long(self.free_quota))
+            .put("desiredQuota", CborObject::Long(self.desired_quota))
+            .put("annual", CborObject::Boolean(self.annual))
+            .put("nextCharge", CborObject::Long(self.next_charge));
+        let b = match &self.payment_server_url {
+            Some(url) => b.put("url", CborObject::Str(url.clone())),
+            None => b,
+        };
+        let b = match &self.error {
+            Some(err) => b.put("err", CborObject::Str(err.clone())),
+            None => b,
+        };
+        let b = match &self.client_secret {
+            Some(s) => b.put("client_secret", CborObject::Str(s.clone())),
+            None => b,
+        };
+        let b = match self.expiry_epoch_secs {
+            Some(e) => b.put("expiry", CborObject::Long(e)),
+            None => b,
+        };
+        b.build()
+    }
 }
 
 /// A handle to a Peergos account (full login) or a shared capability (secret link).
@@ -586,6 +662,29 @@ impl UserContext {
             url_encode(&user.identity.to_string()),
         );
         parse_cbor_long(&self.poster.get(&url).await?)
+    }
+
+    /// Request additional storage quota (`requestSpace`). The server may grant it
+    /// immediately (returning updated `PaymentProperties` with the new `free_quota`)
+    /// or redirect to a payment page (`payment_server_url`).
+    pub async fn request_quota(&self, requested_quota: i64, annual: bool) -> Result<PaymentProperties> {
+        let user = self.require_user()?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+        let req = SpaceRequest {
+            username: user.username.clone(),
+            bytes: requested_quota,
+            annual,
+            utc_millis: now,
+            payment_proof: None,
+        };
+        let signed = user.signer.secret.sign_message(&req.serialize())?;
+        let auth = to_hex(&signed);
+        let url = format!(
+            "{SPACE_USAGE_URL}request?owner={}&req={auth}",
+            url_encode(&user.identity.to_string()),
+        );
+        let res = self.poster.get(&url).await?;
+        PaymentProperties::from_cbor(&CborObject::from_bytes(&res)?)
     }
 
     // ---- second-factor (MFA) management -----------------------------------
