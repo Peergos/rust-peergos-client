@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  mock-tests:
+    name: Mock tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      # Library unit tests across the workspace, including the mock server's own
+      # unit tests. Release build keeps the crypto (scrypt/ML-KEM) fast.
+      - name: Workspace unit tests
+        run: cargo test --release --workspace --lib
+
+      # The end-to-end suite that drives the client against the in-process mock
+      # Peergos server (signup/login/upload/share/revoke/... all hermetic).
+      - name: Mock end-to-end tests
+        run: cargo test --release -p peergos-fs --test mock_e2e
