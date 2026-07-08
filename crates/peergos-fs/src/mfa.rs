@@ -2,8 +2,8 @@
 //!
 //! When the server has a second factor enabled, `login/getLogin` returns a
 //! [`MultiFactorAuthRequest`] instead of the encrypted login data. The client
-//! answers with a [`MultiFactorAuthResponse`] — for TOTP, the current 6-digit
-//! code — and retries `getLogin` with it.
+//! answers with a [`MultiFactorAuthResponse`] — either the current TOTP 6-digit
+//! code or a [`WebauthnResponse`] — and retries `getLogin` with it.
 //!
 //! TOTP here is RFC 6238 with the Google-Authenticator-compatible parameters that
 //! Peergos fixes (`TotpKey.ALGORITHM = HmacSHA1`, 6 digits, 30-second step).
@@ -85,26 +85,77 @@ impl MultiFactorAuthRequest {
     pub fn totp_method(&self) -> Option<&MultiFactorAuthMethod> {
         self.methods.iter().find(|m| m.kind == MfaType::Totp && m.enabled)
     }
+
+    /// The first enabled WebAuthn factor, if any.
+    pub fn webauthn_method(&self) -> Option<&MultiFactorAuthMethod> {
+        self.methods.iter().find(|m| m.kind == MfaType::Webauthn && m.enabled)
+    }
+}
+
+/// WebAuthn assertion / attestation data (`WebauthnResponse` in Java).
+/// Reused for both registration (`authenticator_data` = attestationObject) and
+/// login assertion (`authenticator_data` = authenticatorData, `signature` signed).
+#[derive(Debug, Clone)]
+pub struct WebauthnResponse {
+    /// For login: `authenticatorData`. For registration: `attestationObject`.
+    pub authenticator_data: Vec<u8>,
+    /// The `clientDataJSON` from the WebAuthn ceremony (UTF-8 JSON).
+    pub client_data_json: Vec<u8>,
+    /// For login: the assertion `signature`. For registration: empty/unused.
+    pub signature: Vec<u8>,
+}
+
+impl WebauthnResponse {
+    pub fn to_cbor(&self) -> CborObject {
+        CborObject::map()
+            .put("a", CborObject::ByteString(self.authenticator_data.clone()))
+            .put("c", CborObject::ByteString(self.client_data_json.clone()))
+            .put("s", CborObject::ByteString(self.signature.clone()))
+            .build()
+    }
+
+    pub fn from_cbor(cbor: &CborObject) -> Result<Self> {
+        Ok(WebauthnResponse {
+            authenticator_data: cbor.get("a").and_then(|c| c.as_bytes()).unwrap_or(&[]).to_vec(),
+            client_data_json: cbor.get("c").and_then(|c| c.as_bytes()).unwrap_or(&[]).to_vec(),
+            signature: cbor.get("s").and_then(|c| c.as_bytes()).unwrap_or(&[]).to_vec(),
+        })
+    }
+}
+
+/// The kind of second-factor response in a [`MultiFactorAuthResponse`].
+#[derive(Debug, Clone)]
+pub enum MfaResponseKind {
+    Totp(String),
+    Webauthn(WebauthnResponse),
 }
 
 /// A client's answer to a [`MultiFactorAuthRequest`] (`MultiFactorAuthResponse`).
-/// Only the TOTP variant (a numeric code) is supported here.
 #[derive(Debug, Clone)]
 pub struct MultiFactorAuthResponse {
     pub credential_id: Vec<u8>,
-    pub code: String,
+    pub response: MfaResponseKind,
 }
 
 impl MultiFactorAuthResponse {
-    pub fn totp(credential_id: Vec<u8>, code: String) -> MultiFactorAuthResponse {
-        MultiFactorAuthResponse { credential_id, code }
+    pub fn new_totp(credential_id: Vec<u8>, code: String) -> MultiFactorAuthResponse {
+        MultiFactorAuthResponse { credential_id, response: MfaResponseKind::Totp(code) }
     }
 
-    /// `{"i": credentialId, "r": code}` — the TOTP form (`response = Either.a(code)`).
+    pub fn new_webauthn(credential_id: Vec<u8>, webauthn: WebauthnResponse) -> MultiFactorAuthResponse {
+        MultiFactorAuthResponse { credential_id, response: MfaResponseKind::Webauthn(webauthn) }
+    }
+
+    /// `{"i": credentialId, "r": code | {"a": ..., "c": ..., "s": ...}}`.
+    /// TOTP uses `r = String`, WebAuthn uses `r = WebauthnResponse.toCbor()`.
     pub fn to_cbor(&self) -> CborObject {
+        let r = match &self.response {
+            MfaResponseKind::Totp(code) => CborObject::Str(code.clone()),
+            MfaResponseKind::Webauthn(w) => w.to_cbor(),
+        };
         CborObject::map()
             .put("i", CborObject::ByteString(self.credential_id.clone()))
-            .put("r", CborObject::Str(self.code.clone()))
+            .put("r", r)
             .build()
     }
 

@@ -4,10 +4,11 @@
 //! now_millis}` signed with the account's *identity* key, sent as `&auth=<hex>`.
 
 use crate::login::LoggedInUser;
-use crate::mfa::{MultiFactorAuthMethod, TotpKey};
+use crate::mfa::{MultiFactorAuthMethod, MultiFactorAuthResponse, TotpKey};
 use peergos_cbor::CborObject;
 use peergos_core::error::{Error, Result};
 use peergos_core::poster::HttpPoster;
+use peergos_core::storage::url_encode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const LOGIN_URL: &str = "peergos/v0/login/";
@@ -93,4 +94,35 @@ pub async fn delete_second_factor(
         to_hex(credential_id),
     );
     parse_bool(&poster.get(&url).await?)
+}
+
+/// `Account.registerSecurityKeyStart` (`registerWebauthnStart`): request a
+/// WebAuthn registration challenge from the server. Returns the raw 32-byte
+/// challenge, which should be passed to `navigator.credentials.create()`.
+pub async fn register_security_key_start(
+    user: &LoggedInUser,
+    poster: &dyn HttpPoster,
+) -> Result<Vec<u8>> {
+    let auth = signed_auth(user, "registerWebauthnStart")?;
+    let url = format!("{LOGIN_URL}registerWebauthnStart?username={}&auth={auth}", user.username);
+    poster.get(&url).await
+}
+
+/// `Account.registerSecurityKeyComplete` (`registerWebauthnComplete`): submit
+/// the WebAuthn credential (wrapped in a [`MultiFactorAuthResponse`]) to
+/// complete registration. `key_name` is a human-readable label for the key.
+pub async fn register_security_key_complete(
+    user: &LoggedInUser,
+    key_name: &str,
+    response: &MultiFactorAuthResponse,
+    poster: &dyn HttpPoster,
+) -> Result<bool> {
+    let auth = signed_auth(user, "registerWebauthnComplete")?;
+    let url = format!(
+        "{LOGIN_URL}registerWebauthnComplete?username={}&keyname={}&auth={auth}",
+        user.username,
+        url_encode(key_name),
+    );
+    let body = response.serialize();
+    parse_bool(&poster.post_unzip(&url, body, 0).await?)
 }

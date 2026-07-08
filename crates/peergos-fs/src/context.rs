@@ -13,7 +13,7 @@ use crate::cache::CryptreeCache;
 use crate::capability::AbsoluteCapability;
 use crate::filewrapper::FileWrapper;
 use crate::login::{login, LoggedInUser, MfaResponder};
-use crate::mfa::MultiFactorAuthResponse;
+use crate::mfa::{MultiFactorAuthResponse, MultiFactorAuthRequest, WebauthnResponse};
 use crate::signup::signup;
 use peergos_cbor::{CborObject, Cborable};
 use peergos_core::error::{Error, Result};
@@ -169,9 +169,38 @@ impl UserContext {
             let method = req
                 .totp_method()
                 .ok_or_else(|| Error::Protocol("server did not offer a TOTP factor".into()))?;
-            Ok(MultiFactorAuthResponse::totp(
+            Ok(MultiFactorAuthResponse::new_totp(
                 method.credential_id.clone(),
                 crate::mfa::current_totp(&secret),
+            ))
+        };
+        Self::sign_in(username, password, Some(&responder), poster, store, mutable).await
+    }
+
+    /// Sign in to a WebAuthn-protected account. `webauthn_responder` is called
+    /// with the server's [`MultiFactorAuthRequest`] (which carries the challenge
+    /// and the list of registered WebAuthn credentials); it should perform the
+    /// WebAuthn `navigator.credentials.get()` ceremony and return the assertion
+    /// response.
+    pub async fn sign_in_with_webauthn<F>(
+        username: &str,
+        password: &str,
+        webauthn_responder: F,
+        poster: Arc<dyn HttpPoster>,
+        store: Arc<dyn ContentAddressedStorage>,
+        mutable: Arc<dyn MutablePointers>,
+    ) -> Result<UserContext>
+    where
+        F: Fn(&MultiFactorAuthRequest) -> Result<WebauthnResponse>,
+    {
+        let responder = move |req: &MultiFactorAuthRequest| {
+            let method = req
+                .webauthn_method()
+                .ok_or_else(|| Error::Protocol("server did not offer a WebAuthn factor".into()))?;
+            let webauthn_resp = webauthn_responder(req)?;
+            Ok(MultiFactorAuthResponse::new_webauthn(
+                method.credential_id.clone(),
+                webauthn_resp,
             ))
         };
         Self::sign_in(username, password, Some(&responder), poster, store, mutable).await
@@ -761,6 +790,29 @@ impl UserContext {
     pub async fn delete_second_factor(&self, credential_id: &[u8]) -> Result<bool> {
         let user = self.require_user()?;
         crate::account::delete_second_factor(user, credential_id, self.poster.as_ref()).await
+    }
+
+    // ---- WebAuthn security key registration --------------------------------
+
+    /// Start WebAuthn security key registration (`registerWebauthnStart`):
+    /// returns the 32-byte challenge from the server. Pass it to
+    /// `navigator.credentials.create()`, then call
+    /// [`register_security_key_complete`] with the resulting credential.
+    pub async fn register_security_key_start(&self) -> Result<Vec<u8>> {
+        let user = self.require_user()?;
+        crate::account::register_security_key_start(user, self.poster.as_ref()).await
+    }
+
+    /// Complete WebAuthn security key registration (`registerWebauthnComplete`).
+    /// `key_name` is a human-readable label; `response` contains the credential
+    /// from the WebAuthn ceremony wrapped in a [`MultiFactorAuthResponse`].
+    pub async fn register_security_key_complete(
+        &self,
+        key_name: &str,
+        response: &MultiFactorAuthResponse,
+    ) -> Result<bool> {
+        let user = self.require_user()?;
+        crate::account::register_security_key_complete(user, key_name, response, self.poster.as_ref()).await
     }
 
     fn require_user(&self) -> Result<&LoggedInUser> {
