@@ -687,6 +687,21 @@ impl UserContext {
         PaymentProperties::from_cbor(&CborObject::from_bytes(&res)?)
     }
 
+    /// Fetch payment properties (`getPaymentProperties`). Returns the account's
+    /// current quota info, payment server URL (if applicable), and billing details.
+    /// Pass `new_client_secret = true` to request a fresh client secret for a
+    /// payment session.
+    pub async fn get_payment_properties(&self, new_client_secret: bool) -> Result<PaymentProperties> {
+        let user = self.require_user()?;
+        let auth = signed_now(&user.signer.secret)?;
+        let url = format!(
+            "{SPACE_USAGE_URL}payment-properties?owner={}&new-client-secret={new_client_secret}&auth={auth}",
+            url_encode(&user.identity.to_string()),
+        );
+        let res = self.poster.get(&url).await?;
+        PaymentProperties::from_cbor(&CborObject::from_bytes(&res)?)
+    }
+
     // ---- second-factor (MFA) management -----------------------------------
 
     /// The account's registered second factors (`listMfa`).
