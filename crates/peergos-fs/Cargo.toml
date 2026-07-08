@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["thumbnails"]
+thumbnails = ["image", "webp", "tempfile"]
+
 [dependencies]
 peergos-cbor.workspace = true
 peergos-multiformats.workspace = true
@@ -11,6 +15,9 @@ peergos-crypto.workspace = true
 peergos-core.workspace = true
 
 async-trait = "0.1"
+tempfile = { version = "3", optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"], optional = true }
+webp = { version = "0.3", optional = true }
 
 [dev-dependencies]
 peergos-mock-server = { path = "../peergos-mock-server" }

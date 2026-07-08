@@ -22,6 +22,7 @@ pub mod publish;
 pub mod retrieve;
 pub mod signup;
 pub mod social;
+pub mod thumbnail;
 pub mod transaction;
 
 pub use capability::{AbsoluteCapability, EncryptedCapability, Location, SecretLink, SecretLinkTarget};
@@ -1318,6 +1319,17 @@ pub async fn upload_file(
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<AbsoluteCapability> {
+    #[cfg(feature = "thumbnails")]
+    let thumbnail = match thumbnail {
+        Some(t) => Some(t),
+        None => {
+            let mime = crate::mimetype::calculate_mime_type(contents, name);
+            crate::thumbnail::generate_thumbnail(contents, &mime)
+                .map(|t| t.into_tuple())
+        }
+    };
+    #[cfg(not(feature = "thumbnails"))]
+    let thumbnail = thumbnail;
     upload_file_streaming(
         dir_cap,
         name,
@@ -1347,6 +1359,17 @@ pub async fn upload_file_hidden(
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<AbsoluteCapability> {
+    #[cfg(feature = "thumbnails")]
+    let thumbnail = match thumbnail {
+        Some(t) => Some(t),
+        None => {
+            let mime = crate::mimetype::calculate_mime_type(contents, name);
+            crate::thumbnail::generate_thumbnail(contents, &mime)
+                .map(|t| t.into_tuple())
+        }
+    };
+    #[cfg(not(feature = "thumbnails"))]
+    let thumbnail = thumbnail;
     upload_file_streaming_inner(
         dir_cap,
         name,
