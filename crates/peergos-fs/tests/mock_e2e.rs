@@ -834,6 +834,45 @@ async fn overwrite_file_grow_and_shrink() {
     assert_eq!(ctx.get_by_path("f.txt").await.unwrap().unwrap().size(), 3);
 }
 
+/// Rename a directory that has a subdirectory (Java's `UserTests.rename`).
+#[tokio::test]
+async fn rename() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = sign_up("alice", "apw", &poster, &store, &mutable).await;
+    let home = ctx.get_home().await.unwrap();
+
+    home.mkdir("subdir").await.unwrap();
+    let subdir = ctx.get_by_path("subdir").await.unwrap().unwrap();
+    subdir.mkdir("anotherDir").await.unwrap();
+
+    let home = home.get_latest().await.unwrap();
+    home.rename_child("subdir", "subdir2").await.unwrap();
+    assert!(ctx.get_by_path("subdir").await.unwrap().is_none(), "old name gone");
+    let renamed = ctx.get_by_path("subdir2").await.unwrap();
+    assert!(renamed.is_some(), "renamed dir exists");
+}
+
+/// Upload an empty file, rename it, and verify the file is accessible at the
+/// new path with correct contents (Java's `UserTests.renameFile`).
+#[tokio::test]
+async fn rename_file() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = sign_up("alice", "apw", &poster, &store, &mutable).await;
+    let home = ctx.get_home().await.unwrap();
+
+    let data: &[u8] = b"";
+    home.upload("somedata.txt", data).await.unwrap();
+    let file = ctx.get_by_path("somedata.txt").await.unwrap().unwrap();
+    assert_eq!(file.read().await.unwrap(), data);
+
+    let home = home.get_latest().await.unwrap();
+    home.rename_child("somedata.txt", "newname.txt").await.unwrap();
+    let renamed = ctx.get_by_path("newname.txt").await.unwrap().unwrap();
+    assert_eq!(renamed.read().await.unwrap(), data);
+}
+
 /// Delete a writable folder that contains a subdirectory with a secret link;
 /// the secret link is cleaned up. After deletion the parent can be re-created
 /// (Java's `UserTests.deleteWritableFolderWithSecretLinkToDescendant`).
