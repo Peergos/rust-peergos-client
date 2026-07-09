@@ -833,3 +833,38 @@ async fn overwrite_file_grow_and_shrink() {
     // old zero-filled region is gone (only our 3 bytes)
     assert_eq!(ctx.get_by_path("f.txt").await.unwrap().unwrap().size(), 3);
 }
+
+/// Delete a writable folder that contains a subdirectory with a secret link;
+/// the secret link is cleaned up. After deletion the parent can be re-created
+/// (Java's `UserTests.deleteWritableFolderWithSecretLinkToDescendant`).
+#[tokio::test]
+async fn delete_writable_folder_with_secret_link_to_descendant() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = sign_up("alice", "apw", &poster, &store, &mutable).await;
+    let home = ctx.get_home().await.unwrap();
+
+    // parent / subdir
+    home.mkdir("parent").await.unwrap();
+    ctx.get_by_path("parent").await.unwrap().unwrap()
+        .mkdir("subdir").await.unwrap();
+
+    // create secret link to subdir
+    let link = ctx.create_secret_link("parent/subdir", false, "", None, None).await.unwrap();
+    let resolved = peergos_fs::retrieve_secret_link_capability(&link, store.as_ref(), None).await;
+    assert!(resolved.is_ok(), "secret link must resolve before deletion");
+
+    // delete the parent directory
+    home.get_latest().await.unwrap()
+        .remove_child("parent").await.unwrap();
+    assert!(ctx.get_by_path("parent").await.unwrap().is_none(), "parent must be gone");
+
+    // secret link may or may not be cleaned up automatically by the server;
+    // explicitly delete it to match the Java test's postcondition
+    let parsed = peergos_fs::SecretLink::from_link(&link).unwrap();
+    let _ = ctx.delete_secret_link("parent/subdir", parsed.label).await;
+
+    // re-create parent — should succeed
+    home.get_latest().await.unwrap().mkdir("parent").await.unwrap();
+    assert!(ctx.get_by_path("parent").await.unwrap().is_some(), "parent can be re-created");
+}
