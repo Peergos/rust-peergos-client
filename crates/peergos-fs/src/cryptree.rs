@@ -522,6 +522,26 @@ impl CryptreeNode {
         CryptreeNode { is_directory, bats, from_base_key, from_parent_key, children_or_data }
     }
 
+    /// A copy of this node with new FileProperties (no data change).
+    /// Only the parent block is re-encrypted; the base block and children-or-data
+    /// are preserved byte-for-byte — matching Java's `updateProperties`.
+    pub fn update_properties(
+        &self,
+        base_key: &SymmetricKey,
+        new_props: FileProperties,
+    ) -> Result<CryptreeNode> {
+        let parent_key = self.get_parent_key(base_key);
+        let parent_link = self.parent_link(base_key)?;
+        let from_parent = CborObject::map()
+            .put_opt("p", parent_link.as_ref().map(|p| p.to_cbor()))
+            .put("s", new_props.to_cbor())
+            .build();
+        Ok(CryptreeNode {
+            from_parent_key: PaddedCipherText::build(&parent_key, &from_parent, META_DATA_PADDING_BLOCKSIZE)?,
+            ..self.clone()
+        })
+    }
+
     /// A copy of this node with new children/data (keeping the encrypted base and
     /// parent blocks) — used when adding a child to a directory.
     pub fn with_children_or_data(&self, children_or_data: CborObject) -> CryptreeNode {

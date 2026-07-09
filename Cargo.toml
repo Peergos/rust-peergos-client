@@ -6,6 +6,7 @@ members = [
     "crates/peergos-crypto",
     "crates/peergos-core",
     "crates/peergos-fs",
+    "crates/peergos-sync",
     "crates/peergos-mock-server",
 ]
 
@@ -21,3 +22,7 @@ peergos-multiformats = { path = "crates/peergos-multiformats" }
 peergos-crypto = { path = "crates/peergos-crypto" }
 peergos-core = { path = "crates/peergos-core" }
 peergos-fs = { path = "crates/peergos-fs" }
+async-trait = "0.1"
+chrono = "0.4"
+filetime = "0.2"
+pathdiff = "0.2"

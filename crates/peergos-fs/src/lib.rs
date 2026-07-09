@@ -3318,6 +3318,50 @@ async fn commit_dir_write(
     Ok(())
 }
 
+/// Update the properties of a child (file or directory) in place without touching
+/// its content. Only the parent block is re-encrypted; the base block and data are
+/// preserved. Mirrors Java's `FileWrapper.setProperties`.
+pub async fn update_file_properties(
+    dir_cap: &AbsoluteCapability,
+    child_cap: &AbsoluteCapability,
+    entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
+    new_props: FileProperties,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let mut ctx = begin_dir_write(dir_cap, entry_signer, mirror_bat, &store, mutable).await?;
+    let node = fetch_chunk_node(
+        &ctx.champ,
+        child_cap,
+        &child_cap.map_key,
+        &child_cap.bat,
+        store.as_ref(),
+    )
+    .await?
+    .ok_or_else(|| Error::Protocol("child node missing".into()))?;
+    let new_node = node.update_properties(&child_cap.r_base_key, new_props)?;
+    let cid = put_block_signed(
+        store.as_ref(),
+        &dir_cap.owner,
+        &ctx.signer,
+        new_node.to_cbor().to_bytes(),
+        &ctx.tid,
+    )
+    .await?;
+    let old_val = ctx.champ.get(&child_cap.map_key).await?;
+    ctx.champ
+        .put(
+            &ctx.signer,
+            &child_cap.map_key,
+            &old_val,
+            Some(CborObject::MerkleLink(cid.to_bytes())),
+            &ctx.tid,
+        )
+        .await?;
+    commit_dir_write(&ctx, dir_cap, &store, mutable).await
+}
+
 /// Rename a child (file or directory) within a writable directory. Updates the
 /// child's own chunk-0 properties (the authoritative name) and the parent's child
 /// link. Mirrors `FileWrapper.rename`.
@@ -3920,7 +3964,7 @@ pub struct FolderUpload {
 /// The content hash-tree root a file's bytes would produce on upload (the same
 /// `HashTree` upload builds), for content-based dedup against a remote file's
 /// stored `tree_hash`.
-fn content_root_hash(data: &[u8]) -> Result<hashtree::RootHash> {
+pub fn content_root_hash(data: &[u8]) -> Result<hashtree::RootHash> {
     let chunk = retrieve::CHUNK_MAX_SIZE as usize;
     let n = if data.is_empty() { 1 } else { data.len().div_ceil(chunk) };
     let mut hashes = Vec::with_capacity(n);
