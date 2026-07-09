@@ -84,6 +84,7 @@ use peergos_core::{
 use peergos_crypto::random_bytes;
 use peergos_multiformats::Cid;
 use retrieve::MIN_FRAGMENT_SIZE;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3973,6 +3974,136 @@ pub fn content_root_hash(data: &[u8]) -> Result<hashtree::RootHash> {
         hashes.push(peergos_crypto::hash::sha256(&data[i * chunk..end]));
     }
     Ok(hashtree::HashTree::build(&hashes)?.root_hash)
+}
+
+/// Compute the Merkle tree root hash of a file at `path` by reading it in 5 MiB
+/// chunks, SHA-256 hashing each chunk, and building the hash tree.
+/// Uses [`std::thread::available_parallelism`] threads automatically.
+pub fn hash_file_parallel(path: &std::path::Path, size: u64) -> Result<hashtree::RootHash> {
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    hash_file_with_threads(path, size, n_threads)
+}
+
+/// Like [`hash_file_parallel`] but with an explicit thread count.
+pub fn hash_file_with_threads(path: &std::path::Path, size: u64, n_threads: usize) -> Result<hashtree::RootHash> {
+    let chunk_size = retrieve::CHUNK_MAX_SIZE;
+    if size == 0 {
+        return hashtree::HashTree::build(&[peergos_crypto::hash::sha256(&[])])
+            .map(|t| t.root_hash);
+    }
+    let n_chunks = size.div_ceil(chunk_size) as usize;
+    let chunk_hashes = if n_chunks <= n_threads || n_threads <= 1 {
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| Error::Protocol(format!("open for hash: {e}")))?;
+        read_chunk_hashes_serial(&mut file, size, n_chunks, chunk_size as usize)?
+    } else {
+        read_chunk_hashes_parallel(path, size, n_chunks, n_threads, chunk_size as usize)?
+    };
+    hashtree::HashTree::build(&chunk_hashes).map(|t| t.root_hash)
+}
+
+/// Read a file and SHA-256 hash each 5 MiB chunk serially.
+fn read_chunk_hashes_serial(
+    file: &mut impl Read,
+    size: u64,
+    n_chunks: usize,
+    chunk_size: usize,
+) -> Result<Vec<Vec<u8>>> {
+    let mut hashes = Vec::with_capacity(n_chunks);
+    let mut buf = vec![0u8; chunk_size];
+    let mut remaining = size;
+    loop {
+        let to_read = chunk_size.min(remaining as usize);
+        if to_read == 0 {
+            break;
+        }
+        let mut total = 0;
+        while total < to_read {
+            let n = file.read(&mut buf[total..to_read])
+                .map_err(|e| Error::Protocol(e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        if total == 0 {
+            break;
+        }
+        hashes.push(peergos_crypto::hash::sha256(&buf[..total]));
+        remaining -= total as u64;
+        if total < to_read {
+            break;
+        }
+    }
+    debug_assert_eq!(hashes.len(), n_chunks, "wrong chunk count for size={size}");
+    Ok(hashes)
+}
+
+/// Read a file and SHA-256 hash each 5 MiB chunk in parallel across `n_threads`.
+fn read_chunk_hashes_parallel(
+    path: &std::path::Path,
+    size: u64,
+    n_chunks: usize,
+    n_threads: usize,
+    chunk_size: usize,
+) -> Result<Vec<Vec<u8>>> {
+    let chunks_per_thread = (n_chunks + n_threads - 1) / n_threads;
+    let results = std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(n_threads)));
+    std::thread::scope(|s| {
+        for i in 0..n_threads {
+            let start_chunk = i * chunks_per_thread;
+            let end_chunk = n_chunks.min((i + 1) * chunks_per_thread);
+            if start_chunk >= end_chunk {
+                continue;
+            }
+            let results = std::sync::Arc::clone(&results);
+            s.spawn(move || {
+                let start_offset = start_chunk as u64 * retrieve::CHUNK_MAX_SIZE;
+                let end_offset = size.min(end_chunk as u64 * retrieve::CHUNK_MAX_SIZE);
+                let range_len = end_offset - start_offset;
+                let result = (|| -> Result<Vec<Vec<u8>>> {
+                    let mut file = std::fs::File::open(path)
+                        .map_err(|e| Error::Protocol(format!("parallel hash open: {e}")))?;
+                    file.seek(SeekFrom::Start(start_offset))
+                        .map_err(|e| Error::Protocol(format!("parallel hash seek: {e}")))?;
+                    let mut hashes = Vec::with_capacity(end_chunk - start_chunk);
+                    let mut buf = vec![0u8; chunk_size];
+                    let mut remaining = range_len;
+                    while remaining > 0 {
+                        let to_read = chunk_size.min(remaining as usize);
+                        let mut total = 0;
+                        while total < to_read {
+                            let n = file.read(&mut buf[total..to_read])
+                                .map_err(|e| Error::Protocol(e.to_string()))?;
+                            if n == 0 {
+                                break;
+                            }
+                            total += n;
+                        }
+                        if total == 0 {
+                            break;
+                        }
+                        hashes.push(peergos_crypto::hash::sha256(&buf[..total]));
+                        remaining -= total as u64;
+                        if total < to_read {
+                            break;
+                        }
+                    }
+                    Ok(hashes)
+                })();
+                results.lock().unwrap().push((i, result));
+            });
+        }
+    });
+    let mut all = std::sync::Arc::into_inner(results).unwrap().into_inner().unwrap();
+    all.sort_by_key(|(i, _)| *i);
+    let mut chunk_hashes = Vec::with_capacity(n_chunks);
+    for (_, result) in all {
+        chunk_hashes.extend(result?);
+    }
+    Ok(chunk_hashes)
 }
 
 /// Navigate `components` under `base`, creating any missing directories, through

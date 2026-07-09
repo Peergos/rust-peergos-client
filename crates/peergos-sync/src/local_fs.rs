@@ -123,9 +123,9 @@ impl SyncFilesystem for LocalFileSystem {
         f.write_all(data).map_err(|e| Error::Protocol(e.to_string()))
     }
 
-    async fn hash_file(&self, p: &Path, _size: u64) -> Result<[u8; 32]> {
-        let data = self.read(p).await?;
-        let root = peergos_fs::content_root_hash(&data)?;
+    async fn hash_file(&self, p: &Path, size: u64) -> Result<[u8; 32]> {
+        let target = self.resolve(p);
+        let root = peergos_fs::hash_file_parallel(&target, size)?;
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&root.hash);
         Ok(hash)
