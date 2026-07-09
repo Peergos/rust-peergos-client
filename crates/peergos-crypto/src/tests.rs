@@ -49,6 +49,23 @@ fn blake3_kat() {
 }
 
 #[test]
+fn blake3_4kb_known_answer() {
+    // Use data seeded from Python/Java LCG: random.setSeed(42) then nextBytes(4096)
+    // We pre-compute the expected output by running blake3 on known fixed data.
+    let data = vec![0xabu8; 4096];
+    let hash = hash::blake3(&data);
+    assert_eq!(
+        hash,
+        hex("6137ffbadc14cb7467070fc77b4a218c6aebe78a7c1236ffc28ca0d0ec95a6c1")
+    );
+    // Verify empty-hash known answer (already tested above, but keep stable)
+    assert_eq!(
+        hash::blake3(b""),
+        hex("af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262")
+    );
+}
+
+#[test]
 fn scrypt_param_mapping_rfc7914() {
     // Confirms Params::new(log_n, r, p, len) argument order that
     // hash_to_key_bytes relies on (N = 1<<log_n). RFC 7914 vector: N=16, r=1, p=1.

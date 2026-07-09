@@ -21,9 +21,9 @@ pub const CHUNK_MAX_SIZE: u64 = 5 * 1024 * 1024;
 /// Padding block size for chunk data (`CryptreeNode.MIN_FRAGMENT_SIZE`).
 pub const MIN_FRAGMENT_SIZE: usize = 4096;
 /// Threshold below which a chunk is inlined rather than fragmented.
-const INLINE_LIMIT: usize = 4096 + 6;
+pub const INLINE_LIMIT: usize = 4096 + 6;
 /// Max bytes per fragment block (`Fragment.MAX_LENGTH`).
-const FRAGMENT_MAX_LENGTH: usize = 1024 * 1024;
+pub const FRAGMENT_MAX_LENGTH: usize = 1024 * 1024;
 
 /// `Bat.RAW_BLOCK_MAGIC_PREFIX` — marks a raw block carrying a BAT prefix.
 const RAW_BLOCK_MAGIC_PREFIX: [u8; 8] = [0x71, 0x1d, 0x10, 0xcf, 0x3d, 0x32, 0x2f, 0x2b];
@@ -237,7 +237,7 @@ fn create_raw_block_prefix(bat: &Bat, mirror_bat: Option<&BatId>) -> Result<Vec<
 }
 
 /// `Bat.removeRawBlockBatPrefix`: strip the magic prefix + embedded BAT-id cbor.
-fn remove_raw_block_bat_prefix(block: &[u8]) -> Result<Vec<u8>> {
+pub fn remove_raw_block_bat_prefix(block: &[u8]) -> Result<Vec<u8>> {
     if block.len() < RAW_BLOCK_MAGIC_PREFIX.len() || block[..8] != RAW_BLOCK_MAGIC_PREFIX {
         return Ok(block.to_vec());
     }

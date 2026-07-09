@@ -87,3 +87,18 @@ fn cid_v1_base32_decode() {
     };
     assert_eq!(Cid::decode(&b32).unwrap(), cid);
 }
+
+#[test]
+fn read_uvarint_rejects_non_minimal_encoding() {
+    // 0x81 0x00 encodes value 1 in a non-minimal way (MSB set on first byte, but second byte is 0)
+    let buf = [0x81, 0x00];
+    let mut pos = 0;
+    assert!(read_uvarint(&buf, &mut pos).is_err());
+}
+
+#[test]
+fn read_uvarint_rejects_overflow() {
+    let buf = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02];
+    let mut pos = 0;
+    assert!(read_uvarint(&buf, &mut pos).is_err());
+}

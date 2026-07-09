@@ -128,3 +128,134 @@ fn absolute_capability_cbor_roundtrip_writable_with_bat() {
     assert!(decoded.is_writable());
     assert!(decoded.bat.is_some());
 }
+
+#[test]
+fn hash_tree_1k_chunks_single_level() {
+    let hashes: Vec<Vec<u8>> = (0..1024).map(|_| [0u8; 32].to_vec()).collect();
+    let tree = HashTree::build(&hashes).unwrap();
+    assert_eq!(tree.level1.len(), 1);
+    assert_eq!(tree.level1[0].chunk_hashes.len(), 1024 * 32);
+    assert!(tree.level2.is_empty());
+    assert!(tree.level3.is_empty());
+}
+
+#[test]
+fn hash_tree_2k_chunks_two_levels() {
+    let hashes: Vec<Vec<u8>> = (0..2048).map(|_| [0u8; 32].to_vec()).collect();
+    let tree = HashTree::build(&hashes).unwrap();
+    assert_eq!(tree.level1.len(), 2);
+    assert_eq!(tree.level1[0].chunk_hashes.len(), 1024 * 32);
+    assert_eq!(tree.level2.len(), 1);
+    assert!(tree.level3.is_empty());
+}
+
+#[test]
+fn hash_tree_1m_chunks_three_level_structure() {
+    let hashes: Vec<Vec<u8>> = (0..1024 * 1024).map(|_| [0u8; 32].to_vec()).collect();
+    let tree = HashTree::build(&hashes).unwrap();
+    assert_eq!(tree.level1.len(), 1024);
+    assert_eq!(tree.level2.len(), 1);
+    assert!(tree.level3.is_empty());
+}
+
+#[test]
+fn hash_tree_rejects_empty() {
+    assert!(HashTree::build(&[]).is_err());
+}
+
+#[test]
+fn hash_tree_cbor_roundtrip() {
+    let hashes: Vec<Vec<u8>> = (0..2048).map(|i| sha256(&[i as u8; 8])).collect();
+    let tree = HashTree::build(&hashes).unwrap();
+    for i in 0..2048 {
+        let branch = tree.branch(i);
+        let decoded = HashBranch::from_cbor(&branch.to_cbor()).unwrap();
+        assert_eq!(decoded, branch);
+    }
+}
+
+use crate::retrieve::{FragmentedPaddedCipherText, CHUNK_MAX_SIZE, FRAGMENT_MAX_LENGTH, INLINE_LIMIT, remove_raw_block_bat_prefix};
+use crate::cryptree::ChildrenLinks;
+use peergos_core::auth::BatId;
+use peergos_crypto::random_bytes;
+
+#[test]
+fn fragmented_ciphertext_inlines_small_data() {
+    let key = SymmetricKey::new(vec![0u8; 32], false).unwrap();
+    // data up to ~4 KB is inlined; the exact threshold depends on CBOR overhead + padding
+    for (len, expect_inline) in [(0usize, true), (1000, true), (4000, true), (5000, false), (10000, false)] {
+        let data = vec![0u8; len];
+        let (fpct, raw) = FragmentedPaddedCipherText::build(&key, &CborObject::ByteString(data), 4096, None).unwrap();
+        if expect_inline {
+            assert!(fpct.inlined.is_some(), "len={len} should be inlined");
+            assert!(fpct.fragments.is_empty(), "len={len} should have no fragments");
+            assert!(raw.is_empty(), "len={len} should have no raw blocks");
+        } else {
+            assert!(fpct.inlined.is_none(), "len={len} should NOT be inlined");
+            assert!(!fpct.fragments.is_empty(), "len={len} should have fragments");
+        }
+    }
+}
+
+#[test]
+fn fragmented_ciphertext_fragment_count_and_alignment() {
+    let key = SymmetricKey::new(vec![0u8; 32], false).unwrap();
+    let bat = Bat::new(random_bytes(32)).unwrap();
+    let mirror_bat = BatId::sha256(&bat).unwrap();
+
+    let test_lens: Vec<usize> = vec![
+        0, 4000, 4093, 4096, 4099,
+        FRAGMENT_MAX_LENGTH - 3, FRAGMENT_MAX_LENGTH, FRAGMENT_MAX_LENGTH + 3,
+        CHUNK_MAX_SIZE as usize - 4, CHUNK_MAX_SIZE as usize,
+    ];
+
+    for len in test_lens {
+        let data = vec![0u8; len];
+        let (fpct, raw) = FragmentedPaddedCipherText::build(
+            &key, &CborObject::ByteString(data), 4096, Some(&mirror_bat),
+        ).unwrap();
+
+        // All raw blocks should be block-aligned (after stripping bat prefix)
+        for block in &raw {
+            let stripped = remove_raw_block_bat_prefix(block).unwrap();
+            assert_eq!(stripped.len() % 4096, 0, "misaligned block for len={len}");
+        }
+        assert!(raw.len() as u64 <= CHUNK_MAX_SIZE / FRAGMENT_MAX_LENGTH as u64,
+            "too many fragments for len={len}: {} (max {})", raw.len(), CHUNK_MAX_SIZE / FRAGMENT_MAX_LENGTH as u64);
+
+        if len > INLINE_LIMIT {
+            let expected_frags = (len + FRAGMENT_MAX_LENGTH - 1) / FRAGMENT_MAX_LENGTH;
+            assert_eq!(fpct.fragments.len(), expected_frags,
+                "wrong fragment count for len={len}: expected {expected_frags}, got {}", fpct.fragments.len());
+            assert_eq!(raw.len(), expected_frags,
+                "wrong raw block count for len={len}: expected {expected_frags}, got {}", raw.len());
+        } else {
+            assert!(fpct.fragments.is_empty(), "len={len} should have no fragments");
+            assert!(raw.is_empty(), "len={len} should have no raw blocks");
+        }
+    }
+}
+
+#[test]
+fn fragmented_ciphertext_directory_small_file_equality() {
+    let key = SymmetricKey::new(vec![1u8; 32], false).unwrap();
+    let bat = Bat::new(random_bytes(32)).unwrap();
+    let mirror_bat = BatId::sha256(&bat).unwrap();
+
+    // Empty file
+    let empty_file = CborObject::ByteString(Vec::new());
+    let (fpct_file, _) = FragmentedPaddedCipherText::build(
+        &key, &empty_file, 4096, Some(&mirror_bat),
+    ).unwrap();
+
+    // Empty directory
+    let empty_dir = ChildrenLinks::Named(Vec::new()).to_cbor();
+    let (fpct_dir, _) = FragmentedPaddedCipherText::build(
+        &key, &empty_dir, 4096, Some(&mirror_bat),
+    ).unwrap();
+
+    // Same cbor length
+    assert_eq!(fpct_file.to_cbor().to_bytes().len(), fpct_dir.to_cbor().to_bytes().len());
+    // Same inline content length
+    assert_eq!(fpct_file.inlined.as_ref().map(|b| b.len()), fpct_dir.inlined.as_ref().map(|b| b.len()));
+}
