@@ -81,6 +81,8 @@ use peergos_core::{
     identity_key_hasher, BatWithId, BufferedNetwork, Champ, ChampWrapper, ChunkMirrorCap, FallbackStorage,
     RamStorage, MAX_CHAMP_GETS,
 };
+use std::future::Future;
+use std::pin::Pin;
 use peergos_crypto::random_bytes;
 use peergos_multiformats::Cid;
 use retrieve::MIN_FRAGMENT_SIZE;
@@ -4341,8 +4343,112 @@ async fn commit_small_batch(
     finish_dir_write_multi(ctx, dir_cap, store, mutable, links).await
 }
 
+/// How many probes per round in the 8-ary search for the first absent chunk.
+const PROBE_COUNT: u64 = 8;
+
+/// Derive map-key/BAT pairs for each probe index, walking forward cumulatively
+/// from `prev_key`/`prev_bat` at index `prev_index`. Equivalent to Java's
+/// `deriveProbesForIndices`.
+async fn derive_probes_for_indices(
+    stream_secret: &[u8],
+    prev_key: &[u8],
+    prev_bat: &Option<Bat>,
+    prev_index: u64,
+    probe_indices: &[u64],
+    pos: usize,
+    probes: &mut [(Vec<u8>, Option<Bat>)],
+) -> Result<()> {
+    if pos >= probes.len() {
+        return Ok(());
+    }
+    let steps = probe_indices[pos] - prev_index;
+    let (next_key, next_bat) = advance_map_key(stream_secret, prev_key, prev_bat, steps)?;
+    probes[pos] = (next_key.clone(), next_bat.clone());
+    Box::pin(derive_probes_for_indices(
+        stream_secret,
+        &next_key,
+        &next_bat,
+        probe_indices[pos],
+        probe_indices,
+        pos + 1,
+        probes,
+    ))
+    .await
+}
+
+/// 8-ary search for the first absent chunk index.  Invariant: the answer is in
+/// `[lo, hi)`, chunk[hi] is absent.
+///
+/// `lookup` receives an owned batch of (map_key, bat) pairs and returns a
+/// boolean for each indicating whether the chunk is present.
+///
+/// Each round issues at most `PROBE_COUNT` (8) probes, narrowing the range by
+/// ~8×, so the total number of CHAMP round-trips is O(log₈ N) rather than O(N).
+pub async fn binary_search_absent_chunk(
+    stream_secret: &[u8],
+    lo: u64,
+    hi: u64,
+    lo_map_key: &[u8],
+    lo_bat: &Option<Bat>,
+    lookup: &dyn Fn(Vec<(Vec<u8>, Option<Bat>)>) -> Pin<Box<dyn Future<Output = Result<Vec<bool>>>>>,
+) -> Result<u64> {
+    if lo >= hi {
+        return Ok(lo);
+    }
+
+    let range_size = hi - lo;
+    let batch_size = std::cmp::min(range_size, PROBE_COUNT) as usize;
+
+    // probe_indices[0] = lo, probe_indices[batchSize-1] < hi
+    let probe_indices: Vec<u64> = (0..batch_size)
+        .map(|i| lo + (i as u64) * range_size / (batch_size as u64))
+        .collect();
+
+    // Derive map-key/BAT for each probe (cumulatively from lo)
+    let mut probes = vec![(lo_map_key.to_vec(), lo_bat.clone()); batch_size];
+    derive_probes_for_indices(stream_secret, lo_map_key, lo_bat, lo, &probe_indices, 1, &mut probes).await?;
+
+    let present_flags = lookup(probes.clone()).await?;
+
+    for i in 0..batch_size {
+        if !present_flags[i] {
+            if i == 0 {
+                return Ok(lo);
+            }
+            // probe[i-1] present, probe[i] absent → answer in (probe[i-1], probe[i]]
+            return Box::pin(binary_search_absent_chunk(
+                stream_secret,
+                probe_indices[i - 1],
+                probe_indices[i],
+                &probes[i - 1].0,
+                &probes[i - 1].1,
+                lookup,
+            ))
+            .await;
+        }
+    }
+
+    // All probes present → advance lo to last probe
+    let new_lo = probe_indices[batch_size - 1];
+    if new_lo + 1 >= hi {
+        return Ok(hi);
+    }
+    Box::pin(binary_search_absent_chunk(
+        stream_secret,
+        new_lo,
+        hi,
+        &probes[batch_size - 1].0,
+        &probes[batch_size - 1].1,
+        lookup,
+    ))
+    .await
+}
+
 /// The index of the first chunk not yet present in the writer's champ (the
 /// uploaded chunks form a contiguous prefix). `chunk_count` if all are present.
+///
+/// Uses 8-ary search (`binary_search_absent_chunk`) for O(log₈ N) CHAMP
+/// round-trips instead of O(N).
 async fn find_first_absent_chunk(
     txn: &FileUploadTransaction,
     store: &Arc<dyn ContentAddressedStorage>,
@@ -4355,19 +4461,30 @@ async fn find_first_absent_chunk(
     };
     let wd = store.get(&txn.owner, &wd_cid, None).await?.ok_or_else(|| Error::Protocol("writer data missing".into()))?;
     let tree_root = Cid::cast(wd.get("tree").and_then(|c| c.as_link()).ok_or_else(|| Error::Protocol("no champ tree".into()))?)?;
-    let champ = ChampWrapper::create(txn.owner.clone(), tree_root, None, store.clone(), identity_key_hasher()).await?;
-    let mut map_key = txn.first_map_key.clone();
-    let mut bat = txn.first_bat.clone();
+    let champ = std::sync::Arc::new(ChampWrapper::create(txn.owner.clone(), tree_root, None, store.clone(), identity_key_hasher()).await?);
     let n = txn.chunk_count();
-    for i in 0..n {
-        if champ.get(&map_key).await?.is_none() {
-            return Ok(i);
-        }
-        let (nmk, nbat) = retrieve::calculate_next_map_key(&txn.stream_secret, &map_key, &bat)?;
-        map_key = nmk;
-        bat = nbat;
+    if n == 0 {
+        return Ok(0);
     }
-    Ok(n)
+    let lookup = |probes: Vec<(Vec<u8>, Option<Bat>)>| {
+        let champ = champ.clone();
+        Box::pin(async move {
+            let mut results = Vec::with_capacity(probes.len());
+            for (key, _bat) in &probes {
+                results.push(champ.get(key).await.map(|v| v.is_some())?);
+            }
+            Ok(results)
+        }) as Pin<Box<dyn Future<Output = Result<Vec<bool>>>>>
+    };
+    binary_search_absent_chunk(
+        &txn.stream_secret,
+        0,
+        n,
+        &txn.first_map_key,
+        &txn.first_bat,
+        &lookup,
+    )
+    .await
 }
 
 /// Resume an interrupted upload from its transaction record: upload the missing

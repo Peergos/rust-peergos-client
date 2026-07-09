@@ -3,8 +3,10 @@ use crate::hashtree::{HashBranch, HashTree};
 use peergos_cbor::{CborObject, Cborable};
 use peergos_core::keys::PublicKeyHash;
 use peergos_core::symmetric::SymmetricKey;
+use peergos_core::error::Result as PeergosResult;
 use peergos_core::{hash_to_cid, Bat};
 use peergos_crypto::hash::sha256;
+use std::future::Future;
 
 #[test]
 fn mimetype_detection() {
@@ -258,4 +260,211 @@ fn fragmented_ciphertext_directory_small_file_equality() {
     assert_eq!(fpct_file.to_cbor().to_bytes().len(), fpct_dir.to_cbor().to_bytes().len());
     // Same inline content length
     assert_eq!(fpct_file.inlined.as_ref().map(|b| b.len()), fpct_dir.inlined.as_ref().map(|b| b.len()));
+}
+
+// ---------------------------------------------------------------------------
+// FileChunkBinarySearchTests
+// ---------------------------------------------------------------------------
+
+use crate::retrieve::calculate_next_map_key;
+
+
+/// Pre-compute the (map_key, bat) pairs for chunks 0..n using the same
+/// cumulative chain as `FileProperties.calculateAllMapKeys`.
+fn compute_all_probes(
+    stream_secret: &[u8],
+    first_key: &[u8],
+    first_bat: &Option<Bat>,
+    n: usize,
+) -> Vec<(Vec<u8>, Option<Bat>)> {
+    let mut probes = Vec::with_capacity(n);
+    if n == 0 {
+        return probes;
+    }
+    probes.push((first_key.to_vec(), first_bat.clone()));
+    for i in 1..n {
+        let prev = &probes[i - 1];
+        probes.push(calculate_next_map_key(stream_secret, &prev.0, &prev.1).unwrap());
+    }
+    probes
+}
+
+/// Synthetic lookup: probes whose map key is in the first `k` pre-computed
+/// keys are present; rest are absent. Increments `call_count` on each call.
+fn build_lookup(
+    present_keys: Vec<Vec<u8>>,
+    call_count: &std::cell::Cell<u32>,
+) -> impl Fn(Vec<(Vec<u8>, Option<Bat>)>) -> std::result::Result<Vec<bool>, std::convert::Infallible> + '_ {
+    move |probes: Vec<(Vec<u8>, Option<Bat>)>| {
+        call_count.set(call_count.get() + 1);
+        Ok(probes.iter().map(|(key, _)| present_keys.contains(key)).collect())
+    }
+}
+
+fn random_32() -> Vec<u8> {
+    peergos_crypto::random_bytes(32)
+}
+
+/// Run a single search: compute probes, binary search, verify result and call count.
+async fn run_search(n: usize, k: usize) {
+    use crate::binary_search_absent_chunk;
+    use std::pin::Pin;
+
+    let stream_secret = random_32();
+    let first_key = random_32();
+    let first_bat = Some(Bat::new(random_32()).unwrap());
+
+    // pre-compute all probes; first k are "present", rest "absent"
+    let all_probes = compute_all_probes(&stream_secret, &first_key, &first_bat, n.max(1));
+    let present_keys: Vec<Vec<u8>> = all_probes.into_iter().take(k).map(|(key, _)| key).collect();
+
+    let call_count = std::cell::Cell::new(0u32);
+    let lookup = build_lookup(present_keys, &call_count);
+
+    let n64 = n as u64;
+    let k64 = k as u64;
+    let result = binary_search_absent_chunk(
+        &stream_secret,
+        0,
+        n64,
+        &first_key,
+        &first_bat,
+        &|probes: Vec<(Vec<u8>, Option<Bat>)>| {
+            let res = lookup(probes);
+            Box::pin(async move { res.map_err(|e| peergos_core::error::Error::Protocol(format!("{e}"))) })
+                as Pin<Box<dyn Future<Output = PeergosResult<Vec<bool>>>>>
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result, k64, "N={n} k={k}: wrong first absent chunk");
+
+    // Verify O(log₈ N) round-trips
+    let max_expected_calls = (n.max(1) as f64).log(8.0).ceil() as u32 + 2;
+    let actual_calls = call_count.get();
+    assert!(
+        actual_calls <= max_expected_calls,
+        "N={n} k={k}: too many CHAMP calls: {actual_calls} (expected ≤ {max_expected_calls})"
+    );
+}
+
+#[tokio::test]
+async fn zero_chunks() {
+    use std::pin::Pin;
+
+    let stream_secret = random_32();
+    let first_key = random_32();
+    let call_count = std::cell::Cell::new(0u32);
+    let lookup = build_lookup(Vec::new(), &call_count);
+
+    let result = crate::binary_search_absent_chunk(
+        &stream_secret,
+        0,
+        0,
+        &first_key,
+        &None,
+        &|probes: Vec<(Vec<u8>, Option<Bat>)>| {
+            let res = lookup(probes);
+            Box::pin(async move { res.map_err(|e| peergos_core::error::Error::Protocol(format!("{e}"))) })
+                as Pin<Box<dyn Future<Output = PeergosResult<Vec<bool>>>>>
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result, 0);
+    assert_eq!(call_count.get(), 0, "no lookups needed");
+}
+
+#[tokio::test]
+async fn single_chunk_absent() {
+    run_search(1, 0).await;
+}
+
+#[tokio::test]
+async fn single_chunk_present() {
+    run_search(1, 1).await;
+}
+
+#[tokio::test]
+async fn small_file_all_present() {
+    for n in 1..=10 {
+        run_search(n, n).await;
+    }
+}
+
+#[tokio::test]
+async fn small_file_various_k() {
+    let n = 8;
+    for k in 0..=n {
+        run_search(n, k).await;
+    }
+}
+
+#[tokio::test]
+async fn large_file_first_chunk_absent() {
+    run_search(10_000, 0).await;
+}
+
+#[tokio::test]
+async fn large_file_last_chunk_absent() {
+    run_search(10_000, 9_999).await;
+}
+
+#[tokio::test]
+async fn large_file_all_present() {
+    run_search(10_000, 10_000).await;
+}
+
+#[tokio::test]
+async fn large_file_half_present() {
+    run_search(10_000, 5_000).await;
+}
+
+#[tokio::test]
+async fn logarithmic_round_trips() {
+    // Verify the number of CHAMP round-trips grows as O(log₈ N) not O(N).
+    use crate::binary_search_absent_chunk;
+    use std::pin::Pin;
+
+    let ns = [8usize, 64, 512, 4096, 32768];
+    let mut previous_calls = 0u32;
+
+    for n in ns {
+        let stream_secret = random_32();
+        let first_key = random_32();
+        let first_bat = Some(Bat::new(random_32()).unwrap());
+
+        let k = n / 2;
+        let all_probes = compute_all_probes(&stream_secret, &first_key, &first_bat, n);
+        let present_keys: Vec<Vec<u8>> = all_probes.into_iter().take(k).map(|(key, _)| key).collect();
+
+        let call_count = std::cell::Cell::new(0u32);
+        let lookup = build_lookup(present_keys, &call_count);
+
+        let _ = binary_search_absent_chunk(
+            &stream_secret,
+            0,
+            n as u64,
+            &first_key,
+            &first_bat,
+            &|probes: Vec<(Vec<u8>, Option<Bat>)>| {
+                let res = lookup(probes);
+                Box::pin(async move { res.map_err(|e| peergos_core::error::Error::Protocol(format!("{e}"))) })
+                    as Pin<Box<dyn Future<Output = PeergosResult<Vec<bool>>>>>
+            },
+        )
+        .await
+        .unwrap();
+
+        if previous_calls > 0 {
+            assert!(
+                call_count.get() <= previous_calls + 2,
+                "N={n}: calls={} grew too fast from {previous_calls}",
+                call_count.get()
+            );
+        }
+        previous_calls = call_count.get();
+    }
 }
