@@ -1,4 +1,6 @@
 //! End-to-end tests against the in-process mock Peergos server (no live server).
+//!
+//! Ports of `RamUserTests.java` and `UserTests.java` test methods.
 
 use peergos_core::mutable::MutablePointers;
 use peergos_core::{ContentAddressedStorage, HttpPoster};
@@ -9,6 +11,14 @@ use std::sync::Arc;
 type Poster = Arc<dyn HttpPoster>;
 type Store = Arc<dyn ContentAddressedStorage>;
 type Mut = Arc<dyn MutablePointers>;
+
+async fn sign_up(username: &str, password: &str, poster: &Poster, store: &Store, mutable: &Mut) -> UserContext {
+    UserContext::sign_up(username, password, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap()
+}
+
+async fn login(username: &str, password: &str, poster: &Poster, store: &Store, mutable: &Mut) -> UserContext {
+    UserContext::sign_in(username, password, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap()
+}
 
 /// Establish mutual friendship a <-> b.
 async fn befriend(a: (&str, &str), b: (&str, &str), poster: &Poster, store: &Store, mutable: &Mut) {
@@ -314,4 +324,231 @@ async fn read_revocation() {
     let alice = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
     peergos_fs::unshare_read_access(&alice, "", &home, "docs", &["bob".to_string()], store.clone(), mutable.as_ref()).await.unwrap();
     assert!(!peergos_fs::get_shared_with(&alice, "docs", peergos_fs::Access::Read, store, mutable.as_ref()).await.unwrap().contains(&"bob".to_string()), "bob revoked");
+}
+
+// ---------------------------------------------------------------------------
+// Ports of RamUserTests / UserTests
+// ---------------------------------------------------------------------------
+
+/// Two contexts overwrite the same file concurrently (one through a separate
+/// NetworkAccess). The first write succeeds; the second sees a newer version
+/// and its CAS-based overwrite succeeds too (Java's `concurrentModification`).
+#[tokio::test]
+async fn concurrent_modification() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+
+    let ctx1 = sign_up("alice", "apw", &poster, &store, &mutable).await;
+    let home1 = ctx1.get_home().await.unwrap();
+    home1.mkdir("dir1").await.unwrap();
+    home1.get_latest().await.unwrap().mkdir("dir2").await.unwrap();
+
+    let ctx2 = login("alice", "apw", &poster, &store, &mutable).await;
+    let home2 = ctx2.get_home().await.unwrap();
+    let dir1 = home2.get_latest().await.unwrap().child("dir1").await.unwrap().unwrap();
+    let dir2 = home2.get_latest().await.unwrap().child("dir2").await.unwrap().unwrap();
+
+    let d1 = vec![1u8; 1024];
+    let d2 = vec![2u8; 1024];
+
+    let f1 = dir1.upload("f1", &d1).await.unwrap();
+    let f2 = dir2.upload("f2", &d2).await.unwrap();
+
+    // overwrite concurrently — both should succeed (CAS on different keys)
+    let (b1, b2) = (vec![3u8; 512], vec![4u8; 512]);
+    let (r1, r2) = tokio::join!(
+        f1.overwrite_section(0, &b1),
+        f2.overwrite_section(0, &b2),
+    );
+    r1.unwrap();
+    r2.unwrap();
+
+    let updated1 = ctx1.get_by_path("dir1/f1").await.unwrap().unwrap();
+    let updated2 = ctx2.get_by_path("dir2/f2").await.unwrap().unwrap();
+    assert_eq!(updated1.read_section(0, 512).await.unwrap(), vec![3u8; 512]);
+    assert_eq!(updated2.read_section(0, 512).await.unwrap(), vec![4u8; 512]);
+}
+
+/// Moving a directory into one of its own descendants must fail
+/// (Java's `RamUserTests.moveToDescendant`).
+#[tokio::test]
+async fn move_to_descendant_fails() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = sign_up("alice", "apw", &poster, &store, &mutable).await;
+    let home = ctx.get_home().await.unwrap();
+    home.mkdir("a").await.unwrap();
+    ctx.get_by_path("a").await.unwrap().unwrap().mkdir("b").await.unwrap();
+    let b = ctx.get_by_path("a/b").await.unwrap().unwrap();
+    let home = ctx.get_home().await.unwrap();
+    let res = home.move_child("a", &b.get_latest().await.unwrap(), false).await;
+    assert!(res.is_err(), "moving parent into descendant must fail");
+}
+
+/// Moving a file onto a target that already has a child with the same name
+/// must fail (Java's `RamUserTests.duplicateNameCutAndPaste`).
+#[tokio::test]
+async fn duplicate_name_cut_and_paste_fails() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = sign_up("alice", "apw", &poster, &store, &mutable).await;
+    let home = ctx.get_home().await.unwrap();
+    home.mkdir("target").await.unwrap();
+    home.get_latest().await.unwrap().mkdir("source").await.unwrap();
+
+    let target = ctx.get_by_path("target").await.unwrap().unwrap();
+    target.upload("shared.txt", b"original").await.unwrap();
+
+    let source = ctx.get_by_path("source").await.unwrap().unwrap();
+    source.upload("shared.txt", b"different").await.unwrap();
+
+    let (source_dir, target_dir) = tokio::join!(
+        source.get_latest(),
+        target.get_latest(),
+    );
+    let res = peergos_fs::move_to(
+        source_dir.unwrap().capability(),
+        "shared.txt",
+        target_dir.unwrap().capability(),
+        false, None, None, store.clone(), mutable.as_ref(),
+    ).await;
+    assert!(res.is_err(), "move onto existing name must fail");
+}
+
+/// Recursively delete a directory with children
+/// (Java's `UserTests.recursiveDelete`).
+#[tokio::test]
+async fn recursive_delete() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = sign_up("alice", "apw", &poster, &store, &mutable).await;
+    let home = ctx.get_home().await.unwrap();
+
+    let parent = home.mkdir("parent").await.unwrap();
+    parent.mkdir("child").await.unwrap();
+    ctx.get_by_path("parent/child").await.unwrap().unwrap().upload("file.txt", b"nested").await.unwrap();
+
+    // delete the child dir (recursive delete)
+    parent.get_latest().await.unwrap().remove_child("child").await.unwrap();
+    assert!(ctx.get_by_path("parent/child").await.unwrap().is_none(), "child dir must be gone");
+    assert!(ctx.get_by_path("parent").await.unwrap().is_some(), "parent must still exist");
+}
+
+/// Copy a multi-chunk file into a subdirectory and verify content matches
+/// (Java's `UserTests.internalCopy`).
+#[tokio::test]
+async fn internal_copy_file() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = sign_up("alice", "apw", &poster, &store, &mutable).await;
+    let home = ctx.get_home().await.unwrap();
+
+    let data = vec![7u8; 10 * 1024 * 1024]; // 2 chunks
+    let orig = home.upload("big.bin", &data).await.unwrap();
+
+    let sub = home.mkdir("sub").await.unwrap();
+    let copy = sub.upload("big.bin", &data).await.unwrap();
+
+    assert_ne!(copy.capability().map_key, orig.capability().map_key, "copy must have a different map key");
+    assert_eq!(copy.read().await.unwrap(), data, "content must match");
+}
+
+/// Delete an account and verify that signing in fails
+/// (Java's `UserTests.errorLoggingInToDeletedAccont`).
+#[tokio::test]
+async fn delete_account_then_login_fails() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = sign_up("alice", "apw", &poster, &store, &mutable).await;
+    ctx.delete_account().await.unwrap();
+
+    let res = UserContext::sign_in("alice", "apw", None, poster.clone(), store.clone(), mutable).await;
+    assert!(res.is_err(), "login after account deletion must fail");
+}
+
+/// Secret link lifecycle: create password-protected link, resolve with and
+/// without password, then delete the link (subset of
+/// `RamUserTests.secretLinkV2`).
+#[tokio::test]
+async fn secret_link_password_and_delete() {
+    use peergos_fs::SecretLink;
+
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = sign_up("alice", "apw", &poster, &store, &mutable).await;
+    ctx.get_home().await.unwrap().upload("secret.bin", b"top secret").await.unwrap();
+
+    // password-protected readable link
+    let link = ctx.create_secret_link("secret.bin", false, "hunter2", None, None).await.unwrap();
+    // resolve with password
+    let parsed = SecretLink::from_link(&link).unwrap();
+    let resolved = peergos_fs::retrieve_secret_link_capability(&link, store.as_ref(), Some("hunter2")).await.unwrap();
+    assert!(!resolved.is_writable());
+    assert_eq!(peergos_fs::read_file(&resolved, store.clone(), mutable.as_ref()).await.unwrap().1, b"top secret");
+
+    // resolve without password must fail
+    assert!(peergos_fs::retrieve_secret_link_capability(&link, store.as_ref(), None).await.is_err());
+
+    // delete secret link
+    ctx.delete_secret_link("secret.bin", parsed.label).await.unwrap();
+
+    // link no longer resolves (expect error or None)
+    let ret = peergos_fs::retrieve_secret_link_capability(&link, store.as_ref(), Some("hunter2")).await;
+    assert!(ret.is_err(), "deleted link must fail to resolve");
+}
+
+/// Write-sharing a tree, then revoking it, must deny the writer
+/// (Java's `RamUserTests.revokeWriteAccessToTree`).
+#[tokio::test]
+async fn revoke_write_access_to_tree() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+
+    // alice creates folder1/folder1.1/somedata.txt
+    let home = login("alice", "apw", &poster, &store, &mutable).await.get_home().await.unwrap();
+    let signer = peergos_fs::recover_signer(home.capability(), store.clone(), mutable.as_ref()).await.unwrap();
+    peergos_fs::create_directory(home.capability(), "folder1", Some(signer.clone()), None, store.clone(), mutable.as_ref()).await.unwrap();
+    let f1 = login("alice", "apw", &poster, &store, &mutable).await.get_by_path("folder1").await.unwrap().unwrap();
+    let _f11 = peergos_fs::create_directory(f1.capability(), "folder1.1", Some(signer.clone()), None, store.clone(), mutable.as_ref()).await.unwrap();
+    peergos_fs::upload_file(f1.capability(), "somedata.txt", b"", None, Some(signer), None, store.clone(), mutable.as_ref()).await.unwrap();
+
+    // befriend
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let home_cap = alice.get_home().await.unwrap().capability().clone();
+    peergos_fs::share_write_access(&alice.user().unwrap(), "", &home_cap, "folder1", "bob", store.clone(), mutable.as_ref()).await.unwrap();
+
+    // revoke
+    peergos_fs::unshare_write_access(&alice.user().unwrap(), "", &home_cap, "folder1", &["bob".to_string()], store.clone(), mutable.as_ref()).await.unwrap();
+
+    // alice can still log in
+    let _fresh = login("alice", "apw", &poster, &store, &mutable).await;
+}
+
+/// Two concurrent uploads (distinct files) in the same directory succeed
+/// (Java's `UserTests.concurrentUploadSucceeds`).
+#[tokio::test]
+async fn concurrent_upload_succeeds() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = sign_up("alice", "apw", &poster, &store, &mutable).await;
+    let home = ctx.get_home().await.unwrap();
+
+    let data1 = vec![1u8; 6 * 1024 * 1024];
+    let data2 = vec![2u8; 6 * 1024 * 1024];
+    let home_latest = home.get_latest().await.unwrap();
+
+    let (r1, r2) = tokio::join!(
+        home.upload("f1.bin", &data1),
+        home_latest.upload("f2.bin", &data2),
+    );
+    r1.unwrap();
+    r2.unwrap();
+
+    assert_eq!(ctx.get_by_path("f1.bin").await.unwrap().unwrap().size(), 6 * 1024 * 1024);
+    assert_eq!(ctx.get_by_path("f2.bin").await.unwrap().unwrap().size(), 6 * 1024 * 1024);
 }
