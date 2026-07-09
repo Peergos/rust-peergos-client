@@ -4,10 +4,12 @@ use crate::error::Result;
 use crate::keys::*;
 use crate::mutable::*;
 use crate::poster::HttpPoster;
+use crate::ram::RamStorage;
 use crate::storage::*;
 use async_trait::async_trait;
 use peergos_cbor::{CborObject, Cborable};
 use peergos_multiformats::{Cid, Codec, CID_V1};
+use rand::{Rng, SeedableRng};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -594,4 +596,247 @@ async fn transactions() {
     assert_eq!(tid, TransactionId("txn-7".into()));
     assert!(store.close_transaction(&owner(), &tid).await.unwrap());
     assert!(mock.last_url().contains("transaction/close?arg=txn-7"));
+}
+
+// ---- ported ChampTests ------------------------------------------------------
+
+fn test_signer() -> SigningPrivateKeyAndPublicHash {
+    let (pk, sk) = peergos_crypto::sign::keypair_from_seed(&[9u8; 32]).unwrap();
+    let owner = PublicSigningKey::new(pk.to_vec()).hash().unwrap();
+    SigningPrivateKeyAndPublicHash::new(owner, SecretSigningKey::new(sk.to_vec()))
+}
+
+fn random_hash(rng: &mut impl rand::Rng) -> Vec<u8> {
+    (0..32).map(|_| rng.gen()).collect()
+}
+
+/// Build a random champ tree with `n_keys` keys of `prefix_len + suffix_len` bytes.
+async fn random_tree(
+    signer: &SigningPrivateKeyAndPublicHash,
+    rng: &mut impl rand::Rng,
+    prefix_len: usize,
+    suffix_len: usize,
+    n_keys: usize,
+    mirror_bat: Option<BatId>,
+    store: Arc<dyn ContentAddressedStorage>,
+    tid: &TransactionId,
+) -> (ChampWrapper, Cid) {
+    let prefix: Vec<u8> = (0..prefix_len).map(|_| rng.gen()).collect();
+    let empty = Champ::empty().with_bat(mirror_bat);
+    let root_hash = put_block_signed(store.as_ref(), &signer.public_key_hash, signer, empty.serialize(), tid)
+        .await
+        .unwrap();
+    let mut cw = ChampWrapper::create(
+        signer.public_key_hash.clone(),
+        root_hash.clone(),
+        None,
+        store.clone(),
+        identity_key_hasher(),
+    )
+    .await
+    .unwrap();
+    for _ in 0..n_keys {
+        let mut key = prefix.clone();
+        key.extend((0..suffix_len).map(|_| rng.gen::<u8>()));
+        let value = random_hash(rng);
+        let val = CborObject::ByteString(value);
+        cw.put(signer, &key, &None, Some(val), tid).await.unwrap();
+    }
+    let hash = cw.root_hash().clone();
+    (cw, hash)
+}
+
+#[tokio::test]
+async fn champ_canonical_delete() {
+    let store: Arc<dyn ContentAddressedStorage> = Arc::new(RamStorage::new());
+    let signer = test_signer();
+    let tid = store.start_transaction(&signer.public_key_hash).await.unwrap();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(28);
+
+    for prefix_len in 0..3 {
+        for _ in 0..20 {
+            let n_keys = rng.gen_range(0..10);
+            let (mut cw, root_hash) = random_tree(
+                &signer, &mut rng, prefix_len, 5, n_keys, None, store.clone(), &tid,
+            )
+            .await;
+
+            let key: Vec<u8> = (0..prefix_len + 5).map(|_| rng.gen()).collect();
+            let value = random_hash(&mut rng);
+            cw.put(&signer, &key, &None, Some(CborObject::ByteString(value)), &tid).await.unwrap();
+
+            let expected = cw.get(&key).await.unwrap();
+            cw.remove(&signer, &key, &expected, &tid).await.unwrap();
+
+            assert_eq!(
+                cw.root_hash(), &root_hash,
+                "Non canonical delete! prefix_len={prefix_len}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn champ_mirror_on_root() {
+    let store: Arc<dyn ContentAddressedStorage> = Arc::new(RamStorage::new());
+    let signer = test_signer();
+    let tid = store.start_transaction(&signer.public_key_hash).await.unwrap();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(28);
+
+    let bat = Bat::new(peergos_crypto::random_bytes(32)).unwrap();
+    let mirror_bat = Some(bat.calculate_id().unwrap());
+
+    for prefix_len in 0..3 {
+        for _ in 0..20 {
+            let n_keys = rng.gen_range(0..10);
+            let (mut cw, root_hash) = random_tree(
+                &signer, &mut rng, prefix_len, 5, n_keys, mirror_bat.clone(), store.clone(), &tid,
+            )
+            .await;
+
+            let key: Vec<u8> = (0..prefix_len + 5).map(|_| rng.gen()).collect();
+            let value = random_hash(&mut rng);
+            cw.put(&signer, &key, &None, Some(CborObject::ByteString(value)), &tid).await.unwrap();
+
+            let expected = cw.get(&key).await.unwrap();
+            cw.remove(&signer, &key, &expected, &tid).await.unwrap();
+
+            assert_eq!(
+                cw.root_hash(), &root_hash,
+                "Non canonical delete with mirror bat! prefix_len={prefix_len}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn champ_insert_and_retrieve() {
+    let store: Arc<dyn ContentAddressedStorage> = Arc::new(RamStorage::new());
+    let signer = test_signer();
+    let tid = store.start_transaction(&signer.public_key_hash).await.unwrap();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(28);
+
+    // Build initial tree with 1000 random keys
+    let empty = Champ::empty();
+    let root_hash = put_block_signed(
+        store.as_ref(),
+        &signer.public_key_hash,
+        &signer,
+        empty.serialize(),
+        &tid,
+    )
+    .await
+    .unwrap();
+    let mut cw = ChampWrapper::create(
+        signer.public_key_hash.clone(),
+        root_hash,
+        None,
+        store.clone(),
+        identity_key_hasher(),
+    )
+    .await
+    .unwrap();
+
+    let n_keys = 200;
+    let mut state: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = std::collections::BTreeMap::new();
+
+    for _ in 0..n_keys {
+        let key = random_hash(&mut rng);
+        let value = random_hash(&mut rng);
+        let val = CborObject::ByteString(value.clone());
+        cw.put(&signer, &key, &None, Some(val.clone()), &tid).await.unwrap();
+        assert_eq!(cw.get(&key).await.unwrap(), Some(val), "incorrect result after put");
+        state.insert(key, value);
+    }
+
+    // Check every mapping
+    for (key, val) in &state {
+        let expected = Some(CborObject::ByteString(val.clone()));
+        assert_eq!(cw.get(key).await.unwrap(), expected, "incorrect state");
+    }
+
+    // Check total size
+    assert_eq!(cw.size().await.unwrap(), n_keys as u64, "incorrect number of mappings");
+
+    // Change the value for every key
+    let keys: Vec<Vec<u8>> = state.keys().cloned().collect();
+    for key in &keys {
+        let new_value = random_hash(&mut rng);
+        let current = cw.get(key).await.unwrap();
+        let new_val = CborObject::ByteString(new_value.clone());
+        cw.put(&signer, key, &current, Some(new_val.clone()), &tid).await.unwrap();
+        assert_eq!(cw.get(key).await.unwrap(), Some(new_val), "incorrect result after update");
+        state.insert(key.clone(), new_value);
+    }
+
+    // Remove each key and verify it's gone
+    let keys: Vec<Vec<u8>> = state.keys().cloned().collect();
+    for key in &keys {
+        let val = state.get(key).unwrap();
+        let current = cw.get(key).await.unwrap();
+        let expected_val = Some(CborObject::ByteString(val.clone()));
+        assert_eq!(current, expected_val, "current value mismatch before remove");
+        cw.remove(&signer, key, &current, &tid).await.unwrap();
+        assert_eq!(cw.get(key).await.unwrap(), None, "key still present after remove");
+    }
+    assert_eq!(cw.size().await.unwrap(), 0, "tree should be empty after removing all keys");
+}
+
+#[tokio::test]
+async fn champ_correct_delete() {
+    let store: Arc<dyn ContentAddressedStorage> = Arc::new(RamStorage::new());
+    let signer = test_signer();
+    let tid = store.start_transaction(&signer.public_key_hash).await.unwrap();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(28);
+
+    let empty = Champ::empty();
+    let root_hash = put_block_signed(
+        store.as_ref(),
+        &signer.public_key_hash,
+        &signer,
+        empty.serialize(),
+        &tid,
+    )
+    .await
+    .unwrap();
+    let mut cw = ChampWrapper::create(
+        signer.public_key_hash.clone(),
+        root_hash,
+        None,
+        store.clone(),
+        identity_key_hasher(),
+    )
+    .await
+    .unwrap();
+
+    // Insert 3 keys with controlled prefixes (matching Java test)
+    let mut state: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = std::collections::BTreeMap::new();
+    for i in 0..3 {
+        let key = vec![0u8, i, 0u8];
+        let value = random_hash(&mut rng);
+        let val = CborObject::ByteString(value.clone());
+        cw.put(&signer, &key, &None, Some(val), &tid).await.unwrap();
+        state.insert(key, value);
+    }
+
+    // Verify all 3 mappings
+    for (key, val) in &state {
+        let expected = Some(CborObject::ByteString(val.clone()));
+        assert_eq!(cw.get(key).await.unwrap(), expected, "incorrect state");
+    }
+    assert_eq!(cw.size().await.unwrap(), 3, "incorrect number of mappings");
+
+    // Delete the middle key
+    let delete_key = vec![0u8, 1, 0u8];
+    state.remove(&delete_key);
+    let current = cw.get(&delete_key).await.unwrap();
+    cw.remove(&signer, &delete_key, &current, &tid).await.unwrap();
+    assert_eq!(cw.get(&delete_key).await.unwrap(), None, "key still present after delete");
+    assert_eq!(cw.size().await.unwrap(), 2, "incorrect number of mappings after delete");
+
+    // Verify remaining keys
+    for (key, val) in &state {
+        let expected = Some(CborObject::ByteString(val.clone()));
+        assert_eq!(cw.get(key).await.unwrap(), expected, "remaining key mismatch");
+    }
 }

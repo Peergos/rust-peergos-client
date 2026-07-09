@@ -497,7 +497,7 @@ impl Champ {
         if depth >= HASH_CODE_LENGTH {
             return Err(Error::Protocol("Hash collision!".into()));
         }
-        let empty = Champ::empty();
+        let empty = Champ::empty().with_bat(self.mirror_bat.clone());
         let empty_hash = put_block_signed(storage, owner, writer, empty.serialize(), tid).await?;
         let (mut cur, mut cur_hash) = empty
             .put(owner, writer, key1, hash1, depth, &None, val1, bit_width, max_collisions,
@@ -513,6 +513,32 @@ impl Champ {
             cur_hash = h;
         }
         Ok((cur, cur_hash))
+    }
+
+    /// Total number of key/value mappings across the whole tree.
+    #[async_recursion]
+    pub async fn size(
+        &self,
+        owner: &PublicKeyHash,
+        storage: &dyn ContentAddressedStorage,
+    ) -> Result<u64> {
+        let mut count = self.key_count() as u64;
+        for payload in &self.contents {
+            if let Payload::Link(cid) = payload {
+                let cbor = storage
+                    .get(owner, cid, None)
+                    .await?
+                    .ok_or_else(|| Error::Protocol(format!("champ child missing: {cid}")))?;
+                count += Champ::from_cbor(&cbor)?.size(owner, storage).await?;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Set the mirror bat on this node (champ-level auth for mirroring).
+    pub fn with_bat(mut self, bat: Option<BatId>) -> Champ {
+        self.mirror_bat = bat;
+        self
     }
 
     fn with_contents(&self, data_map: Vec<u8>, node_map: Vec<u8>, contents: Vec<Payload>) -> Champ {
@@ -712,6 +738,11 @@ impl ChampWrapper {
         self.root = new_root;
         self.root_hash = new_root_hash.clone();
         Ok(new_root_hash)
+    }
+
+    /// Total number of key/value mappings in the entire champ tree.
+    pub async fn size(&self) -> Result<u64> {
+        self.root.size(&self.owner, self.storage.as_ref()).await
     }
 
     /// Remove `raw_key` (CAS on `expected`), updating this wrapper's root in place
