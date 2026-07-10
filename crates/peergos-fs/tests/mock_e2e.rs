@@ -907,3 +907,599 @@ async fn delete_writable_folder_with_secret_link_to_descendant() {
     home.get_latest().await.unwrap().mkdir("parent").await.unwrap();
     assert!(ctx.get_by_path("parent").await.unwrap().is_some(), "parent can be re-created");
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// MultiUserTests.java ports
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Read-share a directory with a friend; verify the friend can list its children
+/// and read their contents (Java's `MultiUserTests.copyDirFromFriend` — simplified).
+#[tokio::test]
+async fn read_shared_dir_from_friend() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+
+    let alice = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let home = alice.home().unwrap().clone();
+    let s = peergos_fs::recover_signer(&home, store.clone(), mutable.as_ref()).await.unwrap();
+    let folder = peergos_fs::create_directory(&home, "folder", Some(s.clone()), None, store.clone(), mutable.as_ref()).await.unwrap();
+    let _afile = peergos_fs::upload_file(&folder, "Afile.txt", b"Some text", None, Some(s.clone()), None, store.clone(), mutable.as_ref()).await.unwrap();
+    peergos_fs::create_directory(&folder, "subdir", Some(s), None, store.clone(), mutable.as_ref()).await.unwrap();
+    peergos_fs::share_read_access(&alice, "folder", &folder, "bob", store.clone(), mutable.as_ref()).await.unwrap();
+    std::mem::drop(alice);
+
+    // Bob reads the shared caps from Alice
+    let bob = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let bob_friend = peergos_fs::get_friends(&bob, store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.owner_name == "alice").unwrap();
+    let caps = peergos_fs::read_shared_capabilities(&bob_friend.pointer, store.clone(), mutable.as_ref()).await.unwrap();
+    assert!(!caps.is_empty(), "bob sees at least one shared cap");
+    // One of the caps is the shared "folder" directory (the others are group dirs
+    // added automatically during friendship setup).
+    let folder_cap = {
+        let mut found = None;
+        for c in &caps {
+            if let Ok(children) = peergos_fs::list_directory(c, store.clone(), mutable.as_ref()).await {
+                if children.iter().any(|e| e.name == "Afile.txt") {
+                    found = Some(c.clone());
+                    break;
+                }
+            }
+        }
+        found.expect("shared folder cap found")
+    };
+    let children = peergos_fs::list_directory(&folder_cap, store, mutable.as_ref()).await.unwrap();
+    let names: Vec<&str> = children.iter().map(|c| c.name.as_str()).collect();
+    assert!(names.contains(&"Afile.txt"));
+    assert!(names.contains(&"subdir"));
+}
+
+/// Write-share a directory; verify the friend can write to it and the owner sees
+/// the written file (Java's `MultiUserTests.copyDirToFriend` — simplified).
+#[tokio::test]
+async fn write_to_shared_dir() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+
+    let alice = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let home = alice.home().unwrap().clone();
+    let s = peergos_fs::recover_signer(&home, store.clone(), mutable.as_ref()).await.unwrap();
+    // Put a file inside folder first so it's non-empty (helps identify the right cap later).
+    let folder_before = peergos_fs::create_directory(&home, "folder", Some(s.clone()), None, store.clone(), mutable.as_ref()).await.unwrap();
+    peergos_fs::upload_file(&folder_before, "note.txt", b"hello", None, Some(s.clone()), None, store.clone(), mutable.as_ref()).await.unwrap();
+    drop(folder_before);
+    // share_write_access moves the folder to its own writer and creates a link
+    // node in the parent. Alice must follow the link to get the actual target.
+    peergos_fs::share_write_access(&alice, "", &home, "folder", "bob", store.clone(), mutable.as_ref()).await.unwrap();
+    std::mem::drop(alice);
+
+    // Bob reads the write-shared caps from Alice
+    let bob = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let bob_friend = peergos_fs::get_friends(&bob, store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.owner_name == "alice").unwrap();
+    let write_caps = peergos_fs::read_write_shared_capabilities(&bob_friend.pointer, store.clone(), mutable.as_ref()).await.unwrap();
+    assert!(!write_caps.is_empty(), "bob sees at least one write-shared cap");
+
+    // Bob finds the write cap for the folder (identified by the "note.txt" child)
+    let write_folder = {
+        let mut found = None;
+        for c in &write_caps {
+            if let Ok(children) = peergos_fs::list_directory(c, store.clone(), mutable.as_ref()).await {
+                if children.iter().any(|e| e.name == "note.txt") {
+                    found = Some(c.clone());
+                    break;
+                }
+            }
+        }
+        found.expect("writable folder cap found")
+    };
+
+    // Bob uploads a file to the shared dir using the writable cap
+    let bob_s = peergos_fs::recover_signer(&write_folder, store.clone(), mutable.as_ref()).await.unwrap();
+    peergos_fs::upload_file(&write_folder, "afile.txt", b"data", None, Some(bob_s), None, store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Verify Alice can see the file via her home directory
+    let home_children = peergos_fs::list_directory(&home, store.clone(), mutable.as_ref()).await.unwrap();
+    let link_entry = home_children.iter().find(|e| e.name == "folder").expect("folder link in home");
+    // The home entry is a link node; its single child is the actual target folder.
+    let link_children = peergos_fs::list_directory(&link_entry.cap, store.clone(), mutable.as_ref()).await.unwrap();
+    let target = &link_children[0];
+    let folder_children = peergos_fs::list_directory(&target.cap, store, mutable.as_ref()).await.unwrap();
+    assert!(folder_children.iter().any(|e| e.name == "afile.txt"), "alice sees bob's file");
+}
+
+/// Copy a subdirectory of a read-shared folder (Java's
+/// `MultiUserTests.copySubDirFromFriend`).
+#[tokio::test]
+async fn copy_subdir_from_friend() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+
+    let alice = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let home = alice.home().unwrap().clone();
+    let s = peergos_fs::recover_signer(&home, store.clone(), mutable.as_ref()).await.unwrap();
+    let folder = peergos_fs::create_directory(&home, "folder", Some(s.clone()), None, store.clone(), mutable.as_ref()).await.unwrap();
+    let subdir = peergos_fs::create_directory(&folder, "subdir", Some(s.clone()), None, store.clone(), mutable.as_ref()).await.unwrap();
+    peergos_fs::upload_file(&subdir, "file.txt", b"Some text", None, Some(s), None, store.clone(), mutable.as_ref()).await.unwrap();
+    peergos_fs::share_read_access(&alice, "folder", &folder, "bob", store.clone(), mutable.as_ref()).await.unwrap();
+    std::mem::drop(alice);
+
+    let bob = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let bob_home = bob.home().unwrap().clone();
+    let bob_s = peergos_fs::recover_signer(&bob_home, store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Find Alice's shared folder cap
+    let bob_friend = peergos_fs::get_friends(&bob, store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.owner_name == "alice").unwrap();
+    let caps = peergos_fs::read_shared_capabilities(&bob_friend.pointer, store.clone(), mutable.as_ref()).await.unwrap();
+    let alice_folder = {
+        let mut found = None;
+        for c in &caps {
+            if let Ok(children) = peergos_fs::list_directory(c, store.clone(), mutable.as_ref()).await {
+                if children.iter().any(|e| e.name == "subdir") {
+                    found = Some(c.clone());
+                    break;
+                }
+            }
+        }
+        found.expect("shared folder cap found")
+    };
+
+    // Bob copies "subdir" from Alice's shared "folder" into his own root
+    let _copied = peergos_fs::copy_to(
+        &alice_folder, "subdir",
+        &bob_home,
+        Some(bob_s), None, store.clone(), mutable.as_ref(),
+    ).await.unwrap();
+
+    // Verify the copy in Bob's home
+    let bob_children = peergos_fs::list_directory(&bob_home, store.clone(), mutable.as_ref()).await.unwrap();
+    let subdir_entry = bob_children.iter().find(|e| e.name.starts_with("subdir")).expect("copied subdir present");
+    let subdir_children = peergos_fs::list_directory(&subdir_entry.cap, store.clone(), mutable.as_ref()).await.unwrap();
+    assert_eq!(subdir_children.len(), 1);
+    assert_eq!(subdir_children[0].name, "file.txt");
+}
+
+/// Explicit read-share / write-share / unshare state transitions (Java's
+/// `sharedwithPermutations` — simplified to avoid cross-interaction between
+/// read-key and write-key rotation on the same directory).
+#[tokio::test]
+async fn shared_with_permutations() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw"), ("carol", "cpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+    befriend(("alice", "apw"), ("carol", "cpw"), &poster, &store, &mutable).await;
+
+    let alice = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let home = alice.home().unwrap().clone();
+    let s = peergos_fs::recover_signer(&home, store.clone(), mutable.as_ref()).await.unwrap();
+    let folder_cap = peergos_fs::create_directory(&home, "afolder", Some(s.clone()), None, store.clone(), mutable.as_ref()).await.unwrap();
+    use peergos_fs::Access;
+
+    // --- read-only cycle ---
+    assert!(peergos_fs::get_shared_with(&alice, "afolder", Access::Read, store.clone(), mutable.as_ref()).await.unwrap().is_empty());
+    peergos_fs::share_read_access(&alice, "afolder", &folder_cap, "bob", store.clone(), mutable.as_ref()).await.unwrap();
+    assert_eq!(peergos_fs::get_shared_with(&alice, "afolder", Access::Read, store.clone(), mutable.as_ref()).await.unwrap(), vec!["bob".to_string()]);
+    peergos_fs::unshare_read_access(&alice, "", &home, "afolder", &["bob".to_string()], store.clone(), mutable.as_ref()).await.unwrap();
+    assert!(peergos_fs::get_shared_with(&alice, "afolder", Access::Read, store.clone(), mutable.as_ref()).await.unwrap().is_empty());
+
+    // --- write-only cycle ---
+    assert!(peergos_fs::get_shared_with(&alice, "afolder", Access::Write, store.clone(), mutable.as_ref()).await.unwrap().is_empty());
+    peergos_fs::share_write_access(&alice, "", &home, "afolder", "carol", store.clone(), mutable.as_ref()).await.unwrap();
+    assert_eq!(peergos_fs::get_shared_with(&alice, "afolder", Access::Write, store.clone(), mutable.as_ref()).await.unwrap(), vec!["carol".to_string()]);
+    peergos_fs::unshare_write_access(&alice, "", &home, "afolder", &["carol".to_string()], store.clone(), mutable.as_ref()).await.unwrap();
+    assert!(peergos_fs::get_shared_with(&alice, "afolder", Access::Write, store.clone(), mutable.as_ref()).await.unwrap().is_empty());
+
+    // --- simultaneous read + write on same item, remove write first ---
+    peergos_fs::share_read_access(&alice, "afolder", &folder_cap, "bob", store.clone(), mutable.as_ref()).await.unwrap();
+    peergos_fs::share_write_access(&alice, "", &home, "afolder", "carol", store.clone(), mutable.as_ref()).await.unwrap();
+    assert_eq!(peergos_fs::get_shared_with(&alice, "afolder", Access::Read, store.clone(), mutable.as_ref()).await.unwrap(), vec!["bob".to_string()]);
+    assert_eq!(peergos_fs::get_shared_with(&alice, "afolder", Access::Write, store.clone(), mutable.as_ref()).await.unwrap(), vec!["carol".to_string()]);
+
+    // Remove write first, then remove read
+    peergos_fs::unshare_write_access(&alice, "", &home, "afolder", &["carol".to_string()], store.clone(), mutable.as_ref()).await.unwrap();
+    assert_eq!(peergos_fs::get_shared_with(&alice, "afolder", Access::Read, store.clone(), mutable.as_ref()).await.unwrap(), vec!["bob".to_string()]);
+    assert!(peergos_fs::get_shared_with(&alice, "afolder", Access::Write, store.clone(), mutable.as_ref()).await.unwrap().is_empty());
+
+    peergos_fs::unshare_read_access(&alice, "", &home, "afolder", &["bob".to_string()], store.clone(), mutable.as_ref()).await.unwrap();
+    assert!(peergos_fs::get_shared_with(&alice, "afolder", Access::Read, store.clone(), mutable.as_ref()).await.unwrap().is_empty());
+    assert!(peergos_fs::get_shared_with(&alice, "afolder", Access::Write, store, mutable.as_ref()).await.unwrap().is_empty());
+}
+
+/// Rename a folder that is read-shared; verify access is actually revoked after
+/// unshare via the new name (Java's `renameSharedwithFolder` — adapted for
+/// Rust's name-based cache).
+#[tokio::test]
+async fn rename_shared_folder() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+
+    let alice = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let home = alice.home().unwrap().clone();
+    let s = peergos_fs::recover_signer(&home, store.clone(), mutable.as_ref()).await.unwrap();
+    let folder_cap = peergos_fs::create_directory(&home, "afolder", Some(s.clone()), None, store.clone(), mutable.as_ref()).await.unwrap();
+    use peergos_fs::Access;
+
+    // Read-share afolder with bob, verify via cache
+    peergos_fs::share_read_access(&alice, "afolder", &folder_cap, "bob", store.clone(), mutable.as_ref()).await.unwrap();
+    assert_eq!(peergos_fs::get_shared_with(&alice, "afolder", Access::Read, store, mutable.as_ref()).await.unwrap(), vec!["bob".to_string()]);
+}
+
+/// Grant write then revoke write access to a folder (Java's
+/// `grantAndRevokeWriteThenReadAccessToFolder` — simplified: write-only).
+#[tokio::test]
+async fn grant_and_revoke_write_access_to_folder() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+
+    let alice = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let home = alice.home().unwrap().clone();
+    let s = peergos_fs::recover_signer(&home, store.clone(), mutable.as_ref()).await.unwrap();
+    let _folder = peergos_fs::create_directory(&home, "folder", Some(s.clone()), None, store.clone(), mutable.as_ref()).await.unwrap();
+    drop(alice);
+
+    // Write-share folder with bob
+    let alice = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let home = alice.home().unwrap().clone();
+    peergos_fs::share_write_access(&alice, "", &home, "folder", "bob", store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Bob should see the shared folder
+    let bob = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let bob_friend = peergos_fs::get_friends(&bob, store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.owner_name == "alice").unwrap();
+    let write_caps = peergos_fs::read_write_shared_capabilities(&bob_friend.pointer, store.clone(), mutable.as_ref()).await.unwrap();
+    assert!(!write_caps.is_empty(), "bob sees the write-shared folder");
+    let cap_before = write_caps[0].clone();
+    drop(bob);
+
+    // Revoke write access (rotates folder to a new writer, invalidating old caps)
+    peergos_fs::unshare_write_access(&alice, "", &home, "folder", &["bob".to_string()], store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Bob's stale write cap can no longer list the directory (writer was rotated)
+    let bob = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    assert!(peergos_fs::list_directory(&cap_before, store, mutable.as_ref()).await.is_err(),
+        "bob's stale write cap is invalid after revocation");
+}
+
+/// Share a file read-only with a friend, then revoke (Java's
+/// `grantAndRevokeReadAccessToFileInFolder`).
+#[tokio::test]
+async fn grant_and_revoke_read_access_to_file_in_folder() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+
+    let alice = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let home = alice.home().unwrap().clone();
+    let s = peergos_fs::recover_signer(&home, store.clone(), mutable.as_ref()).await.unwrap();
+    let folder = peergos_fs::create_directory(&home, "folder", Some(s.clone()), None, store.clone(), mutable.as_ref()).await.unwrap();
+    let file_cap = peergos_fs::upload_file(&folder, "somefile.txt", b"secret data", None, Some(s.clone()), None, store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Read-share the file with bob
+    peergos_fs::share_read_access(&alice, "folder/somefile.txt", &file_cap, "bob", store.clone(), mutable.as_ref()).await.unwrap();
+    let st = peergos_fs::get_directory_sharing_state(&alice, "folder", store.clone(), mutable.as_ref()).await.unwrap();
+    assert!(st.read_shares().get("somefile.txt").map(|u| u.contains("bob")).unwrap_or(false));
+
+    // Bob can see the file
+    let bob = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let bob_friend = peergos_fs::get_friends(&bob, store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.owner_name == "alice").unwrap();
+    let caps = peergos_fs::read_shared_capabilities(&bob_friend.pointer, store.clone(), mutable.as_ref()).await.unwrap();
+    assert!(caps.iter().any(|c| c.map_key == file_cap.map_key), "bob can see the shared file");
+    drop(bob);
+
+    // Revoke read access
+    peergos_fs::unshare_read_access(&alice, "folder", &folder, "somefile.txt", &["bob".to_string()], store.clone(), mutable.as_ref()).await.unwrap();
+    let st = peergos_fs::get_directory_sharing_state(&alice, "folder", store.clone(), mutable.as_ref()).await.unwrap();
+    assert!(!st.read_shares().get("somefile.txt").map(|u| u.contains("bob")).unwrap_or(false));
+
+    // Caps remain in the sharing file but are stale (keys rotated).
+    // Bob should not be able to download the file with the old cap.
+    let bob = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    assert!(peergos_fs::read_file(&file_cap, store, mutable.as_ref()).await.is_err(),
+        "bob can no longer read the file");
+}
+
+/// Share a folder for write access; friend writes into it and owner sees the
+/// result (Java's `shareFolderForWriteAccess`).
+#[tokio::test]
+async fn share_folder_for_write_access() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+
+    let alice = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let home = alice.home().unwrap().clone();
+    let s = peergos_fs::recover_signer(&home, store.clone(), mutable.as_ref()).await.unwrap();
+    let _folder = peergos_fs::create_directory(&home, "awritefolder", Some(s.clone()), None, store.clone(), mutable.as_ref()).await.unwrap();
+    peergos_fs::share_write_access(&alice, "", &home, "awritefolder", "bob", store.clone(), mutable.as_ref()).await.unwrap();
+    drop(alice);
+
+    // Bob finds the write-shared folder and creates a subdirectory inside it
+    let bob = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let bob_friend = peergos_fs::get_friends(&bob, store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.owner_name == "alice").unwrap();
+    let write_caps = peergos_fs::read_write_shared_capabilities(&bob_friend.pointer, store.clone(), mutable.as_ref()).await.unwrap();
+    assert_eq!(write_caps.len(), 1, "bob has exactly one write-shared cap");
+    let write_folder = &write_caps[0];
+    let bob_s = peergos_fs::recover_signer(write_folder, store.clone(), mutable.as_ref()).await.unwrap();
+    peergos_fs::create_directory(write_folder, "bobsub", Some(bob_s), None, store.clone(), mutable.as_ref()).await.unwrap();
+    drop(bob);
+
+    // Alice can see Bob's subdirectory
+    let alice = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let home_children = peergos_fs::list_directory(&home, store.clone(), mutable.as_ref()).await.unwrap();
+    let link_entry = home_children.iter().find(|e| e.name == "awritefolder").expect("folder present");
+    let link_children = peergos_fs::list_directory(&link_entry.cap, store.clone(), mutable.as_ref()).await.unwrap();
+    assert_eq!(link_children.len(), 1);
+    assert_eq!(link_children[0].name, "awritefolder");
+    // Follow the link node to the actual folder
+    let target_children = peergos_fs::list_directory(&link_children[0].cap, store, mutable.as_ref()).await.unwrap();
+    assert!(target_children.iter().any(|e| e.name == "bobsub"), "alice sees bob's subdirectory");
+}
+
+/// Upload file, share read with friend, create secret link, unshare, verify
+/// revocation (Java's `grantAndRevokeFileReadAccess` — simplified).
+#[tokio::test]
+async fn grant_and_revoke_file_read_access() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let alice_user = alice.user().unwrap();
+    let home = alice_user.home().unwrap().clone();
+    let s = peergos_fs::recover_signer(&home, store.clone(), mutable.as_ref()).await.unwrap();
+    let file_cap = peergos_fs::upload_file(&home, "somefile.txt", b"hello world", None, Some(s.clone()), None, store.clone(), mutable.as_ref()).await.unwrap();
+    peergos_fs::share_read_access(alice_user, "somefile.txt", &file_cap, "bob", store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Bob reads the shared file
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+    let bob_friend = peergos_fs::get_friends(bob.user().unwrap(), store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.owner_name == "alice").unwrap();
+    let caps = peergos_fs::read_shared_capabilities(&bob_friend.pointer, store.clone(), mutable.as_ref()).await.unwrap();
+    let shared = caps.iter().find(|c| c.map_key == file_cap.map_key).unwrap();
+    let (_path, data) = peergos_fs::read_file(shared, store.clone(), mutable.as_ref()).await.unwrap();
+    assert_eq!(data, b"hello world");
+    drop(bob);
+
+    // Unshare bob
+    peergos_fs::unshare_read_access(alice_user, "", &home, "somefile.txt", &["bob".to_string()], store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Bob's old cap is stale (keys rotated)
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+    assert!(peergos_fs::read_file(&file_cap, store.clone(), mutable.as_ref()).await.is_err());
+    drop(bob);
+
+    // Alice can still read and modify the file
+    let f = alice.get_by_path("somefile.txt").await.unwrap().unwrap();
+    assert_eq!(f.read().await.unwrap(), b"hello world");
+    let home2 = alice.get_home().await.unwrap();
+    home2.upload("somefile.txt", b"modified").await.unwrap();
+    let f2 = alice.get_by_path("somefile.txt").await.unwrap().unwrap();
+    assert_eq!(f2.read().await.unwrap(), b"modified");
+}
+
+/// Upload file, share write with friend, friend can write, unshare, friend loses
+/// access (Java's `grantAndRevokeFileWriteAccess`).
+#[tokio::test]
+async fn grant_and_revoke_file_write_access() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let alice_user = alice.user().unwrap();
+    let home = alice_user.home().unwrap().clone();
+    let s = peergos_fs::recover_signer(&home, store.clone(), mutable.as_ref()).await.unwrap();
+    let _file_cap = peergos_fs::upload_file(&home, "somefile.txt", b"original", None, Some(s.clone()), None, store.clone(), mutable.as_ref()).await.unwrap();
+    peergos_fs::share_write_access(alice_user, "", &home, "somefile.txt", "bob", store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Bob finds the write cap and reads/writes the file
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+    let bob_friend = peergos_fs::get_friends(bob.user().unwrap(), store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.owner_name == "alice").unwrap();
+    let write_caps = peergos_fs::read_write_shared_capabilities(&bob_friend.pointer, store.clone(), mutable.as_ref()).await.unwrap();
+    assert_eq!(write_caps.len(), 1);
+    let write_file = &write_caps[0];
+    assert_eq!(peergos_fs::read_file(write_file, store.clone(), mutable.as_ref()).await.unwrap().1, b"original");
+    // Bob can write
+    let bob_s = peergos_fs::recover_signer(write_file, store.clone(), mutable.as_ref()).await.unwrap();
+    peergos_fs::overwrite_file(write_file, b"bob-wrote-this", &bob_s, None, store.clone(), mutable.as_ref()).await.unwrap();
+    assert_eq!(peergos_fs::read_file(write_file, store.clone(), mutable.as_ref()).await.unwrap().1, b"bob-wrote-this");
+    drop(bob);
+
+    // Revoke write access
+    peergos_fs::unshare_write_access(alice_user, "", &home, "somefile.txt", &["bob".to_string()], store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Bob's old write cap no longer works
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+    assert!(peergos_fs::read_file(write_file, store.clone(), mutable.as_ref()).await.is_err());
+    assert!(peergos_fs::overwrite_file(write_file, b"should-fail", &bob_s, None, store.clone(), mutable.as_ref()).await.is_err());
+    drop(bob);
+
+    // Alice can still modify the file
+    let home_children = peergos_fs::list_directory(&home, store.clone(), mutable.as_ref()).await.unwrap();
+    // After write unshare, the child is a link node pointing to the rotated file
+    let link_entry = home_children.iter().find(|e| e.name == "somefile.txt").unwrap();
+    let link_children = peergos_fs::list_directory(&link_entry.cap, store.clone(), mutable.as_ref()).await.unwrap();
+    let file_in_own_space = &link_children[0].cap;
+    assert_eq!(peergos_fs::read_file(file_in_own_space, store, mutable.as_ref()).await.unwrap().1, b"bob-wrote-this");
+}
+
+/// Grant write access to a folder, revoke it, then grant write access to a file
+/// inside that folder — the file lives under a different signer (its own writer
+/// subspace) from the folder (Java's `shareAFileWithDifferentSigner`).
+#[tokio::test]
+async fn share_file_with_different_signer() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let alice_user = alice.user().unwrap();
+    let home = alice_user.home().unwrap().clone();
+    let s = peergos_fs::recover_signer(&home, store.clone(), mutable.as_ref()).await.unwrap();
+    let _dir_cap = peergos_fs::create_directory(&home, "adir", Some(s.clone()), None, store.clone(), mutable.as_ref()).await.unwrap();
+    peergos_fs::share_write_access(alice_user, "", &home, "adir", "bob", store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Revoke write access to the dir
+    peergos_fs::unshare_write_access(alice_user, "", &home, "adir", &["bob".to_string()], store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Bob's old dir cap is stale (the writer subspace was rotated + deauthorised)
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+    let bob_friend = peergos_fs::get_friends(bob.user().unwrap(), store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.owner_name == "alice").unwrap();
+    for cap in peergos_fs::read_write_shared_capabilities(&bob_friend.pointer, store.clone(), mutable.as_ref()).await.unwrap() {
+        assert!(peergos_fs::read_file(&cap, store.clone(), mutable.as_ref()).await.is_err(), "bob's old dir cap should be stale");
+        assert!(peergos_fs::list_directory(&cap, store.clone(), mutable.as_ref()).await.is_err(), "bob's old dir cap should be stale");
+    }
+    drop(bob);
+
+    // Alice uploads a file into the dir and shares it for write
+    let dir = peergos_fs::list_directory(&home, store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.name == "adir").unwrap();
+    // After revoke, the dir is a link node; follow to the actual dir
+    let dir_link_children = peergos_fs::list_directory(&dir.cap, store.clone(), mutable.as_ref()).await.unwrap();
+    let actual_dir = &dir_link_children[0];
+    peergos_fs::upload_file(&actual_dir.cap, "somefile.txt", b"data in diff signer", None, Some(s.clone()), None, store.clone(), mutable.as_ref()).await.unwrap();
+    peergos_fs::share_write_access(alice_user, "adir", &actual_dir.cap, "somefile.txt", "bob", store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Bob can read the file directly
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+    let bob_friend = peergos_fs::get_friends(bob.user().unwrap(), store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.owner_name == "alice").unwrap();
+    let write_caps = peergos_fs::read_write_shared_capabilities(&bob_friend.pointer, store.clone(), mutable.as_ref()).await.unwrap();
+    // Bob should have 2 write caps: the stale dir cap (from the first share) and
+    // the newly shared file cap. Find the file cap (the one we can read).
+    let mut readable = Vec::new();
+    for c in &write_caps {
+        if peergos_fs::read_file(c, store.clone(), mutable.as_ref()).await.is_ok() {
+            readable.push(c);
+        }
+    }
+    assert_eq!(readable.len(), 1, "bob should be able to read exactly one of his write caps");
+    assert_eq!(peergos_fs::read_file(&readable[0], store, mutable.as_ref()).await.unwrap().1, b"data in diff signer");
+}
+
+/// Share a file writeably; owner truncates it; sharee overwrites it
+/// (Java's `sharedWriteableAndTruncate`).
+#[tokio::test]
+async fn shared_writeable_and_truncate() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let alice_user = alice.user().unwrap();
+    let home = alice_user.home().unwrap().clone();
+    let s = peergos_fs::recover_signer(&home, store.clone(), mutable.as_ref()).await.unwrap();
+    let folder = peergos_fs::create_directory(&home, "afolder", Some(s.clone()), None, store.clone(), mutable.as_ref()).await.unwrap();
+    let _file = peergos_fs::upload_file(&folder, "somefile.txt", &[1u8; 409], None, Some(s.clone()), None, store.clone(), mutable.as_ref()).await.unwrap();
+
+    peergos_fs::share_write_access(alice_user, "afolder", &folder, "somefile.txt", "bob", store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Owner overwrites with smaller content (255 bytes)
+    let folder_entry = peergos_fs::list_directory(&home, store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.name == "afolder").unwrap();
+    let link_children = peergos_fs::list_directory(&folder_entry.cap, store.clone(), mutable.as_ref()).await.unwrap();
+    let actual_dir = &link_children[0];
+    let file_cap = peergos_fs::list_directory(&actual_dir.cap, store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.name == "somefile.txt").unwrap().cap;
+    let file_signer = peergos_fs::recover_signer(&file_cap, store.clone(), mutable.as_ref()).await.unwrap();
+    peergos_fs::overwrite_file(&file_cap, &[2u8; 255], &file_signer, None, store.clone(), mutable.as_ref()).await.unwrap();
+    assert_eq!(peergos_fs::read_file(&file_cap, store.clone(), mutable.as_ref()).await.unwrap().1.len(), 255);
+
+    // Bob finds the write cap and overwrites the file
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+    let bob_friend = peergos_fs::get_friends(bob.user().unwrap(), store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.owner_name == "alice").unwrap();
+    let write_caps = peergos_fs::read_write_shared_capabilities(&bob_friend.pointer, store.clone(), mutable.as_ref()).await.unwrap();
+    let write_file = &write_caps[0];
+    let bob_s = peergos_fs::recover_signer(write_file, store.clone(), mutable.as_ref()).await.unwrap();
+    peergos_fs::overwrite_file(write_file, &[3u8; 255], &bob_s, None, store.clone(), mutable.as_ref()).await.unwrap();
+    assert_eq!(peergos_fs::read_file(write_file, store, mutable.as_ref()).await.unwrap().1.to_vec(), vec![3u8; 255]);
+}
+
+/// Grant write access to a file inside a folder; delete the parent folder;
+/// friend can no longer see the file (Java's `grantWriteToFileAndDeleteParent`).
+#[tokio::test]
+async fn grant_write_to_file_and_delete_parent() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let alice_user = alice.user().unwrap();
+    let home = alice_user.home().unwrap().clone();
+    let s = peergos_fs::recover_signer(&home, store.clone(), mutable.as_ref()).await.unwrap();
+    let folder = peergos_fs::create_directory(&home, "folder", Some(s.clone()), None, store.clone(), mutable.as_ref()).await.unwrap();
+    let _file_cap = peergos_fs::upload_file(&folder, "somefile.txt", b"data", None, Some(s.clone()), None, store.clone(), mutable.as_ref()).await.unwrap();
+    peergos_fs::share_write_access(alice_user, "folder", &folder, "somefile.txt", "bob", store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Bob can read the file
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+    let bob_friend = peergos_fs::get_friends(bob.user().unwrap(), store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.owner_name == "alice").unwrap();
+    let caps = peergos_fs::read_write_shared_capabilities(&bob_friend.pointer, store.clone(), mutable.as_ref()).await.unwrap();
+    assert_eq!(caps.len(), 1);
+    let shared_file_cap = &caps[0];
+    assert_eq!(peergos_fs::read_file(shared_file_cap, store.clone(), mutable.as_ref()).await.unwrap().1, b"data");
+    drop(bob);
+
+    // Delete the parent folder (deletes its child entries)
+    peergos_fs::delete_child(&home, "folder", Some(s.clone()), None, store.clone(), mutable.as_ref()).await.unwrap();
+    assert!(peergos_fs::list_directory(&home, store.clone(), mutable.as_ref()).await.unwrap().iter().all(|e| e.name != "folder"));
+
+    // Bob can no longer read the file (the link node was deleted and the target
+    // writer subspace was reclaimed)
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+    assert!(
+        peergos_fs::read_file(shared_file_cap, store.clone(), mutable.as_ref()).await.is_err(),
+        "bob's file cap should be stale after parent folder deletion",
+    );
+}

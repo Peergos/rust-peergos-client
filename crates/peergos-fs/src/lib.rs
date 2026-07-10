@@ -2208,7 +2208,7 @@ pub async fn force_rotate_child_to_new_writer(
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<AbsoluteCapability> {
-    // The parent's child is a link node; follow it to the real (own-writer) dir.
+    // The parent's child is a link node; follow it to the real (own-writer) target.
     let link = list_directory(parent_cap, store.clone(), mutable)
         .await?
         .into_iter()
@@ -2217,7 +2217,7 @@ pub async fn force_rotate_child_to_new_writer(
     let (_n, link_props) = retrieve_file_metadata(&link.cap, store.clone(), mutable).await?;
     if !link_props.is_link {
         return Err(Error::Protocol(
-            "directory is not write-shared (no link node / own writer)".into(),
+            "child is not write-shared (no link node / own writer)".into(),
         ));
     }
     let old_target = list_directory(&link.cap, store.clone(), mutable)
@@ -2227,15 +2227,28 @@ pub async fn force_rotate_child_to_new_writer(
         .ok_or_else(|| Error::Protocol("link node has no target".into()))?
         .cap;
     let old_writer = recover_signer(&old_target, store.clone(), mutable).await?;
-    let created = retrieve_file_metadata(&old_target, store.clone(), mutable).await?.1.created_epoch;
+    let (_old_meta, old_props) = retrieve_file_metadata(&old_target, store.clone(), mutable).await?;
+    let is_dir = old_props.is_directory;
+    let created = old_props.created_epoch;
 
     // Create a fresh writer subspace, copy the old contents across, and relink.
-    let new_target =
-        create_writable_shared_dir(parent_cap, child_name, entry_signer.clone(), mirror_bat, store.clone(), mutable).await?;
-    let new_signer = recover_signer(&new_target, store.clone(), mutable).await?;
-    copy_dir_contents(&old_target, &new_target, &new_signer, mirror_bat, store.clone(), mutable).await?;
-    create_link_node(parent_cap, child_name, &new_target, true, None, created, entry_signer.clone(), mirror_bat, store.clone(), mutable)
-        .await?;
+    let new_target = if is_dir {
+        let new_dir = create_writable_shared_dir(parent_cap, child_name, entry_signer.clone(), mirror_bat, store.clone(), mutable).await?;
+        let new_signer = recover_signer(&new_dir, store.clone(), mutable).await?;
+        copy_dir_contents(&old_target, &new_dir, &new_signer, mirror_bat, store.clone(), mutable).await?;
+        create_link_node(parent_cap, child_name, &new_dir, true, None, created, entry_signer.clone(), mirror_bat, store.clone(), mutable)
+            .await?;
+        new_dir
+    } else {
+        let (props, content) = read_file(&old_target, store.clone(), mutable).await?;
+        let mime = props.mime_type.clone();
+        let new_file = create_writable_shared_file(
+            parent_cap, child_name, &content, &props, entry_signer.clone(), mirror_bat, store.clone(), mutable,
+        ).await?;
+        create_link_node(parent_cap, child_name, &new_file, false, Some(mime), created, entry_signer.clone(), mirror_bat, store.clone(), mutable)
+            .await?;
+        new_file
+    };
 
     // Delete the old target subspace (while its writer is still authorised), then
     // remove the orphaned old link node, then deauthorise the old writer.
