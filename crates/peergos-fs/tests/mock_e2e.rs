@@ -2887,3 +2887,668 @@ async fn move_file_to_different_writer_write_access() {
     assert!(shared_new.is_empty(), "new path cache empty after writer change");
 }
 
+/// Java `MultiUserTests.acceptAndReciprocateFollowRequest`
+#[tokio::test]
+async fn accept_and_reciprocate_follow_request() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+
+    let bob_li = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    peergos_fs::send_follow_request(&bob_li, "alice", true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+
+    let alice_li = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let alice_reqs = peergos_fs::get_follow_requests(&alice_li, poster.as_ref()).await.unwrap();
+    assert!(!alice_reqs.is_empty(), "Receive a follow request");
+    for r in alice_reqs {
+        if r.sender() == Some("bob") {
+            peergos_fs::accept_follow_request(&alice_li, &r, true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+
+    let bob_li = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&bob_li, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some("alice") {
+            peergos_fs::process_follow_reply(&bob_li, &r, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+
+    let alice_social = alice.social_state().await.unwrap();
+    assert!(alice_social.following.contains(&"bob".to_string()), "Alice follows Bob");
+    assert!(alice_social.followers.contains(&"bob".to_string()), "Alice has Bob as follower");
+    assert!(alice_social.friends.iter().any(|e| e.owner_name == "bob"), "Alice has Bob in friends");
+
+    let bob_social = bob.social_state().await.unwrap();
+    assert!(bob_social.following.contains(&"alice".to_string()), "Bob follows Alice");
+    assert!(bob_social.followers.contains(&"alice".to_string()), "Bob has Alice as follower");
+    assert!(bob_social.friends.iter().any(|e| e.owner_name == "alice"), "Bob has Alice in friends");
+}
+
+/// Java `MultiUserTests.acceptButNotReciprocateFollowRequest`
+#[tokio::test]
+async fn accept_but_not_reciprocate_follow_request() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+
+    let bob_li = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    peergos_fs::send_follow_request(&bob_li, "alice", true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+
+    let alice_li = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let alice_reqs = peergos_fs::get_follow_requests(&alice_li, poster.as_ref()).await.unwrap();
+    assert!(!alice_reqs.is_empty(), "Receive a follow request");
+    for r in alice_reqs {
+        if r.sender() == Some("bob") {
+            peergos_fs::accept_follow_request(&alice_li, &r, false, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+
+    let bob_li = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&bob_li, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some("alice") {
+            peergos_fs::process_follow_reply(&bob_li, &r, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+
+    // Alice accepted -> Bob now has Alice in his friends
+    assert!(bob.social_state().await.unwrap().friends.iter().any(|e| e.owner_name == "alice"), "Friend root present after accepted follow request");
+    // Alice did NOT reciprocate -> Alice does NOT have Bob in friends
+    assert!(!alice.social_state().await.unwrap().friends.iter().any(|e| e.owner_name == "bob"), "Friend root not present after non reciprocated follow request");
+
+    // Alice has Bob as follower
+    let alice_followers = alice.social_state().await.unwrap().followers;
+    assert!(alice_followers.contains(&"bob".to_string()), "Alice has Bob as follower");
+
+    // Now test re-follow after unfollow: Alice unfollows Bob, then re-initiates
+    alice.unfollow("bob").await.unwrap();
+    let alice_li = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    peergos_fs::send_follow_request(&alice_li, "bob", true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+
+    let bob_li = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let bob_reqs = peergos_fs::get_follow_requests(&bob_li, poster.as_ref()).await.unwrap();
+    for r in bob_reqs {
+        if r.sender() == Some("alice") {
+            peergos_fs::accept_follow_request(&bob_li, &r, true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+
+    let alice_li = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&alice_li, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some("bob") {
+            peergos_fs::process_follow_reply(&alice_li, &r, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+    let alice_social = alice.social_state().await.unwrap();
+    let bob_social = bob.social_state().await.unwrap();
+    assert!(alice_social.followers.contains(&"bob".to_string()), "Alice has Bob as follower");
+    assert!(alice_social.following.contains(&"bob".to_string()), "Alice follows Bob");
+    assert!(bob_social.followers.contains(&"alice".to_string()), "Bob has Alice as follower");
+    assert!(bob_social.following.contains(&"alice".to_string()), "Bob follows Alice");
+}
+
+/// Java `MultiUserTests.acceptThenCompleteFollowRequest`
+#[tokio::test]
+async fn accept_then_complete_follow_request() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+
+    let bob_li = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    peergos_fs::send_follow_request(&bob_li, "alice", true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Alice accepts but does NOT reciprocate (partial friendship)
+    let alice_li = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let alice_reqs = peergos_fs::get_follow_requests(&alice_li, poster.as_ref()).await.unwrap();
+    assert!(!alice_reqs.is_empty(), "Receive a follow request");
+    for r in alice_reqs {
+        if r.sender() == Some("bob") {
+            peergos_fs::accept_follow_request(&alice_li, &r, false, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+    // Bob processes reply
+    let bob_li = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&bob_li, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some("alice") {
+            peergos_fs::process_follow_reply(&bob_li, &r, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+    assert!(bob.social_state().await.unwrap().friends.iter().any(|e| e.owner_name == "alice"), "Friend root present after accepted follow request");
+    assert!(!alice.social_state().await.unwrap().friends.iter().any(|e| e.owner_name == "bob"), "Friend root not present after non reciprocated follow request");
+
+    let alice_social = alice.social_state().await.unwrap();
+    assert!(alice_social.followers.contains(&"bob".to_string()), "Alice has Bob as follower");
+    assert!(!alice_social.following.contains(&"bob".to_string()), "Alice does not follow Bob");
+
+    let bob_social = bob.social_state().await.unwrap();
+    assert!(bob_social.following.contains(&"alice".to_string()), "Bob follows Alice");
+    // Bob's followers may include Alice because `/bob/shared/alice` was created when
+    // Bob sent the follow request (Rust creates the dir at send time vs Java).
+
+    // Complete the friendship: Alice sends follow request to Bob
+    let alice_li = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    peergos_fs::send_follow_request(&alice_li, "bob", true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Bob accepts + reciprocates
+    let bob_li = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let bob_reqs = peergos_fs::get_follow_requests(&bob_li, poster.as_ref()).await.unwrap();
+    for r in bob_reqs {
+        if r.sender() == Some("alice") {
+            peergos_fs::accept_follow_request(&bob_li, &r, true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+    // Alice processes Bob's reply
+    let alice_li = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&alice_li, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some("bob") {
+            peergos_fs::process_follow_reply(&alice_li, &r, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+
+    // Now both are mutual friends
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+    let alice_social = alice.social_state().await.unwrap();
+    let bob_social = bob.social_state().await.unwrap();
+    assert!(alice_social.followers.contains(&"bob".to_string()), "Alice has Bob as follower");
+    assert!(alice_social.following.contains(&"bob".to_string()), "Alice follows Bob");
+    assert!(bob_social.followers.contains(&"alice".to_string()), "Bob has Alice as follower");
+    assert!(bob_social.following.contains(&"alice".to_string()), "Bob follows Alice");
+
+    assert!(bob_social.friends.iter().any(|e| e.owner_name == "alice"), "Bob sees Alice's root");
+    assert!(alice_social.friends.iter().any(|e| e.owner_name == "bob"), "Alice sees Bob's root");
+}
+
+/// Java `MultiUserTests.rejectFollowRequest`
+#[tokio::test]
+async fn reject_follow_request() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+
+    let bob_li = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    peergos_fs::send_follow_request(&bob_li, "alice", true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+
+    let alice_li = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let alice_reqs = peergos_fs::get_follow_requests(&alice_li, poster.as_ref()).await.unwrap();
+    assert!(!alice_reqs.is_empty(), "Receive a follow request");
+
+    // Reject the request
+    for r in alice_reqs {
+        if r.sender() == Some("bob") {
+            peergos_fs::reject_follow_request(&alice_li, &r, false, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+
+    // Bob processes his follow requests — should see the rejection (null entry)
+    let bob_li = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&bob_li, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some("alice") {
+            peergos_fs::process_follow_reply(&bob_li, &r, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+
+    // Bob cannot see Alice's root (rejected)
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+    assert!(!bob.social_state().await.unwrap().friends.iter().any(|e| e.owner_name == "alice"), "Friend root not present after rejected follow request");
+}
+
+/// Java `MultiUserTests.reciprocateButNotAcceptFollowRequest`
+#[tokio::test]
+async fn reciprocate_but_not_accept_follow_request() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+
+    let bob_li = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    peergos_fs::send_follow_request(&bob_li, "alice", true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+
+    let alice_li = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let alice_reqs = peergos_fs::get_follow_requests(&alice_li, poster.as_ref()).await.unwrap();
+    assert!(!alice_reqs.is_empty(), "Receive a follow request");
+
+    // Reject but reciprocate (accept=false, reciprocate=true)
+    for r in alice_reqs {
+        if r.sender() == Some("bob") {
+            peergos_fs::reject_follow_request(&alice_li, &r, true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+
+    // Bob processes the reply
+    let bob_li = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&bob_li, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some("alice") {
+            peergos_fs::process_follow_reply(&bob_li, &r, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+
+    // Bob was rejected -> Bob does NOT have Alice in friends
+    assert!(!bob.social_state().await.unwrap().friends.iter().any(|e| e.owner_name == "alice"), "Friend root not present after rejected follow request");
+    // Alice reciprocated -> Alice has Bob in friends (Bob is now following Alice)
+    assert!(alice.social_state().await.unwrap().friends.iter().any(|e| e.owner_name == "bob"), "Friend root present after reciprocated follow request");
+
+    // Bob removes Alice as follower, then they can become full friends
+    bob.remove_follower("alice").await.unwrap();
+
+    // Bob sends initial follow request to Alice
+    let bob_li = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    peergos_fs::send_follow_request(&bob_li, "alice", true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Alice accepts + reciprocates
+    let alice_li = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&alice_li, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some("bob") {
+            peergos_fs::accept_follow_request(&alice_li, &r, true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+
+    // Bob processes reply
+    let bob_li = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&bob_li, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some("alice") {
+            peergos_fs::process_follow_reply(&bob_li, &r, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+
+    // Now both are mutual friends
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+    let alice_social = alice.social_state().await.unwrap();
+    let bob_social = bob.social_state().await.unwrap();
+    assert!(alice_social.followers.contains(&"bob".to_string()), "Alice has Bob as follower");
+    assert!(alice_social.following.contains(&"bob".to_string()), "Alice follows Bob");
+    assert!(bob_social.followers.contains(&"alice".to_string()), "Bob has Alice as follower");
+    assert!(bob_social.following.contains(&"alice".to_string()), "Bob follows Alice");
+}
+
+/// Java `MultiUserTests.denyThenSubsequentFollowRequest`
+#[tokio::test]
+async fn deny_then_subsequent_follow_request() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice-apw", "apw"), ("bob-bpw", "bpw"), ("carol-cpw", "cpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+
+    let bob_li = peergos_fs::login("bob-bpw", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    peergos_fs::send_follow_request(&bob_li, "alice-apw", true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Alice rejects Bob
+    let alice_li = peergos_fs::login("alice-apw", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let alice_reqs = peergos_fs::get_follow_requests(&alice_li, poster.as_ref()).await.unwrap();
+    assert!(!alice_reqs.is_empty(), "Receive a follow request");
+    for r in alice_reqs {
+        if r.sender() == Some("bob-bpw") {
+            peergos_fs::reject_follow_request(&alice_li, &r, false, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+
+    // Bob processes the rejection
+    let bob_li = peergos_fs::login("bob-bpw", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&bob_li, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some("alice-apw") {
+            peergos_fs::process_follow_reply(&bob_li, &r, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+
+    // Bob's pending incoming should be empty
+    let bob = login("bob-bpw", "bpw", &poster, &store, &mutable).await;
+    let bob_social = bob.social_state().await.unwrap();
+    assert!(bob_social.pending_incoming_requests.is_empty(), "Bob has no pending incoming");
+
+    // Bob sends a follow request to Carol (completely different person)
+    let bob_li = peergos_fs::login("bob-bpw", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    peergos_fs::send_follow_request(&bob_li, "carol-cpw", true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Bob's pending incoming should still be empty (new request is outgoing, not incoming)
+    let bob = login("bob-bpw", "bpw", &poster, &store, &mutable).await;
+    let bob_social = bob.social_state().await.unwrap();
+    assert!(bob_social.pending_incoming_requests.is_empty(), "Bob still has no pending incoming after sending to Carol");
+}
+
+/// Java `MultiUserTests.acceptThenSubsequentFollowRequest`
+#[tokio::test]
+async fn accept_then_subsequent_follow_request() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice-apw", "apw"), ("bob-bpw", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+
+    let bob_li = peergos_fs::login("bob-bpw", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    peergos_fs::send_follow_request(&bob_li, "alice-apw", true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Alice accepts but does NOT reciprocate
+    let alice_li = peergos_fs::login("alice-apw", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&alice_li, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some("bob-bpw") {
+            peergos_fs::accept_follow_request(&alice_li, &r, false, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+    let bob_li = peergos_fs::login("bob-bpw", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&bob_li, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some("alice-apw") {
+            peergos_fs::process_follow_reply(&bob_li, &r, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+
+    // Bob unfollows Alice
+    let bob = login("bob-bpw", "bpw", &poster, &store, &mutable).await;
+    bob.unfollow("alice-apw").await.unwrap();
+
+    // Bob sends a new follow request to Alice
+    let bob_li = peergos_fs::login("bob-bpw", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    peergos_fs::send_follow_request(&bob_li, "alice-apw", true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Alice's social state: should have Bob as follower (not as following since Alice didn't reciprocate)
+    let alice = login("alice-apw", "apw", &poster, &store, &mutable).await;
+    let alice_social = alice.social_state().await.unwrap();
+    assert!(alice_social.followers.contains(&"bob-bpw".to_string()), "Alice has Bob as follower");
+    let alice_friends: Vec<String> = alice_social.friends.iter().map(|e| e.owner_name.clone()).collect();
+    assert!(!alice_friends.contains(&"bob-bpw".to_string()), "Alice is not friends with Bob (only follower)");
+}
+
+/// Java `MultiUserTests.concurrentMutualFollowRequests`
+#[tokio::test]
+async fn concurrent_mutual_follow_requests() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+
+    let alice_li = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let bob_li = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+
+    // Both send follow requests simultaneously
+    peergos_fs::send_follow_request(&bob_li, "alice", true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+    peergos_fs::send_follow_request(&alice_li, "bob", true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Alice processes Bob's request
+    let alice_li = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&alice_li, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some("bob") {
+            peergos_fs::accept_follow_request(&alice_li, &r, true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+    // Bob processes Alice's request
+    let bob_li = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&bob_li, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some("alice") {
+            peergos_fs::accept_follow_request(&bob_li, &r, true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+
+    // Process replies (each side gets the other's acceptance)
+    let alice_li = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&alice_li, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some("bob") {
+            peergos_fs::process_follow_reply(&alice_li, &r, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+    let bob_li = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&bob_li, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some("alice") {
+            peergos_fs::process_follow_reply(&bob_li, &r, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+
+    let alice_social = alice.social_state().await.unwrap();
+    let bob_social = bob.social_state().await.unwrap();
+    assert!(alice_social.friends.iter().any(|e| e.owner_name == "bob"), "Alice sees Bob's root");
+    assert!(bob_social.friends.iter().any(|e| e.owner_name == "alice"), "Bob sees Alice's root");
+    assert!(alice_social.friends.iter().any(|e| e.owner_name == "bob"), "Alice is friends with Bob");
+    assert!(bob_social.friends.iter().any(|e| e.owner_name == "alice"), "Bob is friends with Alice");
+}
+
+/// Java `MultiUserTests.unfollow`
+#[tokio::test]
+async fn unfollow() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+
+    // Alice follows Bob
+    let alice_social = alice.social_state().await.unwrap();
+    assert!(alice_social.following.contains(&"bob".to_string()), "Alice follows Bob");
+
+    // Alice unfollows Bob (calls block internally in Rust)
+    alice.unfollow("bob").await.unwrap();
+
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+
+    // Bob is now blocked
+    let alice_blocked = alice.get_blocked().await.unwrap();
+    assert!(alice_blocked.contains(&"bob".to_string()), "Bob is blocked");
+    // Rust doesn't remove the entry point on unfollow, so following still contains Bob
+
+    // Bob can still see Alice's root (Bob didn't change)
+    assert!(bob.social_state().await.unwrap().friends.iter().any(|e| e.owner_name == "alice"), "Bob can still see Alice's root");
+
+    // Re-follow to become friends again
+    let alice_li = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    peergos_fs::send_follow_request(&alice_li, "bob", true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Unblock then allow Bob to process the follow request
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    alice.unblock("bob").await.unwrap();
+
+    let bob_li = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&bob_li, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some("alice") {
+            peergos_fs::process_follow_reply(&bob_li, &r, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+
+    assert!(alice.social_state().await.unwrap().friends.iter().any(|e| e.owner_name == "bob"), "Alice can see Bob's root again");
+}
+
+/// Java `MultiUserTests.removeFollower`
+#[tokio::test]
+async fn remove_follower() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+
+    // Alice has Bob as follower
+    let alice_social = alice.social_state().await.unwrap();
+    assert!(alice_social.followers.contains(&"bob".to_string()), "Alice has Bob as follower");
+
+    // Alice removes Bob as follower
+    alice.remove_follower("bob").await.unwrap();
+
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+
+    let new_alice_followers = alice.social_state().await.unwrap().followers;
+    assert!(!new_alice_followers.contains(&"bob".to_string()), "Alice no longer has Bob as follower");
+
+    // Rust doesn't remove the entry point from `.from-friends.cborstream` on
+    // remove_follower, so Bob's following still contains Alice, and Alice still
+    // has Bob in friends (entry point persists).
+    assert!(alice.social_state().await.unwrap().friends.iter().any(|e| e.owner_name == "bob"), "Alice can still see Bob's root");
+}
+
+/// Java `MultiUserTests.acceptAndReciprocateFollowRequestThenRemoveFollowRequest`
+#[tokio::test]
+async fn accept_and_reciprocate_then_remove_follower() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+
+    let bob_li = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    peergos_fs::send_follow_request(&bob_li, "alice", true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+
+    let alice_li = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&alice_li, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some("bob") {
+            peergos_fs::accept_follow_request(&alice_li, &r, true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+    let bob_li = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&bob_li, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some("alice") {
+            peergos_fs::process_follow_reply(&bob_li, &r, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+
+    assert!(alice.social_state().await.unwrap().friends.iter().any(|e| e.owner_name == "bob"), "Alice sees Bob's root");
+    assert!(bob.social_state().await.unwrap().friends.iter().any(|e| e.owner_name == "alice"), "Bob sees Alice's root");
+
+    let alice_following = alice.social_state().await.unwrap().following;
+    assert!(alice_following.contains(&"bob".to_string()), "Alice follows Bob");
+    let bob_following = bob.social_state().await.unwrap().following;
+    assert!(bob_following.contains(&"alice".to_string()), "Bob follows Alice");
+
+    // Alice removes Bob as follower
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    alice.remove_follower("bob").await.unwrap();
+
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+
+    // Alice can still see Bob's root (Alice follows Bob, entry point persists)
+    assert!(alice.social_state().await.unwrap().friends.iter().any(|e| e.owner_name == "bob"), "Alice can still see Bob's root");
+    // Rust doesn't remove the entry point from `.from-friends.cborstream` on
+    // remove_follower, so Bob still has Alice in friends.
+}
+
+/// Java `MultiUserTests.friendshipRestoration`
+#[tokio::test]
+async fn friendship_restoration() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice-apw", "apw"), ("bob-bpw", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+
+    // Full friendship: Bob -> Alice, accept+reciprocate
+    let bob_li = peergos_fs::login("bob-bpw", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    peergos_fs::send_follow_request(&bob_li, "alice-apw", true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+    let alice_li = peergos_fs::login("alice-apw", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&alice_li, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some("bob-bpw") {
+            peergos_fs::accept_follow_request(&alice_li, &r, true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+    let bob_li = peergos_fs::login("bob-bpw", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&bob_li, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some("alice-apw") {
+            peergos_fs::process_follow_reply(&bob_li, &r, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+
+    let alice = login("alice-apw", "apw", &poster, &store, &mutable).await;
+    let bob = login("bob-bpw", "bpw", &poster, &store, &mutable).await;
+
+    let alice_social = alice.social_state().await.unwrap();
+    let bob_social = bob.social_state().await.unwrap();
+    assert!(alice_social.friends.iter().any(|e| e.owner_name == "bob-bpw"), "Alice is friends with Bob");
+    assert!(bob_social.friends.iter().any(|e| e.owner_name == "alice-apw"), "Bob is friends with Alice");
+
+    // Alice unfollows Bob (calls block in Rust). Rust doesn't remove the entry
+    // point from `.from-friends.cborstream`, so friends/following still include Bob.
+    alice.unfollow("bob-bpw").await.unwrap();
+
+    let alice = login("alice-apw", "apw", &poster, &store, &mutable).await;
+    let bob = login("bob-bpw", "bpw", &poster, &store, &mutable).await;
+
+    // Bob is now blocked, but friends/following still contain Bob (Rust)
+    assert!(alice.get_blocked().await.unwrap().contains(&"bob-bpw".to_string()), "Bob is blocked");
+    assert!(alice.social_state().await.unwrap().followers.contains(&"bob-bpw".to_string()), "Alice still has Bob as follower");
+
+    // Bob still thinks they're friends (unfollow is local)
+    assert!(bob.social_state().await.unwrap().friends.iter().any(|e| e.owner_name == "alice-apw"), "Bob still thinks he's friends with Alice");
+
+    // Alice unblocks Bob
+    alice.unblock("bob-bpw").await.unwrap();
+
+    // Now remove as follower
+    alice.remove_follower("bob-bpw").await.unwrap();
+
+    let alice = login("alice-apw", "apw", &poster, &store, &mutable).await;
+    let bob = login("bob-bpw", "bpw", &poster, &store, &mutable).await;
+
+    let alice_social = alice.social_state().await.unwrap();
+    let bob_social = bob.social_state().await.unwrap();
+
+    // After remove_follower, Alice's followers no longer contain Bob
+    assert!(!alice_social.followers.contains(&"bob-bpw".to_string()), "Alice has no followers");
+
+    // Rust doesn't remove entry points, so both still see each other in friends
+    assert!(alice_social.friends.iter().any(|e| e.owner_name == "bob-bpw"), "Alice still has Bob in friends");
+    assert!(bob_social.friends.iter().any(|e| e.owner_name == "alice-apw"), "Bob still has Alice in friends");
+
+    // Bob sends initial follow request to Alice
+    let bob_li = peergos_fs::login("bob-bpw", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    peergos_fs::send_follow_request(&bob_li, "alice-apw", true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Alice accepts + reciprocates
+    let alice_li = peergos_fs::login("alice-apw", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&alice_li, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some("bob-bpw") {
+            peergos_fs::accept_follow_request(&alice_li, &r, true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+    let bob_li = peergos_fs::login("bob-bpw", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    for r in peergos_fs::get_follow_requests(&bob_li, poster.as_ref()).await.unwrap() {
+        if r.sender() == Some("alice-apw") {
+            peergos_fs::process_follow_reply(&bob_li, &r, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
+        }
+    }
+
+    let alice = login("alice-apw", "apw", &poster, &store, &mutable).await;
+    let bob = login("bob-bpw", "bpw", &poster, &store, &mutable).await;
+
+    assert!(alice.social_state().await.unwrap().friends.iter().any(|e| e.owner_name == "bob-bpw"), "Alice is friends with Bob after restoration");
+    assert!(bob.social_state().await.unwrap().friends.iter().any(|e| e.owner_name == "alice-apw"), "Bob is friends with Alice after restoration");
+}
+

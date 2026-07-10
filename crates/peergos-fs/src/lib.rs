@@ -39,7 +39,7 @@ pub use social::{
     get_pending_outgoing, get_public_keys, get_shared_with, group_uid, unblock, unfollow,
     load_read_access_sharing_links, load_write_access_sharing_links, move_file,
     process_follow_reply, read_shared_capabilities, read_write_shared_capabilities, record_link,
-    remove_link, send_follow_request, share_read_access, share_read_with_group, share_write_access,
+    reject_follow_request, remove_link, send_follow_request, share_read_access, share_read_with_group, share_write_access,
     share_write_with_group, unshare_read_access, unshare_write_access, Access, CapabilitiesFromUser,
     CapabilityWithPath, FileSharedWithState, FriendAnnotation, Groups, LinkProperties,
     ReceivedFollowRequest, SharedWithState, SocialState, FOLLOWERS_GROUP, FRIENDS_GROUP,

@@ -652,8 +652,12 @@ pub async fn accept_follow_request(
     }
     blind_and_send(&their_identity, &their_boxer, &reply.build(), poster).await?;
 
-    // Persist their entry point so we retain read access after this session.
-    persist_friend_entry_point(user, entry, store.clone(), mutable).await?;
+    // Persist their entry point only when reciprocating (mutual friendship), so we
+    // get read access to their shared files — matching Java's `sendReplyFollowRequest`
+    // which skips `addExternalEntryPoint` when `accept=true, reciprocate=false`.
+    if reciprocate {
+        persist_friend_entry_point(user, entry, store.clone(), mutable).await?;
+    }
 
     // Add them to our followers group, and — if reciprocating (mutual friends) —
     // our friends group, matching Java's accept flow. This shares each group's
@@ -665,6 +669,56 @@ pub async fn accept_follow_request(
     }
 
     // Remove the processed request from our inbox.
+    remove_follow_request(user, &request.raw_cipher, poster).await?;
+    Ok(())
+}
+
+/// `sendReplyFollowRequest` with `accept=false`: send a rejection reply (null
+/// entry point) back to the requester.  If `reciprocate` is true the requester's
+/// read base key is echoed so they become a follower even though we didn't accept
+/// their request (Java's `accept=false, reciprocate=true` path).
+pub async fn reject_follow_request(
+    user: &LoggedInUser,
+    request: &ReceivedFollowRequest,
+    reciprocate: bool,
+    poster: &dyn HttpPoster,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let entry = request
+        .entry
+        .as_ref()
+        .ok_or_else(|| Error::Protocol("follow request has no entry point".into()))?;
+    let their_name = entry.owner_name.clone();
+    let (their_identity, their_boxer) =
+        get_public_keys(poster, store.as_ref(), mutable, &their_name).await?;
+
+    // Null capability: all-zero identity, map_key, and r_base_key.
+    let null_hash = PublicKeyHash::identity(vec![0u8; 32])?;
+    let null_key = SymmetricKey::new(vec![0u8; 32], false)?;
+    let null_cap = AbsoluteCapability {
+        owner: null_hash,
+        writer: PublicKeyHash::identity(vec![0u8; 32])?,
+        map_key: vec![0u8; 32],
+        bat: None,
+        r_base_key: null_key,
+        w_base_key: None,
+    };
+    let null_entry = EntryPoint { pointer: null_cap.clone(), owner_name: user.username.clone() };
+
+    let mut reply = CborObject::map().put("e", null_entry.to_cbor());
+    if reciprocate {
+        reply = reply.put("k", entry.pointer.r_base_key.to_cbor());
+    }
+    blind_and_send(&their_identity, &their_boxer, &reply.build(), poster).await?;
+
+    // If reciprocating, persist the requester's entry point so we can see their
+    // shared files (Java's `addExternalEntryPoint` + `retrieveAndAddEntryPointToTrie`).
+    if reciprocate {
+        persist_friend_entry_point(user, entry, store.clone(), mutable).await?;
+        add_member_to_group(user, FOLLOWERS_GROUP, &their_name, store.clone(), mutable).await?;
+    }
+
     remove_follow_request(user, &request.raw_cipher, poster).await?;
     Ok(())
 }
