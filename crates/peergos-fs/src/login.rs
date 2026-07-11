@@ -370,6 +370,47 @@ pub async fn change_password(
     Ok(())
 }
 
+/// Copy the user's login data onto *this* server (`UserContext.mirrorLoginData`),
+/// so it can serve logins if the user later migrates here. Re-derives the login
+/// keypair + root from the password (same salt), fetches the current entry points,
+/// re-encrypts them under the root, signs the login data with the identity
+/// `signer`, and POSTs it to `setLogin` with `local=true` (mirror). Non-legacy
+/// accounts only.
+pub async fn mirror_login_data(
+    username: &str,
+    password: &str,
+    signer: &SigningPrivateKeyAndPublicHash,
+    mfa: Option<&MfaResponder<'_>>,
+    poster: &dyn HttpPoster,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<bool> {
+    let owner = get_public_key_hash(poster, username)
+        .await?
+        .ok_or_else(|| Error::Protocol(format!("Unknown username: {username}")))?;
+    let pointer = mutable.get_pointer_target(&owner, &owner, store.as_ref()).await?;
+    let wd_cid = pointer.updated.ok_or_else(|| Error::Protocol("User has been deleted".into()))?;
+    let wd = store.get(&owner, &wd_cid, None).await?.ok_or_else(|| Error::Protocol("writer data block missing".into()))?;
+    if wd.get("static").is_some() {
+        return Err(Error::Protocol("Legacy accounts do not have login data, change your password to upgrade your account.".into()));
+    }
+    let algo = ScryptParams::from_writer_data(&wd)?;
+
+    let creds = generate_user(username, password, &algo)?;
+    let entry_points_cbor = get_login_data(poster, username, &creds, mfa).await?;
+    let new_static =
+        crate::cryptree::PaddedCipherText::build(&creds.root, &entry_points_cbor, USER_STATIC_DATA_PADDING)?.to_cbor();
+    let login_data = CborObject::map()
+        .put("u", CborObject::Str(username.to_string()))
+        .put("e", new_static)
+        .put("r", creds.login_pub.to_cbor())
+        .build();
+    let auth = to_hex(&signer.secret.signature_only(&login_data.to_bytes())?);
+    let url = format!("{LOGIN_URL}setLogin?username={username}&auth={auth}&local=true");
+    let res = poster.post_unzip(&url, login_data.to_bytes(), 0).await?;
+    Ok(res.first().copied() == Some(1))
+}
+
 /// Decrypt a `UserStaticData` (PaddedCipherText) to its `EntryPoints` cbor.
 fn decrypt_entry_points(static_data: &CborObject, root: &SymmetricKey) -> Result<CborObject> {
     crate::cryptree::PaddedCipherText::from_cbor(static_data)?

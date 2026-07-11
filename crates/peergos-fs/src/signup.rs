@@ -215,13 +215,13 @@ impl MutablePointers for OpLogStore {
 // ---------------------------------------------------------------------------
 
 /// `Serialize.serialize(byte[])`: 4-byte big-endian length prefix, then bytes.
-fn serialize_bytes(out: &mut Vec<u8>, b: &[u8]) {
+pub(crate) fn serialize_bytes(out: &mut Vec<u8>, b: &[u8]) {
     out.extend_from_slice(&(b.len() as u32).to_be_bytes());
     out.extend_from_slice(b);
 }
 
 /// `Serialize.serialize(String)`: 4-byte big-endian char count, then UTF-8 bytes.
-fn serialize_string(out: &mut Vec<u8>, s: &str) {
+pub(crate) fn serialize_string(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.chars().count() as u32).to_be_bytes());
     out.extend_from_slice(s.as_bytes());
 }

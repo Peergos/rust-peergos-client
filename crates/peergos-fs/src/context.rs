@@ -428,6 +428,67 @@ impl UserContext {
         dir.get_by_path(&comps[matched..].join("/")).await
     }
 
+    /// The children of the directory at `path` (`getChildren`). Empty if the path
+    /// doesn't resolve, or resolves to a file.
+    pub async fn get_children(&self, path: &str) -> Result<Vec<FileWrapper>> {
+        match self.get_by_path(path).await? {
+            Some(dir) if dir.is_directory() => dir.children().await,
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Mirror this account's login data onto the current server so it can serve
+    /// logins after a migration (`mirrorLoginData`). Non-legacy accounts only.
+    pub async fn mirror_login_data(&self, password: &str, mfa: Option<&MfaResponder<'_>>) -> Result<bool> {
+        let user = self.require_user()?;
+        crate::login::mirror_login_data(
+            &user.username,
+            password,
+            &user.signer,
+            mfa,
+            self.poster.as_ref(),
+            self.store.clone(),
+            self.mutable.as_ref(),
+        )
+        .await
+    }
+
+    /// Ask the current server to mirror this account's data, authorised by a signed
+    /// timestamp + proof-of-work (`mirrorOnThisServer`, unpaid path). Requires a
+    /// mirror BAT.
+    pub async fn mirror_on_this_server(&self) -> Result<bool> {
+        let user = self.require_user()?;
+        let mirror_bat = user.mirror_bat.clone().ok_or_else(|| Error::Protocol("You need a mirror bat!".into()))?;
+        crate::migrate::start_mirror(self.poster.as_ref(), &user.username, &mirror_bat, &user.signer).await
+    }
+
+    /// Migrate this account's home server to the current server
+    /// (`migrateToThisServer`): fetch the username claim chain, append a link naming
+    /// this server as the storage provider, and commit it. Returns the raw
+    /// `UserSnapshot` cbor the server returns. `password`/`mfa` are accepted for
+    /// signature parity with the Java API (the current session's identity signer is
+    /// used to sign the new claim).
+    pub async fn migrate_to_this_server(&self, _password: &str, _mfa: Option<&MfaResponder<'_>>) -> Result<CborObject> {
+        let user = self.require_user()?;
+        let existing = crate::migrate::get_chain(self.poster.as_ref(), &user.username).await?;
+        let last = existing.last().ok_or_else(|| Error::Protocol("empty claim chain".into()))?;
+        let original_node_id = crate::migrate::claim_storage_provider(last)?;
+        let usage = self.get_usage().await?;
+        let this_server = self.store.id().await?;
+        let new_chain = crate::migrate::build_migration_chain(&existing, &this_server, &user.signer.secret)?;
+        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        crate::migrate::migrate_user(
+            self.poster.as_ref(),
+            &user.username,
+            &new_chain,
+            &original_node_id,
+            user.mirror_bat.as_ref(),
+            now_secs,
+            usage,
+        )
+        .await
+    }
+
     /// The user's mirror BAT (`getMirrorBat`), fetched from the server's bats
     /// endpoint and authorised by a time-limited signed request. `None` if the
     /// account has no registered BAT. Used to keep secret-link data private.

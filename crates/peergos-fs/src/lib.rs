@@ -17,6 +17,7 @@ pub mod incoming;
 pub mod login;
 pub mod messaging;
 pub mod mfa;
+pub mod migrate;
 pub mod mimetype;
 pub mod profile;
 pub mod publish;
