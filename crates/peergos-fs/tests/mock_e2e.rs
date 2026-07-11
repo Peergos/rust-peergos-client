@@ -3972,3 +3972,32 @@ async fn multi_chunk_append_stays_consistent() {
     let f2 = ctx2.get_by_path("/carol/big.bin").await.unwrap().unwrap();
     assert_eq!(f2.read().await.unwrap().len(), 13_900_000);
 }
+
+// ---------------------------------------------------------------------------
+// Media uploads get an auto-generated thumbnail (FileWrapper::upload path)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn uploaded_image_gets_thumbnail() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = UserContext::sign_up("dave", "dpw", None, poster, store, mutable).await.expect("sign up");
+    let home = ctx.get_home().await.unwrap();
+
+    // A real 64x64 PNG.
+    let png: &[u8] = include_bytes!("assets/pixel.png");
+    home.upload("pic.png", png).await.unwrap();
+
+    // A plain (non-media) file gets no thumbnail.
+    home.upload("notes.txt", b"just some text, definitely not an image").await.unwrap();
+
+    let img = ctx.get_by_path("/dave/pic.png").await.unwrap().unwrap();
+    let thumb = img.properties().thumbnail.clone();
+    assert!(thumb.is_some(), "an uploaded image should get a thumbnail");
+    let (mime, bytes) = thumb.unwrap();
+    assert_eq!(mime, "image/webp");
+    assert!(bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP", "thumbnail should be a WebP");
+
+    let txt = ctx.get_by_path("/dave/notes.txt").await.unwrap().unwrap();
+    assert!(txt.properties().thumbnail.is_none(), "a text file should not get a thumbnail");
+}

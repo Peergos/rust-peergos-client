@@ -1153,6 +1153,35 @@ fn read_exact(r: &mut impl std::io::Read, buf: &mut [u8]) -> Result<()> {
     r.read_exact(buf).map_err(|e| Error::Protocol(format!("read error: {e}")))
 }
 
+/// Auto-generate a WebP thumbnail for an image/video upload that didn't supply
+/// one, so every media upload gets a thumbnail regardless of the chunking path.
+/// Image decoding and the ffmpeg video path both need the whole file, so buffer it
+/// once via a fresh reader — but only for actual media. Without the `thumbnails`
+/// feature (or for non-media) it returns the caller's `thumbnail` unchanged.
+#[allow(unused_variables)]
+fn auto_thumbnail<R, F>(
+    thumbnail: Option<(String, Vec<u8>)>,
+    mime_type: &str,
+    size: u64,
+    open: &F,
+) -> Result<Option<(String, Vec<u8>)>>
+where
+    R: std::io::Read,
+    F: Fn() -> std::io::Result<R>,
+{
+    #[cfg(feature = "thumbnails")]
+    {
+        let is_media = (mime_type.starts_with("image/") && mime_type != "image/svg+xml") || mime_type.starts_with("video/");
+        if thumbnail.is_none() && is_media {
+            let mut full = Vec::with_capacity(size as usize);
+            let mut r = open().map_err(|e| Error::Protocol(format!("open error: {e}")))?;
+            std::io::Read::read_to_end(&mut r, &mut full).map_err(|e| Error::Protocol(format!("read error: {e}")))?;
+            return Ok(crate::thumbnail::generate_thumbnail(&full, mime_type).map(|t| t.into_tuple()));
+        }
+    }
+    Ok(thumbnail)
+}
+
 /// Stream a file of `size` bytes into a writable directory, holding at most one
 /// 5 MiB chunk in memory. `open` yields a fresh reader over the same content and
 /// is called twice: once to compute the content hash tree, once to encrypt and
@@ -1241,6 +1270,7 @@ where
     }
     let tree = hashtree::HashTree::build(&chunk_hashes)?;
     let mime_type = mimetype::calculate_mime_type(&header, name);
+    let thumbnail = auto_thumbnail(thumbnail, &mime_type, size, &open)?;
 
     // Pass 2: open the directory transaction, then stream-encrypt + upload chunks.
     let mut ctx = begin_dir_write(dir_cap, entry_signer, mirror_bat, &store, mutable).await?;
@@ -3811,6 +3841,7 @@ where
     }
     let tree = hashtree::HashTree::build(&chunk_hashes)?;
     let mime_type = mimetype::calculate_mime_type(&header, name);
+    let thumbnail = auto_thumbnail(thumbnail, &mime_type, size, &open)?;
 
     let epoch = now_epoch();
     let mut props = FileProperties::new_file(name.to_string(), mime_type, size, epoch, stream_secret.clone(), thumbnail);

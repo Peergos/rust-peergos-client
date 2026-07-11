@@ -257,7 +257,8 @@ impl FileProperties {
             created_epoch: cbor.get("c").and_then(|c| c.as_long()).unwrap_or(modified_epoch),
             stream_secret: cbor.get("p").and_then(|c| c.as_bytes()).map(|b| b.to_vec()),
             thumbnail: cbor.get("i").and_then(|c| c.as_bytes()).map(|d| {
-                let mime = cbor.get("im").and_then(|c| c.as_string()).unwrap_or("image/png");
+                // Thumbnails are always WebP; default accordingly if the mime is absent.
+                let mime = cbor.get("im").and_then(|c| c.as_string()).unwrap_or("image/webp");
                 (mime.to_string(), d.to_vec())
             }),
             tree_hash: cbor.get("th").map(HashBranch::from_cbor).transpose()?,
