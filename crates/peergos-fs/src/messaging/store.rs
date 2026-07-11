@@ -13,7 +13,10 @@ use peergos_core::error::Result;
 use std::collections::BTreeSet;
 use std::sync::Mutex;
 
-#[async_trait]
+// Futures are `?Send`: the filesystem-backed store transitively awaits non-`Send`
+// boxed futures from the fs layer, and the whole crate runs on a current-thread
+// runtime (see the mock e2e tests).
+#[async_trait(?Send)]
 pub trait MessageStore: Send + Sync {
     /// All messages with index >= `index` (`getMessagesFrom`).
     async fn get_messages_from(&self, index: i64) -> Result<Vec<SignedMessage>>;
@@ -61,7 +64,7 @@ impl Default for RamMessageStore {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl MessageStore for RamMessageStore {
     async fn get_messages_from(&self, index: i64) -> Result<Vec<SignedMessage>> {
         let msgs = self.messages.lock().unwrap();

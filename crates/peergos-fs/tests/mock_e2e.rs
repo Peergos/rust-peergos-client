@@ -3662,3 +3662,59 @@ async fn clean_renamed_files_read_access() {
     assert_eq!(renamed.read().await.unwrap(), content, "Alice can read her renamed file");
 }
 
+
+// ---------------------------------------------------------------------------
+// Chat / messaging (Messenger + ChatController over the filesystem)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn chat_create_send_and_reload() {
+    use peergos_fs::messaging::{ApplicationMessage, Message, Messenger};
+    use peergos_fs::Content;
+
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = UserContext::sign_up("alice", "alicepw", None, poster, store, mutable).await.expect("sign up");
+
+    let messenger = Messenger::new(ctx);
+
+    // createChat => creates dirs, writes log/index/state/private-state, joins, adds admin.
+    let chat = messenger.create_chat().await.expect("create chat");
+    let uuid = chat.chat_uuid.clone();
+    assert!(chat.is_admin(), "creator should be an admin");
+    assert!(chat.get_member_names().contains("alice"), "creator should be a member");
+    assert!(chat.host().chat_identity.is_some(), "creator should have joined");
+
+    // Set the title, then send a text message.
+    let chat = messenger.set_group_property(&chat, "title", "Standup").await.expect("set title");
+    assert_eq!(chat.get_title(), "Standup");
+
+    let chat = messenger
+        .send_message(&chat, Message::Application(ApplicationMessage::text("hello world")))
+        .await
+        .expect("send message");
+
+    let has_recent = chat.get_recent().iter().any(|e| match &e.payload {
+        Message::Application(a) => a.body.iter().any(|c| matches!(c, Content::Text(t) if t == "hello world")),
+        _ => false,
+    });
+    assert!(has_recent, "sent message should be in recent");
+
+    // Reload the chat from disk: title, admin status and the message log persist.
+    let reloaded = messenger.get_chat(&uuid).await.expect("reload chat");
+    assert_eq!(reloaded.get_title(), "Standup");
+    assert!(reloaded.is_admin());
+    assert!(reloaded.get_member_names().contains("alice"));
+
+    let msgs = reloaded.get_messages(0, 1000).await.expect("read log");
+    let has_logged = msgs.iter().any(|e| match &e.payload {
+        Message::Application(a) => a.body.iter().any(|c| matches!(c, Content::Text(t) if t == "hello world")),
+        _ => false,
+    });
+    assert!(has_logged, "sent message should be persisted in the shared log");
+
+    // listChats finds exactly this chat.
+    let all = messenger.list_chats().await.expect("list chats");
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].chat_uuid, uuid);
+}
