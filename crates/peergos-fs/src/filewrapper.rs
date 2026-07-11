@@ -421,9 +421,33 @@ impl FileWrapper {
             .or_else(|| self.signer.clone())
             .ok_or_else(|| Error::Protocol("no writer available to modify this file".into()))?;
         let prior = self.writer_root().await;
+        // Every chunk of the file may change, and only chunk 0 lives at cap.map_key,
+        // so gather all chunk map-keys (old + new span) to drop from the cache —
+        // otherwise a later read serves a stale cached tail chunk.
+        let chunk_keys = self.rewrite_chunk_keys(content.len() as u64).await;
         crate::rewrite_file_content(&self.cap, content, &signer, self.mirror_bat.as_ref(), self.store.clone(), self.mutable.as_ref()).await?;
-        self.migrate_cache(prior, &[&self.cap.map_key]).await;
+        let refs: Vec<&[u8]> = chunk_keys.iter().map(|k| k.as_slice()).collect();
+        self.migrate_cache(prior, &refs).await;
         Ok(())
+    }
+
+    /// The map-keys of every chunk the file has before and after a rewrite to
+    /// `new_size` bytes (best-effort: falls back to just chunk 0 if metadata can't
+    /// be read).
+    async fn rewrite_chunk_keys(&self, new_size: u64) -> Vec<Vec<u8>> {
+        let chunk = crate::retrieve::CHUNK_MAX_SIZE;
+        let new_n = new_size.div_ceil(chunk).max(1);
+        match crate::retrieve_file_metadata(&self.cap, self.store.clone(), self.mutable.as_ref()).await {
+            Ok((_, props)) => {
+                let old_n = props.size.div_ceil(chunk).max(1);
+                let n = new_n.max(old_n);
+                match &props.stream_secret {
+                    Some(ss) => crate::file_chunk_map_keys(&self.cap, ss, n).unwrap_or_else(|_| vec![self.cap.map_key.clone()]),
+                    None => vec![self.cap.map_key.clone()],
+                }
+            }
+            Err(_) => vec![self.cap.map_key.clone()],
+        }
     }
 
     /// Upload a file into this directory and return its wrapper (`uploadFile`).

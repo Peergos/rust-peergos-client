@@ -529,6 +529,25 @@ fn advance_map_key(
     Ok((mk, bt))
 }
 
+/// The map-keys of a file's first `n_chunks` chunks (chunk 0 is `cap.map_key`,
+/// the rest follow the stream secret). Used to invalidate every chunk of a file in
+/// the cryptree cache after a whole-file rewrite, since only chunk 0 lives at the
+/// capability's map-key.
+pub(crate) fn file_chunk_map_keys(cap: &AbsoluteCapability, stream_secret: &[u8], n_chunks: u64) -> Result<Vec<Vec<u8>>> {
+    let mut keys = Vec::with_capacity(n_chunks as usize);
+    let mut mk = cap.map_key.clone();
+    let mut bat = cap.bat.clone();
+    for i in 0..n_chunks.max(1) {
+        if i > 0 {
+            let (nmk, nbat) = retrieve::calculate_next_map_key(stream_secret, &mk, &bat)?;
+            mk = nmk;
+            bat = nbat;
+        }
+        keys.push(mk.clone());
+    }
+    Ok(keys)
+}
+
 /// Read only the byte range `[offset, offset+length)` of a file, fetching just the
 /// chunk(s) that overlap it (plus chunk 0 for the size + stream secret) — never the
 /// whole file or all its metadata. Mirrors Java's `getInputStream(...).seek(offset)`

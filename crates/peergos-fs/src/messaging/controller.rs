@@ -19,7 +19,6 @@ use peergos_core::keys::{OwnerProof, SigningPrivateKeyAndPublicHash};
 use std::collections::BTreeSet;
 
 pub(crate) const SHARED_CHAT_STATE: &str = "peergos-chat-state.cbor";
-pub(crate) const SHARED_MSG_LOG_INDEX: &str = "peergos-chat-messages.index.bin";
 pub(crate) const PRIVATE_CHAT_STATE: &str = "private-chat-state.cbor";
 pub(crate) const MESSAGING_BASE_DIR: &str = ".messaging";
 

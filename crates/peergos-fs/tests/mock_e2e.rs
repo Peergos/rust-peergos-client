@@ -3844,3 +3844,131 @@ async fn chat_send_attachment() {
     let via_alice = bob_ctx.get_by_path(&file_ref.path).await.unwrap().expect("original reachable");
     assert_eq!(via_alice.read().await.unwrap(), media);
 }
+
+#[tokio::test]
+async fn chat_message_log_index_seeks_large_log() {
+    use peergos_fs::messaging::{
+        ApplicationMessage, FileBackedMessageStore, Id, Message, MessageEnvelope, MessageStore,
+        Messenger, SignedMessage, TreeClock,
+    };
+    use peergos_fs::Content;
+
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = UserContext::sign_up("alice", "alicepw", None, poster, store, mutable).await.expect("sign up");
+
+    // Create a chat to get the shared dir + log/index files in place.
+    let messenger = Messenger::new(ctx.clone());
+    let chat = messenger.create_chat().await.expect("create chat");
+    let uuid = chat.chat_uuid.clone();
+    let shared = format!("/alice/.messaging/{uuid}/shared");
+    let root = format!("/alice/.messaging/{uuid}");
+    let msg_store = FileBackedMessageStore::new(ctx.clone(), shared.clone(), root);
+
+    // A distinctively-tagged, ~1.2 MiB message.
+    let big_body = "x".repeat(1_200_000);
+    let make = |i: usize| -> SignedMessage {
+        let env = MessageEnvelope::new(
+            Id::creator(),
+            TreeClock::init(&[Id::creator()]),
+            i as i64,
+            Vec::new(),
+            Message::Application(ApplicationMessage::text(format!("MSG{i}:{big_body}"))),
+        );
+        SignedMessage::new(vec![7u8; 64], env)
+    };
+
+    let base = msg_store.get_messages_from(0).await.unwrap().len() as i64; // join + addAdmin
+    // Append 6 big messages (~7.2 MiB) so the log crosses the 5 MiB chunk boundary.
+    for i in 0..6 {
+        msg_store.add_messages(base + i, vec![make(i as usize)]).await.expect("append big message");
+    }
+
+    // The index file grew past its base (0,0) entry once a boundary was crossed.
+    let index_bytes = ctx
+        .get_by_path(&format!("{shared}/peergos-chat-messages.index.bin"))
+        .await
+        .unwrap()
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    assert!(index_bytes.len() > 16, "a boundary-crossing append should add an index entry (len={})", index_bytes.len());
+
+    let tag_of = |m: &SignedMessage| -> String {
+        match &m.msg.payload {
+            Message::Application(a) => match a.body.first() {
+                Some(Content::Text(t)) => t.split(':').next().unwrap_or("").to_string(),
+                _ => String::new(),
+            },
+            _ => String::new(),
+        }
+    };
+
+    // Seek to a single message in the middle via the index and check it's the right one.
+    let idx = base + 3;
+    let one = msg_store.get_messages(idx, idx + 1).await.expect("indexed read");
+    assert_eq!(one.len(), 1);
+    assert_eq!(tag_of(&one[0]), "MSG3", "index seek returned the wrong message");
+
+    // get_messages_from past the pre-existing messages returns exactly our 6, in order.
+    let ours = msg_store.get_messages_from(base).await.expect("read from base");
+    assert_eq!(ours.len(), 6);
+    for (i, m) in ours.iter().enumerate() {
+        assert_eq!(tag_of(m), format!("MSG{i}"));
+    }
+    let _ = &uuid;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-chunk file append (regression: cache coherence across chunk boundaries)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn multi_chunk_append_stays_consistent() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = UserContext::sign_up("carol", "cpw", None, poster.clone(), store.clone(), mutable.clone())
+        .await
+        .expect("sign up");
+    let home = ctx.get_home().await.unwrap();
+
+    // A >5 MiB (multi-chunk) file with a recognizable fill.
+    let first = vec![0xABu8; 7_200_000];
+    home.upload("big.bin", &first).await.unwrap();
+
+    // Warm the shared cache with the pre-append chunks, then append into the tail.
+    let f = ctx.get_by_path("/carol/big.bin").await.unwrap().unwrap();
+    assert_eq!(f.read().await.unwrap().len(), 7_200_000);
+    f.append(&vec![0xCDu8; 1_200_000]).await.unwrap();
+
+    // Read back through the SAME context: the previously-cached tail chunk must not
+    // be served stale (this is the bug the fix addresses).
+    let f = ctx.get_by_path("/carol/big.bin").await.unwrap().unwrap();
+    assert_eq!(f.size(), 8_400_000);
+    let data = f.read().await.unwrap();
+    assert_eq!(data.len(), 8_400_000, "appended bytes must not be lost");
+    assert!(data[..7_200_000].iter().all(|&b| b == 0xAB), "original region intact");
+    assert!(data[7_200_000..].iter().all(|&b| b == 0xCD), "appended region correct");
+
+    // A second append that grows the file by another whole chunk.
+    f.append(&vec![0xEFu8; 5_500_000]).await.unwrap();
+    let f = ctx.get_by_path("/carol/big.bin").await.unwrap().unwrap();
+    assert_eq!(f.size(), 13_900_000);
+    let data = f.read().await.unwrap();
+    assert_eq!(data.len(), 13_900_000);
+    assert!(data[..7_200_000].iter().all(|&b| b == 0xAB));
+    assert!(data[7_200_000..8_400_000].iter().all(|&b| b == 0xCD));
+    assert!(data[8_400_000..].iter().all(|&b| b == 0xEF));
+
+    // A ranged read straddling the 0xAB/0xCD boundary returns the right bytes.
+    let sec = f.read_section(7_100_000, 200_000).await.unwrap();
+    assert_eq!(sec.len(), 200_000);
+    assert!(sec[..100_000].iter().all(|&b| b == 0xAB));
+    assert!(sec[100_000..].iter().all(|&b| b == 0xCD));
+
+    // A fresh context (cold cache) sees the same persisted content.
+    let ctx2 = UserContext::sign_in("carol", "cpw", None, poster, store, mutable).await.unwrap();
+    let f2 = ctx2.get_by_path("/carol/big.bin").await.unwrap().unwrap();
+    assert_eq!(f2.read().await.unwrap().len(), 13_900_000);
+}

@@ -13,9 +13,9 @@
 //! directory with them. To join, they clone our state + log, append a join
 //! message, and read-share their `shared` directory back to us.
 
-use super::controller::{ChatController, MESSAGING_BASE_DIR, PRIVATE_CHAT_STATE, SHARED_CHAT_STATE, SHARED_MSG_LOG_INDEX};
+use super::controller::{ChatController, MESSAGING_BASE_DIR, PRIVATE_CHAT_STATE, SHARED_CHAT_STATE};
 use super::chat::Chat;
-use super::file_store::{FileBackedMessageStore, SHARED_MSG_LOG};
+use super::file_store::{FileBackedMessageStore, SHARED_MSG_LOG, SHARED_MSG_LOG_INDEX};
 use super::member::Member;
 use super::messages::Message;
 use super::private_state::PrivateChatState;
