@@ -9,6 +9,7 @@
 pub mod auth;
 pub mod boxing;
 pub mod buffered;
+pub mod cached;
 pub mod champ;
 pub mod champ_merge;
 pub mod direct_s3;
@@ -35,6 +36,7 @@ pub use mutable::{
     HttpMutablePointers, MultiWriterCommit, MutablePointers, PointerUpdate, SignedPointerUpdate,
 };
 pub use poster::{HttpPoster, ReqwestPoster};
+pub use cached::{CachedMutablePointers, CachedStorage};
 pub use ram::RamStorage;
 pub use storage::{
     build_cid, champ_lookup_local, get_signing_key, hash_to_cid, put_block_signed, sign_block,

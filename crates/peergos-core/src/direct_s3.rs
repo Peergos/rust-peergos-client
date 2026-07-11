@@ -287,6 +287,20 @@ impl ContentAddressedStorage for DirectS3Storage {
     async fn get_size(&self, owner: &PublicKeyHash, block: &Multihash) -> Result<Option<u64>> {
         self.fallback.get_size(owner, block).await
     }
+    /// Champ lookups (directory listing, WriterData walks) touch small cbor blocks,
+    /// so forward them to the server's bulk `champ/get/bulk` endpoint rather than
+    /// walking the tree node-by-node — otherwise the default local walk would issue
+    /// one round-trip per champ node. (The trait default is `champ_lookup_local`,
+    /// which `DirectS3Storage` must not inherit.)
+    async fn get_champ_lookup(
+        &self,
+        owner: &PublicKeyHash,
+        root: &Cid,
+        caps: &[crate::storage::ChunkMirrorCap],
+        committed_root: Option<&Cid>,
+    ) -> Result<Vec<Vec<u8>>> {
+        self.fallback.get_champ_lookup(owner, root, caps, committed_root).await
+    }
     async fn get_secret_link(&self, owner: &PublicKeyHash, label: &str) -> Result<CborObject> {
         self.fallback.get_secret_link(owner, label).await
     }
@@ -315,8 +329,11 @@ impl ContentAddressedStorage for DirectS3Storage {
                 }
             }
         }
-        // Authed S3 read (server presigns, we fetch).
-        if self.props.authed_reads {
+        // Authed S3 read (server presigns, we fetch). Only raw blocks can be read
+        // this way — the server rejects authed reads of cbor blocks — so cbor
+        // blocks (cryptree nodes, champ, WriterData) go straight to the server
+        // (`authedReads && hash.isRaw()` in DirectS3BlockStore).
+        if self.props.authed_reads && hash.is_raw() {
             let cap = BlockMirrorCap { hash: hash.clone(), bat: bat.cloned() };
             if let Ok(urls) = self.auth_reads(owner, std::slice::from_ref(&cap)).await {
                 if let Some(u) = urls.first() {
