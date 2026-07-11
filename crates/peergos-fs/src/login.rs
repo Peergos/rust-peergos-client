@@ -91,6 +91,40 @@ impl LoggedInUser {
 }
 
 impl LoggedInUser {
+    /// Serialize the whole logged-in state (identity signer, root key, boxer,
+    /// entry points, mirror BAT) so a session can be persisted and resumed without
+    /// re-running the password KDF or the login round-trips. Contains secret key
+    /// material — store it protected.
+    pub fn to_cbor(&self) -> CborObject {
+        CborObject::map()
+            .put("u", CborObject::Str(self.username.clone()))
+            .put("i", self.identity.to_cbor())
+            .put("s", self.signer.to_cbor())
+            .put("r", self.root_key.to_cbor())
+            .put_opt("b", self.boxer.as_ref().map(|b| b.to_cbor()))
+            .put("e", CborObject::List(self.entries.iter().map(|e| e.to_cbor()).collect()))
+            .put_opt("m", self.mirror_bat.as_ref().map(|b| b.to_cbor()))
+            .build()
+    }
+
+    pub fn from_cbor(cbor: &CborObject) -> Result<LoggedInUser> {
+        let get = |k: &str| cbor.get(k).ok_or_else(|| Error::Cbor(format!("LoggedInUser missing '{k}'")));
+        Ok(LoggedInUser {
+            username: get("u")?.as_string().ok_or_else(|| Error::Cbor("LoggedInUser 'u' not a string".into()))?.to_string(),
+            identity: PublicKeyHash::from_cbor(get("i")?)?,
+            signer: SigningPrivateKeyAndPublicHash::from_cbor(get("s")?)?,
+            root_key: SymmetricKey::from_cbor(get("r")?)?,
+            boxer: cbor.get("b").map(peergos_core::boxing::BoxingKeyPair::from_cbor).transpose()?,
+            entries: get("e")?
+                .as_list()
+                .ok_or_else(|| Error::Cbor("LoggedInUser 'e' not a list".into()))?
+                .iter()
+                .map(EntryPoint::from_cbor)
+                .collect::<Result<Vec<_>>>()?,
+            mirror_bat: cbor.get("m").map(peergos_core::auth::BatWithId::from_cbor).transpose()?,
+        })
+    }
+
     /// The capability to the user's own home directory (`/username`).
     pub fn home(&self) -> Option<&AbsoluteCapability> {
         self.entries

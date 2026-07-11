@@ -4,6 +4,12 @@
 //! remote working directory + a local working directory.
 //!
 //!   cargo run -p peergos-cli -- [--server URL] [--username NAME]
+//!                               [--stay-logged-in] [--fresh] [--logout]
+//!
+//! `--stay-logged-in` saves the session (server + derived keys) to
+//! `~/.peergos-shell/session.cbor` (mode 0600); later runs then resume it
+//! automatically — no password, no KDF, no login round-trips. `--fresh` ignores a
+//! saved session, `--logout` deletes it.
 
 use peergos_core::mutable::{HttpMutablePointers, MutablePointers};
 use peergos_core::{ContentAddressedStorage, DirectS3Storage, HttpPoster, HttpStorage, ReqwestPoster};
@@ -27,62 +33,81 @@ struct Shell {
 
 #[tokio::main]
 async fn main() -> Result<(), BoxErr> {
-    let mut server = arg_value("--server");
-    let mut username = arg_value("--username");
+    let session_path = session_file_path();
 
-    let server = match server.take() {
-        Some(s) => s,
-        None => prompt("Enter server address [https://peergos.net] > ")?,
-    };
-    let server = if server.trim().is_empty() { "https://peergos.net".to_string() } else { server.trim().to_string() };
-    let server = if server.starts_with("http") { server } else { format!("https://{server}") };
+    // `--logout` clears any saved session and exits.
+    if has_flag("--logout") {
+        if session_path.exists() {
+            let _ = std::fs::remove_file(&session_path);
+        }
+        println!("Logged out (session cleared).");
+        return Ok(());
+    }
 
-    let username = match username.take() {
-        Some(u) => u,
-        None => prompt("Enter username > ")?,
-    };
-    let username = username.trim().to_string();
-    let password = read_password("Enter password > ")?;
+    let server_arg = arg_value("--server").map(|s| normalize_server(&s));
+    let username_arg = arg_value("--username");
+    let stay = has_flag("--stay-logged-in");
+    let fresh = has_flag("--fresh");
 
-    let poster: Arc<dyn HttpPoster> = Arc::new(ReqwestPoster::new(&server, false)?);
-    let mutable: Arc<dyn MutablePointers> = Arc::new(HttpMutablePointers::new(Arc::new(ReqwestPoster::new(&server, false)?)));
-    let http_store: Arc<dyn ContentAddressedStorage> = Arc::new(HttpStorage::new(Arc::new(ReqwestPoster::new(&server, false)?), true));
+    let mut shell: Option<Shell> = None;
 
-    // Whether we read/write large blocks directly to S3 is decided by the server's
-    // advertised blockstore properties: wrap in DirectS3Storage only if the server
-    // says it's S3-backed; otherwise talk to the server directly.
-    let props = DirectS3Storage::fetch_properties(poster.as_ref()).await.unwrap_or_default();
-    let store: Arc<dyn ContentAddressedStorage> = if props.use_direct_block_store() {
-        let s3_server: Arc<dyn HttpPoster> = Arc::new(ReqwestPoster::new(&server, false)?);
-        let s3_direct: Arc<dyn HttpPoster> = Arc::new(ReqwestPoster::new(&server, true)?);
-        Arc::new(DirectS3Storage::with_properties(props, s3_server, s3_direct, http_store))
-    } else {
-        http_store
-    };
+    // 1. Try to resume a saved session (unless --fresh), skipping password + KDF.
+    if !fresh {
+        if let Some((srv, user)) = load_session(&session_path) {
+            let server_ok = server_arg.as_ref().map_or(true, |s| *s == srv);
+            let user_ok = username_arg.as_ref().map_or(true, |u| *u == user.username);
+            if server_ok && user_ok {
+                let username = user.username.clone();
+                let (poster, store, mutable) = build_transport(&srv).await?;
+                let ctx = UserContext::from_session(user, poster, store, mutable).with_session_caches();
+                if ctx.get_home().await.is_ok() {
+                    println!("Resumed session as {username} on {srv}.");
+                    shell = Some(make_shell(ctx, username, srv));
+                } else {
+                    eprintln!("Saved session is no longer valid; logging in again.");
+                    let _ = std::fs::remove_file(&session_path);
+                }
+            }
+        }
+    }
 
-    // A TOTP prompt for second-factor accounts. `sign_in` only invokes this if the
-    // server actually requests a second factor, so it's harmless for non-MFA logins.
-    let responder = |req: &MultiFactorAuthRequest| -> peergos_core::error::Result<MultiFactorAuthResponse> {
-        let method = req.totp_method().ok_or_else(|| {
-            peergos_core::error::Error::Protocol("this account needs a second factor the shell can't handle (only TOTP is supported)".into())
-        })?;
-        let code = prompt("Two-factor code (TOTP) > ")
-            .map_err(|e| peergos_core::error::Error::Protocol(format!("failed to read TOTP code: {e}")))?;
-        Ok(MultiFactorAuthResponse::new_totp(method.credential_id.clone(), code.trim().to_string()))
-    };
-    // Single-user interactive session: enable the client-side pointer + block caches.
-    let ctx = UserContext::sign_in(&username, &password, Some(&responder), poster, store, mutable)
-        .await?
-        .with_session_caches();
-    println!("Connected to {server} as {username}.\nType 'help' for commands, 'exit' to quit.");
+    // 2. Otherwise, a full login (and save the session if --stay-logged-in).
+    if shell.is_none() {
+        let server = match server_arg {
+            Some(s) => s,
+            None => normalize_server(&prompt("Enter server address [https://peergos.net] > ")?),
+        };
+        let username = match username_arg {
+            Some(u) => u,
+            None => prompt("Enter username > ")?.trim().to_string(),
+        };
+        let password = read_password("Enter password > ")?;
+        let (poster, store, mutable) = build_transport(&server).await?;
 
-    let mut shell = Shell {
-        ctx,
-        username: username.clone(),
-        server,
-        pwd: format!("/{username}"),
-        lpwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    };
+        // A TOTP prompt for second-factor accounts (only invoked if the server asks).
+        let responder = |req: &MultiFactorAuthRequest| -> peergos_core::error::Result<MultiFactorAuthResponse> {
+            let method = req.totp_method().ok_or_else(|| {
+                peergos_core::error::Error::Protocol("this account needs a second factor the shell can't handle (only TOTP is supported)".into())
+            })?;
+            let code = prompt("Two-factor code (TOTP) > ")
+                .map_err(|e| peergos_core::error::Error::Protocol(format!("failed to read TOTP code: {e}")))?;
+            Ok(MultiFactorAuthResponse::new_totp(method.credential_id.clone(), code.trim().to_string()))
+        };
+        let ctx = UserContext::sign_in(&username, &password, Some(&responder), poster, store, mutable)
+            .await?
+            .with_session_caches();
+        if stay {
+            match save_session(&session_path, &server, ctx.user().expect("logged in")) {
+                Ok(()) => println!("Session saved to {} — future runs will resume automatically.", session_path.display()),
+                Err(e) => eprintln!("warning: could not save session: {e}"),
+            }
+        }
+        println!("Connected to {server} as {username}.");
+        shell = Some(make_shell(ctx, username, server));
+    }
+
+    let mut shell = shell.expect("connected");
+    println!("Type 'help' for commands, 'exit' to quit.");
 
     loop {
         let line = prompt(&format!("{}@{} > ", shell.username, shell.server))?;
@@ -426,6 +451,78 @@ fn split_flags(args: &[String]) -> (Vec<String>, Vec<String>) {
 fn arg_value(name: &str) -> Option<String> {
     let args: Vec<String> = std::env::args().collect();
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
+}
+
+fn has_flag(name: &str) -> bool {
+    std::env::args().any(|a| a == name)
+}
+
+fn normalize_server(s: &str) -> String {
+    let s = s.trim();
+    let s = if s.is_empty() { "https://peergos.net" } else { s };
+    if s.starts_with("http") { s.to_string() } else { format!("https://{s}") }
+}
+
+fn make_shell(ctx: UserContext, username: String, server: String) -> Shell {
+    Shell {
+        pwd: format!("/{username}"),
+        lpwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        ctx,
+        username,
+        server,
+    }
+}
+
+/// Build the poster + (props-driven direct-S3) store + mutable pointers for a server.
+async fn build_transport(
+    server: &str,
+) -> Result<(Arc<dyn HttpPoster>, Arc<dyn ContentAddressedStorage>, Arc<dyn MutablePointers>), BoxErr> {
+    let poster: Arc<dyn HttpPoster> = Arc::new(ReqwestPoster::new(server, false)?);
+    let mutable: Arc<dyn MutablePointers> = Arc::new(HttpMutablePointers::new(Arc::new(ReqwestPoster::new(server, false)?)));
+    let http_store: Arc<dyn ContentAddressedStorage> = Arc::new(HttpStorage::new(Arc::new(ReqwestPoster::new(server, false)?), true));
+    let props = DirectS3Storage::fetch_properties(poster.as_ref()).await.unwrap_or_default();
+    let store: Arc<dyn ContentAddressedStorage> = if props.use_direct_block_store() {
+        let s3_server: Arc<dyn HttpPoster> = Arc::new(ReqwestPoster::new(server, false)?);
+        let s3_direct: Arc<dyn HttpPoster> = Arc::new(ReqwestPoster::new(server, true)?);
+        Arc::new(DirectS3Storage::with_properties(props, s3_server, s3_direct, http_store))
+    } else {
+        http_store
+    };
+    Ok((poster, store, mutable))
+}
+
+// ---- persisted session ("stay logged in") ----------------------------------
+
+fn session_file_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".peergos-shell").join("session.cbor")
+}
+
+/// Load a saved `(server, session)` from disk, if present and parseable.
+fn load_session(path: &Path) -> Option<(String, peergos_fs::LoggedInUser)> {
+    let bytes = std::fs::read(path).ok()?;
+    let cbor = peergos_cbor::CborObject::from_bytes(&bytes).ok()?;
+    let server = cbor.get("s")?.as_string()?.to_string();
+    let user = peergos_fs::LoggedInUser::from_cbor(cbor.get("u")?).ok()?;
+    Some((server, user))
+}
+
+/// Save the current session (contains secret keys) to a private (0600) file.
+fn save_session(path: &Path, server: &str, user: &peergos_fs::LoggedInUser) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let cbor = peergos_cbor::CborObject::map()
+        .put("s", peergos_cbor::CborObject::Str(server.to_string()))
+        .put("u", user.to_cbor())
+        .build();
+    std::fs::write(path, cbor.to_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 fn prompt(msg: &str) -> io::Result<String> {

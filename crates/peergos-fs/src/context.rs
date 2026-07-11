@@ -232,6 +232,19 @@ impl UserContext {
         Ok(UserContext { user: None, link_caps: vec![cap], store, mutable, poster, cache: CryptreeCache::new() })
     }
 
+    /// Rebuild a context from a previously-saved [`LoggedInUser`] session, skipping
+    /// the password KDF and login round-trips entirely (`stay logged in`). The
+    /// caller is responsible for having obtained the session securely; the entry
+    /// points may be slightly stale (e.g. a friend added since it was saved).
+    pub fn from_session(
+        user: LoggedInUser,
+        poster: Arc<dyn HttpPoster>,
+        store: Arc<dyn ContentAddressedStorage>,
+        mutable: Arc<dyn MutablePointers>,
+    ) -> UserContext {
+        UserContext { user: Some(user), link_caps: Vec::new(), store, mutable, poster, cache: CryptreeCache::new() }
+    }
+
     // ---- accessors ---------------------------------------------------------
 
     /// The signed-in username, if this is a full login.
