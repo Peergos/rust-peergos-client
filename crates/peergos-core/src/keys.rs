@@ -178,6 +178,64 @@ impl Cborable for SigningPrivateKeyAndPublicHash {
     }
 }
 
+/// `OwnerProof` — a signature by an owned key over its owner's key hash, proving
+/// that `owner` controls `ownedKey`. Stored inline in the owner's owned-key champ
+/// and in chat `Join` messages / `Member`s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerProof {
+    pub owned_key: PublicKeyHash,
+    pub signed_owner: Vec<u8>,
+}
+
+impl OwnerProof {
+    pub fn new(owned_key: PublicKeyHash, signed_owner: Vec<u8>) -> OwnerProof {
+        OwnerProof { owned_key, signed_owner }
+    }
+
+    /// `OwnerProof.build` — sign the owner's serialized key hash with the owned
+    /// key's secret.
+    pub fn build(owned_keypair: &SigningPrivateKeyAndPublicHash, owner: &PublicKeyHash) -> Result<OwnerProof> {
+        let signed = owned_keypair.secret.sign_message(&owner.to_cbor().to_bytes())?;
+        Ok(OwnerProof::new(owned_keypair.public_key_hash.clone(), signed))
+    }
+
+    /// `OwnerProof.getAndVerifyOwner` — retrieve the owned public signing key,
+    /// verify the signature and return the claimed owner key hash.
+    pub async fn get_and_verify_owner(
+        &self,
+        owner: &PublicKeyHash,
+        store: &dyn crate::storage::ContentAddressedStorage,
+    ) -> Result<PublicKeyHash> {
+        let signer = crate::storage::get_signing_key(store, owner, &self.owned_key)
+            .await?
+            .ok_or_else(|| Error::Protocol(format!("Couldn't retrieve owned key: {}", self.owned_key)))?;
+        let unsigned = signer.unsign_message(&self.signed_owner)?;
+        PublicKeyHash::from_cbor(&CborObject::from_bytes_prefix(&unsigned)?)
+    }
+
+    pub fn from_cbor(cbor: &CborObject) -> Result<OwnerProof> {
+        let owned = cbor
+            .get("o")
+            .ok_or_else(|| Error::Cbor("OwnerProof missing 'o'".into()))
+            .and_then(PublicKeyHash::from_cbor)?;
+        let signed = cbor
+            .get("p")
+            .and_then(|c| c.as_bytes())
+            .ok_or_else(|| Error::Cbor("OwnerProof missing 'p'".into()))?
+            .to_vec();
+        Ok(OwnerProof::new(owned, signed))
+    }
+}
+
+impl Cborable for OwnerProof {
+    fn to_cbor(&self) -> CborObject {
+        CborObject::map()
+            .put("o", self.owned_key.to_cbor())
+            .put("p", CborObject::ByteString(self.signed_owner.clone()))
+            .build()
+    }
+}
+
 /// A signing keypair, mirroring `SigningKeyPair` (public key + its hash + secret).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SigningKeyPair {
@@ -186,6 +244,13 @@ pub struct SigningKeyPair {
 }
 
 impl SigningKeyPair {
+    /// A fresh random Ed25519 keypair (`SigningKeyPair.random`).
+    pub fn random() -> Result<SigningKeyPair> {
+        let (_public, secret64) = peergos_crypto::sign::keypair_from_seed(&peergos_crypto::random_bytes(32))
+            .map_err(|e| Error::Crypto(e.to_string()))?;
+        SigningKeyPair::from_secret(secret64.to_vec())
+    }
+
     /// Build from a NaCl 64-byte secret key (`seed || public`).
     pub fn from_secret(secret_key: Vec<u8>) -> Result<SigningKeyPair> {
         let public = sign::public_from_secret(&secret_key)?;

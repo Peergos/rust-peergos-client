@@ -3552,3 +3552,113 @@ async fn friendship_restoration() {
     assert!(bob.social_state().await.unwrap().friends.iter().any(|e| e.owner_name == "alice-apw"), "Bob is friends with Alice after restoration");
 }
 
+/// Java `MultiUserTests.friendDeletesAccount`
+#[tokio::test]
+async fn friend_deletes_account() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    alice.delete_account().await.unwrap();
+
+    // Bob can still log in after Alice deletes her account
+    login("bob", "bpw", &poster, &store, &mutable).await;
+}
+
+/// Java `MultiUserTests.cleanRenamedFilesReadAccess` (without low-level crypto checks)
+#[tokio::test]
+async fn clean_renamed_files_read_access() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw"), ("charlie", "cpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+    befriend(("alice", "apw"), ("charlie", "cpw"), &poster, &store, &mutable).await;
+
+    let content = b"Hello Peergos friend!";
+
+    // Alice uploads a file
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let alice_user = alice.user().unwrap();
+    let home_cap = alice_user.home().unwrap().clone();
+    let s = peergos_fs::recover_signer(&home_cap, store.clone(), mutable.as_ref()).await.unwrap();
+    let file_cap = peergos_fs::upload_file(&home_cap, "somefile.txt", content, None, Some(s.clone()), None, store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Share read access with Bob and Charlie
+    peergos_fs::share_read_access(alice_user, "somefile.txt", &file_cap, "bob", store.clone(), mutable.as_ref()).await.unwrap();
+    peergos_fs::share_read_access(alice_user, "somefile.txt", &file_cap, "charlie", store.clone(), mutable.as_ref()).await.unwrap();
+    drop(alice);
+
+    // Bob and Charlie can both read the file
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+    let bob_friend = peergos_fs::get_friends(bob.user().unwrap(), store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.owner_name == "alice").unwrap();
+    let bob_caps = peergos_fs::read_shared_capabilities(&bob_friend.pointer, store.clone(), mutable.as_ref()).await.unwrap();
+    let mut bob_can_read = false;
+    for c in &bob_caps {
+        if let Ok((_, d)) = peergos_fs::read_file(c, store.clone(), mutable.as_ref()).await {
+            if d == content { bob_can_read = true; }
+        }
+    }
+    assert!(bob_can_read, "Bob can read shared file");
+
+    let charlie = login("charlie", "cpw", &poster, &store, &mutable).await;
+    let charlie_friend = peergos_fs::get_friends(charlie.user().unwrap(), store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.owner_name == "alice").unwrap();
+    let charlie_caps = peergos_fs::read_shared_capabilities(&charlie_friend.pointer, store.clone(), mutable.as_ref()).await.unwrap();
+    let mut charlie_can_read = false;
+    for c in &charlie_caps {
+        if let Ok((_, d)) = peergos_fs::read_file(c, store.clone(), mutable.as_ref()).await {
+            if d == content { charlie_can_read = true; }
+        }
+    }
+    assert!(charlie_can_read, "Charlie can read shared file");
+
+    // Unshare with Bob
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let alice_user = alice.user().unwrap();
+    let home_cap = alice_user.home().unwrap().clone();
+    peergos_fs::unshare_read_access(alice_user, "", &home_cap, "somefile.txt", &["bob".to_string()], store.clone(), mutable.as_ref()).await.unwrap();
+
+    // Rename the file
+    let home_fw = alice.get_home().await.unwrap();
+    home_fw.rename_child("somefile.txt", "newname.txt").await.unwrap();
+    drop(alice);
+
+    // Bob (unshared) can't find the file through shared caps
+    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
+    let bob_friend = peergos_fs::get_friends(bob.user().unwrap(), store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.owner_name == "alice").unwrap();
+    let bob_caps = peergos_fs::read_shared_capabilities(&bob_friend.pointer, store.clone(), mutable.as_ref()).await.unwrap();
+    let mut bob_can_read = false;
+    for c in &bob_caps {
+        if peergos_fs::read_file(c, store.clone(), mutable.as_ref()).await.is_ok() {
+            bob_can_read = true;
+        }
+    }
+    assert!(!bob_can_read, "Bob can't read any caps after unshare");
+
+    // Charlie (still shared) can read the renamed file through shared caps
+    let charlie = login("charlie", "cpw", &poster, &store, &mutable).await;
+    let charlie_friend = peergos_fs::get_friends(charlie.user().unwrap(), store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.owner_name == "alice").unwrap();
+    let charlie_caps = peergos_fs::read_shared_capabilities(&charlie_friend.pointer, store.clone(), mutable.as_ref()).await.unwrap();
+    let mut charlie_can_read = false;
+    for c in &charlie_caps {
+        if let Ok((_, d)) = peergos_fs::read_file(c, store.clone(), mutable.as_ref()).await {
+            if d == content { charlie_can_read = true; }
+        }
+    }
+    assert!(charlie_can_read, "Charlie can still read the renamed file");
+
+    // Alice can still access and read the renamed file
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let renamed = alice.get_by_path("newname.txt").await.unwrap().unwrap();
+    assert_eq!(renamed.read().await.unwrap(), content, "Alice can read her renamed file");
+}
+

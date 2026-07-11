@@ -28,7 +28,7 @@ pub use direct_s3::{hash_to_key, BlockStoreProperties, DirectS3Storage, Presigne
 pub use symmetric::{CipherText, SymmetricKey};
 pub use error::{Error, Result};
 pub use keys::{
-    PublicKeyHash, PublicSigningKey, SecretSigningKey, SigningKeyPair,
+    OwnerProof, PublicKeyHash, PublicSigningKey, SecretSigningKey, SigningKeyPair,
     SigningPrivateKeyAndPublicHash,
 };
 pub use mutable::{

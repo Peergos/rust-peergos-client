@@ -15,6 +15,7 @@ pub mod filewrapper;
 pub mod hashtree;
 pub mod incoming;
 pub mod login;
+pub mod messaging;
 pub mod mfa;
 pub mod mimetype;
 pub mod profile;
