@@ -3718,3 +3718,68 @@ async fn chat_create_send_and_reload() {
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].chat_uuid, uuid);
 }
+
+#[tokio::test]
+async fn chat_between_two_users() {
+    use peergos_fs::messaging::{ApplicationMessage, Message, Messenger};
+    use peergos_fs::Content;
+
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.expect("sign up");
+    }
+    // Mutual friendship so each can read the other's shared chat directory.
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+
+    let text_in = |c: &peergos_fs::messaging::ChatController, want: &str| -> bool {
+        c.get_recent().iter().any(|e| match &e.payload {
+            Message::Application(a) => a.body.iter().any(|x| matches!(x, Content::Text(t) if t == want)),
+            _ => false,
+        })
+    };
+
+    // --- Alice creates a chat and invites Bob -----------------------------
+    let alice_ctx = UserContext::sign_in("alice", "apw", None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    let alice_m = Messenger::new(alice_ctx.clone());
+    let chat = alice_m.create_chat().await.expect("create chat");
+    let uuid = chat.chat_uuid.clone();
+
+    let (bob_identity, _) = peergos_fs::get_public_keys(poster.as_ref(), store.as_ref(), mutable.as_ref(), "bob").await.unwrap();
+    let chat = alice_m.invite(&chat, vec!["bob".to_string()], vec![bob_identity]).await.expect("invite bob");
+    assert!(chat.get_pending_member_names().contains("bob"), "bob should be pending before he joins");
+
+    // --- Bob finds the shared chat dir and joins --------------------------
+    let bob_ctx = UserContext::sign_in("bob", "bpw", None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    let bob_m = Messenger::new(bob_ctx.clone());
+    let source = bob_ctx
+        .get_by_path(&format!("/alice/.messaging/{uuid}/shared"))
+        .await
+        .expect("resolve alice's shared chat dir")
+        .expect("alice's shared chat dir is reachable");
+    let bob_chat = bob_m.clone_locally_and_join(&source).await.expect("clone + join");
+    assert!(bob_chat.host().chat_identity.is_some(), "bob should have joined his own copy");
+    assert!(bob_chat.get_member_names().contains("alice"));
+
+    // --- Alice merges Bob's mirror: she should see he joined --------------
+    let chat = alice_m.merge_messages(&chat, "bob").await.expect("alice merges bob");
+    assert!(
+        chat.get_member("bob").expect("bob known").chat_identity.is_some(),
+        "alice should see bob's chat identity after merging"
+    );
+    assert!(!chat.get_pending_member_names().contains("bob"), "bob is no longer pending");
+
+    // --- Alice sends a message; Bob merges and sees it --------------------
+    let chat = alice_m.send_message(&chat, Message::Application(ApplicationMessage::text("hello bob"))).await.unwrap();
+    let bob_chat = bob_m.merge_messages(&bob_chat, "alice").await.expect("bob merges alice");
+    assert!(text_in(&bob_chat, "hello bob"), "bob should receive alice's message");
+
+    // --- Bob replies; Alice merges and sees it ---------------------------
+    let bob_chat = bob_m.send_message(&bob_chat, Message::Application(ApplicationMessage::text("hi alice"))).await.unwrap();
+    let chat = alice_m.merge_messages(&chat, "bob").await.expect("alice merges bob again");
+    assert!(text_in(&chat, "hi alice"), "alice should receive bob's reply");
+
+    // Both agree on the membership.
+    assert!(chat.get_member_names().contains("bob") && bob_chat.get_member_names().contains("alice"));
+    let _ = &uuid;
+}

@@ -318,9 +318,15 @@ impl UserContext {
     }
 
     /// Resolve a path (`UserContext.getByPath`). Accepts an absolute path whose
-    /// first component names a root (`/username/a/b`, `/friend/shared/...`) or, for
-    /// a logged-in user, a path relative to home (`a/b`). For a secret-link context
-    /// a bare path is resolved relative to the shared root.
+    /// first component names a root (`/username/a/b`), a path into a directory a
+    /// friend has shared with us (`/friend/.../shared/...`), or — for a logged-in
+    /// user — a path relative to home (`a/b`). For a secret-link context a bare path
+    /// is resolved relative to the shared root.
+    ///
+    /// Friend paths are resolved the way Java's entry-point trie does: the
+    /// capabilities friends have shared with us carry their absolute path, so a
+    /// query is matched against the deepest such capability that is an ancestor of
+    /// it, and the remainder is navigated through the real filesystem.
     pub async fn get_by_path(&self, path: &str) -> Result<Option<FileWrapper>> {
         let comps: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
         let roots = self.roots().await?;
@@ -335,17 +341,91 @@ impl UserContext {
 
         // First component names a root?
         if let Some(root) = roots.iter().find(|r| r.name() == comps[0]) {
-            return root.get_by_path(&comps[1..].join("/")).await;
+            if let Some(found) = root.get_by_path(&comps[1..].join("/")).await? {
+                return Ok(Some(found));
+            }
         }
-        // Logged-in user: treat as relative to home.
         if self.user.is_some() {
-            return self.get_home().await?.get_by_path(&comps.join("/")).await;
+            // A logged-in user: try relative to home, then fall back to a directory
+            // a friend has shared with us (their absolute path).
+            if let Some(found) = self.get_home().await?.get_by_path(&comps.join("/")).await? {
+                return Ok(Some(found));
+            }
+            if let Some(found) = self.resolve_shared_with_us(&comps).await? {
+                return Ok(Some(found));
+            }
+            return Ok(None);
         }
         // Single secret-link root: treat as relative to it.
         if roots.len() == 1 {
             return roots.into_iter().next().unwrap().get_by_path(&comps.join("/")).await;
         }
         Ok(None)
+    }
+
+    /// Resolve a path into a directory a friend has shared with us. The first
+    /// component names the friend; among the capabilities they've shared, pick the
+    /// deepest whose path is an ancestor of (or equal to) the query and navigate the
+    /// remaining components from there.
+    async fn resolve_shared_with_us(&self, comps: &[&str]) -> Result<Option<FileWrapper>> {
+        let user = match &self.user {
+            Some(u) => u,
+            None => return Ok(None),
+        };
+        let owner = comps[0];
+        if Some(owner) == self.username() {
+            return Ok(None);
+        }
+        let friend = match crate::get_friends(user, self.store.clone(), self.mutable.as_ref())
+            .await?
+            .into_iter()
+            .find(|e| e.owner_name == owner)
+        {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+
+        // All capabilities this friend has shared with us, each with its path.
+        let mut shared = crate::load_read_access_sharing_links(&friend.pointer, 0, self.store.clone(), self.mutable.as_ref())
+            .await?
+            .capabilities;
+        shared.extend(
+            crate::load_write_access_sharing_links(&friend.pointer, 0, self.store.clone(), self.mutable.as_ref())
+                .await?
+                .capabilities,
+        );
+
+        // Find the deepest shared cap whose path is an ancestor of the query.
+        let mut best: Option<(usize, AbsoluteCapability, String)> = None;
+        for cwp in &shared {
+            let cap_comps: Vec<&str> = cwp.path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+            if cap_comps.len() <= comps.len() && cap_comps[..] == comps[..cap_comps.len()] {
+                let deeper = best.as_ref().map(|(n, _, _)| cap_comps.len() > *n).unwrap_or(true);
+                if deeper {
+                    let name = cap_comps.last().copied().unwrap_or(owner).to_string();
+                    best = Some((cap_comps.len(), cwp.cap.clone(), name));
+                }
+            }
+        }
+        let (matched, cap, name) = match best {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+
+        let home_cap = user.home().cloned();
+        let dir = FileWrapper::from_cap(
+            cap,
+            name,
+            comps[..matched].join("/"),
+            None,
+            home_cap,
+            self.store.clone(),
+            self.mutable.clone(),
+        )
+        .await?
+        .with_cache(self.cache.clone())
+        .with_mirror_bat(self.mirror_bat_id());
+        dir.get_by_path(&comps[matched..].join("/")).await
     }
 
     /// The user's mirror BAT (`getMirrorBat`), fetched from the server's bats
