@@ -8,6 +8,7 @@ members = [
     "crates/peergos-fs",
     "crates/peergos-sync",
     "crates/peergos-mock-server",
+    "crates/peergos-cli",
 ]
 
 [workspace.package]

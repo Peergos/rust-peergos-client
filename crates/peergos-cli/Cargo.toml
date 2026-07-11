@@ -1,0 +1,15 @@
+[package]
+name = "peergos-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "peergos-shell"
+path = "src/main.rs"
+
+[dependencies]
+peergos-fs = { workspace = true }
+peergos-core = { workspace = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
