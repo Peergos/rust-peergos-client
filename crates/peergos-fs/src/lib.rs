@@ -10,6 +10,7 @@ pub mod cache;
 pub mod capability;
 pub mod context;
 pub mod cryptree;
+pub mod email;
 pub mod feed;
 pub mod filewrapper;
 pub mod hashtree;

@@ -77,8 +77,10 @@ const TTF: &[u8] = &[0, 1, 0, 0];
 
 const CBOR_PEERGOS_POST: &[u8] = &[0x82, 17];
 const CBOR_PEERGOS_IDENTITY_PROOF: &[u8] = &[0x82, 0x18, 24];
+const CBOR_PEERGOS_EMAIL: &[u8] = &[0x82, 0x18, 18];
 pub const PEERGOS_POST: &str = "application/vnd.peergos-post";
 pub const PEERGOS_IDENTITY: &str = "application/vnd.peergos-identity-proof";
+pub const PEERGOS_EMAIL: &str = "application/vnd.peergos-email";
 
 /// `MimeTypes.equalArrays(a, offset, target)`.
 fn matches(a: &[u8], offset: usize, target: &[u8]) -> bool {
@@ -296,6 +298,9 @@ pub fn calculate_mime_type(start: &[u8], filename: &str) -> String {
     }
     if matches0(start, CBOR_PEERGOS_IDENTITY_PROOF) {
         return s(PEERGOS_IDENTITY);
+    }
+    if matches0(start, CBOR_PEERGOS_EMAIL) {
+        return s(PEERGOS_EMAIL);
     }
 
     if valid_utf8(start) {
