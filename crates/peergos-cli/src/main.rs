@@ -7,7 +7,7 @@
 
 use peergos_core::mutable::{HttpMutablePointers, MutablePointers};
 use peergos_core::{ContentAddressedStorage, DirectS3Storage, HttpPoster, HttpStorage, ReqwestPoster};
-use peergos_fs::{FileWrapper, UserContext};
+use peergos_fs::{FileWrapper, MultiFactorAuthRequest, MultiFactorAuthResponse, UserContext};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcCommand;
@@ -44,15 +44,33 @@ async fn main() -> Result<(), BoxErr> {
     let username = username.trim().to_string();
     let password = read_password("Enter password > ")?;
 
-    // A DirectS3-backed store, so large files stream to/from S3 when available.
-    let s3_server: Arc<dyn HttpPoster> = Arc::new(ReqwestPoster::new(&server, false)?);
-    let s3_direct: Arc<dyn HttpPoster> = Arc::new(ReqwestPoster::new(&server, true)?);
-    let fallback: Arc<dyn ContentAddressedStorage> = Arc::new(HttpStorage::new(Arc::new(ReqwestPoster::new(&server, false)?), true));
-    let store: Arc<dyn ContentAddressedStorage> = Arc::new(DirectS3Storage::build(s3_server, s3_direct, fallback).await);
     let poster: Arc<dyn HttpPoster> = Arc::new(ReqwestPoster::new(&server, false)?);
     let mutable: Arc<dyn MutablePointers> = Arc::new(HttpMutablePointers::new(Arc::new(ReqwestPoster::new(&server, false)?)));
+    let http_store: Arc<dyn ContentAddressedStorage> = Arc::new(HttpStorage::new(Arc::new(ReqwestPoster::new(&server, false)?), true));
 
-    let ctx = UserContext::sign_in(&username, &password, None, poster, store, mutable).await?;
+    // Whether we read/write large blocks directly to S3 is decided by the server's
+    // advertised blockstore properties: wrap in DirectS3Storage only if the server
+    // says it's S3-backed; otherwise talk to the server directly.
+    let props = DirectS3Storage::fetch_properties(poster.as_ref()).await.unwrap_or_default();
+    let store: Arc<dyn ContentAddressedStorage> = if props.use_direct_block_store() {
+        let s3_server: Arc<dyn HttpPoster> = Arc::new(ReqwestPoster::new(&server, false)?);
+        let s3_direct: Arc<dyn HttpPoster> = Arc::new(ReqwestPoster::new(&server, true)?);
+        Arc::new(DirectS3Storage::with_properties(props, s3_server, s3_direct, http_store))
+    } else {
+        http_store
+    };
+
+    // A TOTP prompt for second-factor accounts. `sign_in` only invokes this if the
+    // server actually requests a second factor, so it's harmless for non-MFA logins.
+    let responder = |req: &MultiFactorAuthRequest| -> peergos_core::error::Result<MultiFactorAuthResponse> {
+        let method = req.totp_method().ok_or_else(|| {
+            peergos_core::error::Error::Protocol("this account needs a second factor the shell can't handle (only TOTP is supported)".into())
+        })?;
+        let code = prompt("Two-factor code (TOTP) > ")
+            .map_err(|e| peergos_core::error::Error::Protocol(format!("failed to read TOTP code: {e}")))?;
+        Ok(MultiFactorAuthResponse::new_totp(method.credential_id.clone(), code.trim().to_string()))
+    };
+    let ctx = UserContext::sign_in(&username, &password, Some(&responder), poster, store, mutable).await?;
     println!("Connected to {server} as {username}.\nType 'help' for commands, 'exit' to quit.");
 
     let mut shell = Shell {
