@@ -264,6 +264,21 @@ impl UserContext {
         self.poster.clone()
     }
 
+    /// Wrap this context's storage + mutable-pointer layers in the client-side
+    /// caches — a small in-RAM cbor block cache and a pointer cache (7s TTL,
+    /// invalidated on writes) — and return the cached context.
+    ///
+    /// Intended for a **single-user interactive session** (a CLI, a desktop app):
+    /// it cuts the redundant round-trips a single operation makes re-resolving the
+    /// same writer pointer + `WriterData`. Do **not** use it in a process that
+    /// drives several users against one server — the pointer TTL would hide another
+    /// user's concurrent writes for up to 7 seconds.
+    pub fn with_session_caches(mut self) -> UserContext {
+        self.mutable = Arc::new(peergos_core::CachedMutablePointers::new(self.mutable.clone()));
+        self.store = Arc::new(peergos_core::CachedStorage::new(self.store.clone()));
+        self
+    }
+
     // ---- filesystem --------------------------------------------------------
 
     /// The user's home directory as a [`FileWrapper`] (errors on a secret-link

@@ -45,25 +45,20 @@ async fn main() -> Result<(), BoxErr> {
     let password = read_password("Enter password > ")?;
 
     let poster: Arc<dyn HttpPoster> = Arc::new(ReqwestPoster::new(&server, false)?);
-    // Cache pointer lookups (7s TTL, invalidated on writes) so a single command
-    // doesn't re-resolve the same writer pointer many times.
-    let http_mutable: Arc<dyn MutablePointers> = Arc::new(HttpMutablePointers::new(Arc::new(ReqwestPoster::new(&server, false)?)));
-    let mutable: Arc<dyn MutablePointers> = Arc::new(peergos_core::CachedMutablePointers::new(http_mutable));
+    let mutable: Arc<dyn MutablePointers> = Arc::new(HttpMutablePointers::new(Arc::new(ReqwestPoster::new(&server, false)?)));
     let http_store: Arc<dyn ContentAddressedStorage> = Arc::new(HttpStorage::new(Arc::new(ReqwestPoster::new(&server, false)?), true));
 
     // Whether we read/write large blocks directly to S3 is decided by the server's
     // advertised blockstore properties: wrap in DirectS3Storage only if the server
     // says it's S3-backed; otherwise talk to the server directly.
     let props = DirectS3Storage::fetch_properties(poster.as_ref()).await.unwrap_or_default();
-    let raw_store: Arc<dyn ContentAddressedStorage> = if props.use_direct_block_store() {
+    let store: Arc<dyn ContentAddressedStorage> = if props.use_direct_block_store() {
         let s3_server: Arc<dyn HttpPoster> = Arc::new(ReqwestPoster::new(&server, false)?);
         let s3_direct: Arc<dyn HttpPoster> = Arc::new(ReqwestPoster::new(&server, true)?);
         Arc::new(DirectS3Storage::with_properties(props, s3_server, s3_direct, http_store))
     } else {
         http_store
     };
-    // A small in-RAM cache of cbor blocks (content-addressed, so no invalidation).
-    let store: Arc<dyn ContentAddressedStorage> = Arc::new(peergos_core::CachedStorage::new(raw_store));
 
     // A TOTP prompt for second-factor accounts. `sign_in` only invokes this if the
     // server actually requests a second factor, so it's harmless for non-MFA logins.
@@ -75,7 +70,10 @@ async fn main() -> Result<(), BoxErr> {
             .map_err(|e| peergos_core::error::Error::Protocol(format!("failed to read TOTP code: {e}")))?;
         Ok(MultiFactorAuthResponse::new_totp(method.credential_id.clone(), code.trim().to_string()))
     };
-    let ctx = UserContext::sign_in(&username, &password, Some(&responder), poster, store, mutable).await?;
+    // Single-user interactive session: enable the client-side pointer + block caches.
+    let ctx = UserContext::sign_in(&username, &password, Some(&responder), poster, store, mutable)
+        .await?
+        .with_session_caches();
     println!("Connected to {server} as {username}.\nType 'help' for commands, 'exit' to quit.");
 
     let mut shell = Shell {
