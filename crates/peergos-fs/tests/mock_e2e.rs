@@ -3783,3 +3783,64 @@ async fn chat_between_two_users() {
     assert!(chat.get_member_names().contains("bob") && bob_chat.get_member_names().contains("alice"));
     let _ = &uuid;
 }
+
+#[tokio::test]
+async fn chat_send_attachment() {
+    use peergos_fs::messaging::{ApplicationMessage, Message, Messenger};
+    use peergos_fs::Content;
+
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.expect("sign up");
+    }
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+
+    // Alice creates a chat, invites Bob; Bob clones + joins; Alice merges him in.
+    let alice_ctx = UserContext::sign_in("alice", "apw", None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    let alice_m = Messenger::new(alice_ctx.clone());
+    let chat = alice_m.create_chat().await.unwrap();
+    let uuid = chat.chat_uuid.clone();
+    let (bob_identity, _) = peergos_fs::get_public_keys(poster.as_ref(), store.as_ref(), mutable.as_ref(), "bob").await.unwrap();
+    let chat = alice_m.invite(&chat, vec!["bob".to_string()], vec![bob_identity]).await.unwrap();
+
+    let bob_ctx = UserContext::sign_in("bob", "bpw", None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    let bob_m = Messenger::new(bob_ctx.clone());
+    let source = bob_ctx.get_by_path(&format!("/alice/.messaging/{uuid}/shared")).await.unwrap().unwrap();
+    let bob_chat = bob_m.clone_locally_and_join(&source).await.unwrap();
+    let chat = alice_m.merge_messages(&chat, "bob").await.unwrap();
+
+    // Alice uploads a media attachment and sends it in a message.
+    let media = b"\x89PNG\r\n\x1a\n-not-a-real-png-but-distinctive-bytes".to_vec();
+    let post_time = 1_752_000_000; // 2025-07-08-ish
+    let (mime, file_ref) = alice_m.upload_media(&chat, &media, "png", post_time).await.expect("upload media");
+    assert!(!mime.is_empty(), "media should have a mime type");
+    assert!(file_ref.path.contains(&format!("/.messaging/{uuid}/shared/media/")), "media stored under the chat: {}", file_ref.path);
+
+    let msg = Message::Application(ApplicationMessage::attachment("look at this", vec![file_ref.clone()]));
+    alice_m.send_message(&chat, msg).await.expect("send attachment");
+
+    // Bob merges: he receives the message AND the media is mirrored into his space.
+    let bob_chat = bob_m.merge_messages(&bob_chat, "alice").await.expect("bob merges attachment");
+
+    // The received message carries the same FileRef.
+    let received_ref = bob_chat.get_recent().iter().rev().find_map(|e| match &e.payload {
+        Message::Application(a) => a.body.iter().find_map(|c| match c {
+            Content::Reference(r) => Some(r.clone()),
+            _ => None,
+        }),
+        _ => None,
+    });
+    let received_ref = received_ref.expect("bob should receive the attachment reference");
+    assert_eq!(received_ref.path, file_ref.path);
+    assert_eq!(received_ref.content_hash, file_ref.content_hash);
+
+    // Bob has a local mirrored copy of the media, with identical bytes.
+    let bob_copy_path = file_ref.path.replacen("/alice/", "/bob/", 1);
+    let bob_copy = bob_ctx.get_by_path(&bob_copy_path).await.expect("resolve bob's media copy").expect("bob mirrored the media");
+    assert_eq!(bob_copy.read().await.unwrap(), media, "bob's mirrored media should match the original");
+
+    // Bob can also still read the original via Alice's shared path.
+    let via_alice = bob_ctx.get_by_path(&file_ref.path).await.unwrap().expect("original reachable");
+    assert_eq!(via_alice.read().await.unwrap(), media);
+}

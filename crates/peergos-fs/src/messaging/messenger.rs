@@ -20,7 +20,9 @@ use super::member::Member;
 use super::messages::Message;
 use super::private_state::PrivateChatState;
 use crate::context::UserContext;
+use crate::feed::FileRef;
 use crate::filewrapper::FileWrapper;
+use crate::mimetype::calculate_mime_type;
 use peergos_cbor::{Cborable, CborObject};
 use peergos_core::error::{Error, Result};
 use peergos_core::keys::PublicKeyHash;
@@ -225,6 +227,30 @@ impl Messenger {
         current.send_message(Message::GroupState { key: key.to_string(), value: value.to_string() }).await
     }
 
+    /// Upload a media file into the chat's shared media directory and return its
+    /// mime type + a [`FileRef`] to embed in a message (`uploadMedia`). The file is
+    /// stored at `/$user/.messaging/$chatUuid/shared/media/$year/$month/$uuid.$ext`.
+    pub async fn upload_media(
+        &self,
+        current: &ChatController,
+        media: &[u8],
+        file_extension: &str,
+        post_time_epoch_secs: i64,
+    ) -> Result<(String, FileRef)> {
+        let username = self.username()?.to_string();
+        let name = format!("{}.{file_extension}", uuid());
+        let (year, month) = year_month(post_time_epoch_secs);
+        let dir_rel = format!("{MESSAGING_BASE_DIR}/{}/shared/media/{year}/{month}", current.chat_uuid);
+        let home = self.context.get_home().await?;
+        let dir = home.get_or_mkdirs(&dir_rel).await?;
+        let file = dir.upload(&name, media).await?;
+
+        let mime = calculate_mime_type(media, &name);
+        let path = format!("/{username}/{dir_rel}/{name}");
+        let content_hash = sha256_multihash(media);
+        Ok((mime, FileRef { path, cap: file.capability().read_only(), content_hash }))
+    }
+
     /// Delete a chat from our space (`deleteChat`).
     pub async fn delete_chat(&self, chat: &ChatController) -> Result<()> {
         let parent_path = format!("/{}/{MESSAGING_BASE_DIR}", self.username()?);
@@ -306,6 +332,30 @@ fn chat_id_from_shared_path(path: &str) -> Option<String> {
 /// The owner username (first path component) of `/alice/.messaging/...`.
 fn owner_from_path(path: &str) -> Option<String> {
     path.trim_matches('/').split('/').find(|s| !s.is_empty()).map(|s| s.to_string())
+}
+
+/// The bare sha2-256 multihash of `data` (`[0x12, 0x20] ++ sha256`), as stored in
+/// a `FileRef` merkle link (`Hasher.hashFromStream`).
+fn sha256_multihash(data: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x12, 0x20];
+    out.extend_from_slice(&peergos_crypto::hash::sha256(data));
+    out
+}
+
+/// Civil year + month (1-12) for an epoch-second timestamp (Howard Hinnant's
+/// days-from-civil, inverted).
+fn year_month(epoch_secs: i64) -> (i64, u32) {
+    let days = epoch_secs.div_euclid(86400);
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    (year, m as u32)
 }
 
 /// A random UUID-v4-shaped string for chat ids.

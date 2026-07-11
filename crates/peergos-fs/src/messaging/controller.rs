@@ -250,9 +250,9 @@ impl ChatController {
         if !update.to_revoke_access.is_empty() {
             store.revoke_access(update.to_revoke_access.clone()).await?;
         }
-        // 2. mirror any referenced media into our storage (best-effort)
+        // 2. mirror any referenced media into our storage
         for r in &update.media_to_copy {
-            let _ = self.mirror_media(r, &mirror_username).await;
+            self.mirror_media(r, &mirror_username).await?;
         }
         // 3. commit any new private state
         let mut new_priv = self.private_chat_state.clone();
@@ -287,26 +287,40 @@ impl ChatController {
         Ok(())
     }
 
-    /// Best-effort media mirroring: copy an attachment referenced from another
-    /// member's message into our own chat media directory. Java resolves the exact
-    /// year/month sub-path; this simplified port copies by filename and never fails
-    /// the merge (media upload isn't produced by this client yet).
+    /// Mirror an attachment referenced from another member's message into our own
+    /// chat media directory, preserving its `year/month/filename` sub-path
+    /// (`mirrorMedia`). We never mirror our own media.
     async fn mirror_media(&self, r: &FileRef, mirror_username: &str) -> Result<()> {
         if mirror_username == self.username()? {
             return Ok(());
         }
-        let source = match self.context.get_by_path(&r.path).await? {
-            Some(f) => f,
-            None => return Ok(()),
+        // The chat-relative part of the source path: everything after
+        // `.../shared/media/` (i.e. `<year>/<month>/<file>`).
+        const MARKER: &str = "/shared/media/";
+        let rel = match r.path.find(MARKER) {
+            Some(i) => &r.path[i + MARKER.len()..],
+            None => return Ok(()), // not a chat-media path
         };
+        let (sub_dir, filename) = match rel.rsplit_once('/') {
+            Some((d, f)) => (d.to_string(), f.to_string()),
+            None => (String::new(), rel.to_string()),
+        };
+        // Read the source file (reachable via getByPath, incl. a friend's share).
+        let source = self
+            .context
+            .get_by_path(&r.path)
+            .await?
+            .ok_or_else(|| Error::Protocol(format!("chat media not found: {}", r.path)))?;
         let data = source.read().await?;
-        let filename = r.path.rsplit('/').next().unwrap_or("attachment").to_string();
-        let media_dir = format!("{}/shared/media/mirror", self.root_path()?);
+
+        // Our own copy: .messaging/<uuid>/shared/media/<year>/<month>/<file>.
+        let mut dir_rel = format!("{MESSAGING_BASE_DIR}/{}/shared/media", self.chat_uuid);
+        if !sub_dir.is_empty() {
+            dir_rel.push('/');
+            dir_rel.push_str(&sub_dir);
+        }
         let home = self.context.get_home().await?;
-        let rel = media_dir.trim_start_matches('/');
-        // Skip the leading username component when navigating from home.
-        let rel = rel.splitn(2, '/').nth(1).unwrap_or(rel);
-        let dir = home.get_or_mkdirs(rel).await?;
+        let dir = home.get_or_mkdirs(&dir_rel).await?;
         dir.upload(&filename, &data).await?;
         Ok(())
     }
