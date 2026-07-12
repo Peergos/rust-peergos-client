@@ -1,7 +1,7 @@
 //! An interactive Peergos shell, mirroring the Java `peergos.server.cli` shell:
 //! the same commands (ls/lls, get/put, mkdir, rm, cd/lcd, pwd/lpwd, space,
 //! follow, get_follow_requests, process_follow_request, share_read, share_write,
-//! passwd) over a
+//! link, passwd) over a
 //! remote working directory + a local working directory.
 //!
 //!   cargo run -p peergos-cli -- [--server URL] [--username NAME]
@@ -19,6 +19,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcCommand;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 type BoxErr = Box<dyn std::error::Error>;
 
@@ -155,6 +156,7 @@ impl Shell {
             "process_follow_request" => self.process_follow_request(args).await,
             "share_read" => self.share_read(args).await,
             "share_write" => self.share_write(args).await,
+            "link" => self.link(args).await,
             "passwd" => self.passwd().await,
             other => Err(format!("unknown command '{other}' (try 'help')").into()),
         }
@@ -400,6 +402,69 @@ impl Shell {
         Ok(format!("Shared write-access to '{remote}' with {target}"))
     }
 
+    /// Mint a secret link to a file/dir. Read-only by default; `--write` makes it
+    /// writable (rotating the target into its own writer). Optionally password-
+    /// protect it, expire it after a duration, and/or cap the number of retrievals.
+    ///   link <remote> [--write] [--password [pw]] [--expiry <30m|24h|7d>] [--max-uses <n>]
+    async fn link(&self, args: &[String]) -> Result<String, BoxErr> {
+        const USAGE: &str = "usage: link <remote-path> [--write] [--password [pw]] [--expiry <30m|24h|7d>] [--max-uses <n>]";
+        let path_arg = args.first().filter(|a| !a.starts_with("--")).ok_or(USAGE)?;
+        let remote = self.resolve_remote(path_arg);
+        let rel = self.home_relative(&remote)?;
+
+        let mut writable = false;
+        let mut password = String::new();
+        let mut expiry: Option<i64> = None;
+        let mut max_uses: Option<i64> = None;
+
+        let mut i = 1;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--write" | "--writable" => writable = true,
+                "--password" => {
+                    // Optional inline value; otherwise prompt (kept out of shell history).
+                    match args.get(i + 1).filter(|v| !v.starts_with("--")) {
+                        Some(v) => {
+                            password = v.clone();
+                            i += 1;
+                        }
+                        None => password = read_password("Link password > ")?,
+                    }
+                }
+                "--expiry" => {
+                    let v = args.get(i + 1).ok_or("--expiry needs a duration like 30m, 24h, 7d")?;
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+                    expiry = Some(now + parse_duration_secs(v)?);
+                    i += 1;
+                }
+                "--max-uses" | "--max-retrievals" => {
+                    let v = args.get(i + 1).ok_or("--max-uses needs a number")?;
+                    max_uses = Some(v.parse().map_err(|_| format!("invalid --max-uses value: {v}"))?);
+                    i += 1;
+                }
+                other => return Err(format!("unknown option '{other}'\n{USAGE}").into()),
+            }
+            i += 1;
+        }
+
+        if self.ctx.get_by_path(&rel).await?.is_none() {
+            return Err(format!("no such path: {remote}").into());
+        }
+        let link = self.ctx.create_secret_link(&rel, writable, &password, expiry, max_uses).await?;
+
+        let mut notes = vec![if writable { "writable" } else { "read-only" }.to_string()];
+        if !password.is_empty() {
+            notes.push("password-protected".to_string());
+        }
+        if expiry.is_some() {
+            notes.push("expiring".to_string());
+        }
+        if let Some(n) = max_uses {
+            notes.push(format!("max {n} use(s)"));
+        }
+        Ok(format!("Created secret link to '{remote}' ({}):\n{link}", notes.join(", ")))
+    }
+
     async fn passwd(&self) -> Result<String, BoxErr> {
         let old = read_password("Current password > ")?;
         let new1 = read_password("New password > ")?;
@@ -574,6 +639,25 @@ fn read_password(msg: &str) -> io::Result<String> {
     Ok(pw.trim_end_matches(['\n', '\r']).to_string())
 }
 
+/// Parse a duration like `30s`, `15m`, `24h`, `7d` into seconds.
+fn parse_duration_secs(s: &str) -> Result<i64, BoxErr> {
+    let s = s.trim();
+    let err = || format!("invalid duration '{s}' (use e.g. 30m, 24h, 7d)");
+    let (num, unit) = s.split_at(s.len().checked_sub(1).ok_or_else(err)?);
+    let mult = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        _ => return Err(err().into()),
+    };
+    let n: i64 = num.parse().map_err(|_| err())?;
+    if n < 0 {
+        return Err(err().into());
+    }
+    Ok(n * mult)
+}
+
 fn help_text() -> String {
     [
         "Commands:",
@@ -592,6 +676,8 @@ fn help_text() -> String {
         "  process_follow_request <user> <accept|accept-and-reciprocate|reject>",
         "  share_read <remote> <user>             grant read access to a follower",
         "  share_write <remote> <user>            grant write access to a follower",
+        "  link <remote> [--write] [--password [pw]] [--expiry <30m|24h|7d>] [--max-uses <n>]",
+        "                                         mint a secret link to a file/dir",
         "  passwd                                 change your password",
         "  help | ?                               show this help",
         "  exit | quit | bye                      disconnect",
