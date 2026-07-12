@@ -24,7 +24,7 @@ use peergos_core::{ContentAddressedStorage, DirectS3Storage, HttpPoster, HttpSto
 use peergos_fs::{
     retrieve_secret_link_capability, AbsoluteCapability, FileWrapper, MultiFactorAuthRequest, MultiFactorAuthResponse, UserContext,
 };
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcCommand;
 use std::sync::Arc;
@@ -154,8 +154,21 @@ async fn main() -> Result<(), BoxErr> {
     let mut shell = shell.expect("connected");
     println!("Type 'help' for commands, 'exit' to quit.");
 
+    // An interactive terminal gets line editing + in-memory history (up-arrow recalls
+    // previous commands); piped/redirected input falls back to plain line reads so
+    // scripting still works.
+    let mut editor: Option<rustyline::DefaultEditor> =
+        if std::io::stdin().is_terminal() { rustyline::DefaultEditor::new().ok() } else { None };
+
     loop {
-        let line = prompt(&format!("{}@{} > ", shell.username, shell.server))?;
+        let prompt_str = format!("{}@{} > ", shell.username, shell.server);
+        let line = match read_command(editor.as_mut(), &prompt_str) {
+            Some(l) => l,
+            None => {
+                println!("Bye.");
+                break;
+            }
+        };
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -177,6 +190,49 @@ async fn main() -> Result<(), BoxErr> {
         }
     }
     Ok(())
+}
+
+/// Read one command line. With an interactive `editor`, this offers line editing
+/// and up-arrow history (kept in RAM only, never persisted); otherwise it reads a
+/// plain line from stdin. Returns `None` at end-of-input (Ctrl-D / closed pipe) so
+/// the caller can exit.
+fn read_command(editor: Option<&mut rustyline::DefaultEditor>, prompt_str: &str) -> Option<String> {
+    match editor {
+        Some(ed) => match ed.readline(prompt_str) {
+            Ok(line) => {
+                if !line.trim().is_empty() {
+                    let _ = ed.add_history_entry(line.as_str());
+                }
+                Some(line)
+            }
+            // Ctrl-C abandons the current line but keeps the shell running.
+            Err(rustyline::error::ReadlineError::Interrupted) => Some(String::new()),
+            Err(rustyline::error::ReadlineError::Eof) => None,
+            Err(e) => {
+                eprintln!("error reading input: {e}");
+                None
+            }
+        },
+        None => match prompt_line(prompt_str) {
+            Ok(Some(line)) => Some(line),
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!("error reading input: {e}");
+                None
+            }
+        },
+    }
+}
+
+/// Print `prompt_str` and read a line from stdin, returning `None` at EOF.
+fn prompt_line(prompt_str: &str) -> io::Result<Option<String>> {
+    print!("{prompt_str}");
+    io::stdout().flush()?;
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line)? == 0 {
+        return Ok(None);
+    }
+    Ok(Some(line.trim_end_matches(['\n', '\r']).to_string()))
 }
 
 impl Shell {

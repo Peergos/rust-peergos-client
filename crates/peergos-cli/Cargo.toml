@@ -14,3 +14,4 @@ peergos-fs = { workspace = true }
 peergos-core = { workspace = true }
 peergos-cbor = { workspace = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+rustyline = "14"
