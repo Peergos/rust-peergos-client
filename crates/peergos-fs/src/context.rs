@@ -125,8 +125,14 @@ impl Cborable for PaymentProperties {
 pub struct UserContext {
     /// The signed-in user (identity, keys, entry points). `None` for a secret link.
     user: Option<LoggedInUser>,
-    /// Root capabilities of a secret-link context (empty for a full login).
+    /// Root capabilities of a single-link secret-link context (empty for a full
+    /// login or a multi-link context — see `link_mounts`).
     link_caps: Vec<AbsoluteCapability>,
+    /// Secret links mounted at their true absolute paths (`/username/a/b`), for a
+    /// multi-link context. Each entry is `(absolute path, capability)`; the deepest
+    /// matching mount wins during path resolution, so a writable child link
+    /// supersedes a read-only parent link at the overlapping path.
+    link_mounts: Vec<(String, AbsoluteCapability)>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: Arc<dyn MutablePointers>,
     poster: Arc<dyn HttpPoster>,
@@ -151,7 +157,7 @@ impl UserContext {
         mutable: Arc<dyn MutablePointers>,
     ) -> Result<UserContext> {
         let user = login(username, password, poster.as_ref(), store.clone(), mutable.as_ref(), mfa).await?;
-        Ok(UserContext { user: Some(user), link_caps: Vec::new(), store, mutable, poster, cache: CryptreeCache::new() })
+        Ok(UserContext { user: Some(user), link_caps: Vec::new(), link_mounts: Vec::new(), store, mutable, poster, cache: CryptreeCache::new() })
     }
 
     /// Sign in to a TOTP-protected account, generating the current code from the
@@ -229,7 +235,37 @@ impl UserContext {
         mutable: Arc<dyn MutablePointers>,
     ) -> Result<UserContext> {
         let cap = crate::retrieve_secret_link_capability(link, store.as_ref(), user_password).await?;
-        Ok(UserContext { user: None, link_caps: vec![cap], store, mutable, poster, cache: CryptreeCache::new() })
+        Ok(UserContext { user: None, link_caps: vec![cap], link_mounts: Vec::new(), store, mutable, poster, cache: CryptreeCache::new() })
+    }
+
+    /// Open a context spanning several already-resolved secret-link capabilities
+    /// at once (Java `fromSecretLinks`). Each cap is mounted at its true absolute
+    /// path — recovered by walking cryptree parent links ([`crate::reconstruct_link_path`])
+    /// — so the caps sit in a single coherent tree. The caps may be nested (e.g. a
+    /// writable link to a subdirectory plus a read-only link to its parent); the
+    /// deepest mount wins during resolution, so the writable child supersedes the
+    /// read-only parent at the overlapping path. Callers resolve the links with
+    /// [`crate::retrieve_secret_link_capability`] (handling any per-link user
+    /// password themselves) and pass the caps here.
+    pub async fn from_link_caps(
+        caps: Vec<AbsoluteCapability>,
+        poster: Arc<dyn HttpPoster>,
+        store: Arc<dyn ContentAddressedStorage>,
+        mutable: Arc<dyn MutablePointers>,
+    ) -> Result<UserContext> {
+        let mut link_mounts = Vec::with_capacity(caps.len());
+        for cap in caps {
+            let path = crate::reconstruct_link_path(&cap, store.clone(), mutable.as_ref()).await?;
+            link_mounts.push((path, cap));
+        }
+        Ok(UserContext { user: None, link_caps: Vec::new(), link_mounts, store, mutable, poster, cache: CryptreeCache::new() })
+    }
+
+    /// The absolute paths at which this context's secret links are mounted, in the
+    /// order supplied. Used by shells to render the virtual directory tree spanning
+    /// the links.
+    pub fn link_mount_paths(&self) -> Vec<String> {
+        self.link_mounts.iter().map(|(p, _)| p.clone()).collect()
     }
 
     /// Rebuild a context from a previously-saved [`LoggedInUser`] session, skipping
@@ -242,7 +278,7 @@ impl UserContext {
         store: Arc<dyn ContentAddressedStorage>,
         mutable: Arc<dyn MutablePointers>,
     ) -> UserContext {
-        UserContext { user: Some(user), link_caps: Vec::new(), store, mutable, poster, cache: CryptreeCache::new() }
+        UserContext { user: Some(user), link_caps: Vec::new(), link_mounts: Vec::new(), store, mutable, poster, cache: CryptreeCache::new() }
     }
 
     // ---- accessors ---------------------------------------------------------
@@ -357,6 +393,12 @@ impl UserContext {
     /// it, and the remainder is navigated through the real filesystem.
     pub async fn get_by_path(&self, path: &str) -> Result<Option<FileWrapper>> {
         let comps: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+
+        // A multi-link context resolves against its mounted absolute paths.
+        if !self.link_mounts.is_empty() {
+            return self.resolve_link_mount(&comps).await;
+        }
+
         let roots = self.roots().await?;
 
         if comps.is_empty() {
@@ -454,6 +496,33 @@ impl UserContext {
         .with_cache(self.cache.clone())
         .with_mirror_bat(self.mirror_bat_id());
         dir.get_by_path(&comps[matched..].join("/")).await
+    }
+
+    /// Resolve a path within a multi-link context: pick the deepest mounted link
+    /// whose absolute path is an ancestor of (or equal to) the query, then navigate
+    /// the remaining components from it. A query that is only a virtual ancestor of
+    /// some mount (an intermediate directory with no capability of its own) does not
+    /// resolve to a node — shells list those from [`Self::link_mount_paths`].
+    async fn resolve_link_mount(&self, comps: &[&str]) -> Result<Option<FileWrapper>> {
+        let mut best: Option<(usize, &AbsoluteCapability)> = None;
+        for (mpath, cap) in &self.link_mounts {
+            let mc: Vec<&str> = mpath.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+            if mc.len() <= comps.len() && mc[..] == comps[..mc.len()] {
+                let deeper = best.as_ref().map(|(n, _)| mc.len() > *n).unwrap_or(true);
+                if deeper {
+                    best = Some((mc.len(), cap));
+                }
+            }
+        }
+        let (matched, cap) = match best {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        let signer = crate::recover_signer(cap, self.store.clone(), self.mutable.as_ref()).await.ok();
+        let root = FileWrapper::from_link_cap(cap.clone(), signer, self.store.clone(), self.mutable.clone())
+            .await?
+            .with_cache(self.cache.clone());
+        root.get_by_path(&comps[matched..].join("/")).await
     }
 
     /// The children of the directory at `path` (`getChildren`). Empty if the path

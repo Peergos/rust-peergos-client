@@ -429,6 +429,52 @@ pub(crate) async fn retrieve_file_metadata_cached(
     Ok((node, properties))
 }
 
+/// Reconstruct the absolute path (`/username/a/b/name`) of the file/dir `cap`
+/// points at, by following cryptree parent links up to the root (Java
+/// `FileWrapper.getPath`). Each node's parent block embeds the parent's read key,
+/// so this works from a bare secret-link capability without any login. Parent
+/// link nodes (the write-share stand-ins living in the parent's writer space) are
+/// transparently skipped, matching Java's `retrieveParent`.
+pub async fn reconstruct_link_path(
+    cap: &AbsoluteCapability,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<String> {
+    let (node, props) = retrieve_file_metadata(cap, store.clone(), mutable).await?;
+    match first_non_link_parent(&node, cap, store.clone(), mutable).await? {
+        None => Ok(format!("/{}", props.name)),
+        Some(parent_cap) => {
+            let parent_path = Box::pin(reconstruct_link_path(&parent_cap, store, mutable)).await?;
+            Ok(format!("{}/{}", parent_path, props.name))
+        }
+    }
+}
+
+/// The capability of `node`'s first non-link ancestor directory, or `None` if it
+/// is a root. Follows the parent link, skipping any link nodes along the way.
+async fn first_non_link_parent(
+    node: &CryptreeNode,
+    cap: &AbsoluteCapability,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<Option<AbsoluteCapability>> {
+    let rel = match node.parent_link(&cap.r_base_key)? {
+        None => return Ok(None),
+        Some(r) => r,
+    };
+    let mut parent_cap = rel.to_absolute(cap)?;
+    loop {
+        let (pnode, pprops) = retrieve_file_metadata(&parent_cap, store.clone(), mutable).await?;
+        if !pprops.is_link {
+            return Ok(Some(parent_cap));
+        }
+        parent_cap = match pnode.parent_link(&parent_cap.r_base_key)? {
+            None => return Ok(None),
+            Some(r) => r.to_absolute(&parent_cap)?,
+        };
+    }
+}
+
 /// Stream a file's contents: walk all chunks (each ≤ 5 MiB), decrypt one at a
 /// time and hand each plaintext slice to `sink`, never holding more than a single
 /// chunk in memory. Returns the file properties. This is the RAM-safe primitive

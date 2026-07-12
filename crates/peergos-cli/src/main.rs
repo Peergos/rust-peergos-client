@@ -6,15 +6,24 @@
 //!
 //!   cargo run -p peergos-cli -- [--server URL] [--username NAME]
 //!                               [--stay-logged-in] [--fresh] [--logout]
+//!                               [--links LINK1,LINK2,...]
 //!
 //! `--stay-logged-in` saves the session (server + derived keys) to
 //! `~/.peergos-shell/session.cbor` (mode 0600); later runs then resume it
 //! automatically — no password, no KDF, no login round-trips. `--fresh` ignores a
 //! saved session, `--logout` deletes it.
+//!
+//! `--links` opens the shell over a comma-separated set of secret links instead of
+//! a login. Each link is mounted at its true absolute path (recovered by following
+//! cryptree parent links), so nested links — e.g. a writable link to a subdirectory
+//! plus a read-only link to its parent — appear in one coherent tree, the writable
+//! child taking precedence where they overlap.
 
 use peergos_core::mutable::{HttpMutablePointers, MutablePointers};
 use peergos_core::{ContentAddressedStorage, DirectS3Storage, HttpPoster, HttpStorage, ReqwestPoster};
-use peergos_fs::{FileWrapper, MultiFactorAuthRequest, MultiFactorAuthResponse, UserContext};
+use peergos_fs::{
+    retrieve_secret_link_capability, AbsoluteCapability, FileWrapper, MultiFactorAuthRequest, MultiFactorAuthResponse, UserContext,
+};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcCommand;
@@ -27,10 +36,14 @@ struct Shell {
     ctx: UserContext,
     username: String,
     server: String,
-    /// Remote working directory, always absolute (`/username/...`).
+    /// Remote working directory, always absolute (`/username/...`, or `/` at the
+    /// virtual root of a secret-link session).
     pwd: String,
     /// Local working directory.
     lpwd: PathBuf,
+    /// True when the session was opened from secret links rather than a login:
+    /// there is no home, and `/` is a virtual root listing the link targets.
+    link_mode: bool,
 }
 
 #[tokio::main]
@@ -48,13 +61,43 @@ async fn main() -> Result<(), BoxErr> {
 
     let server_arg = arg_value("--server").map(|s| normalize_server(&s));
     let username_arg = arg_value("--username");
+    let links_arg = arg_value("--links");
     let stay = has_flag("--stay-logged-in");
     let fresh = has_flag("--fresh");
 
     let mut shell: Option<Shell> = None;
 
+    // 0. `--links a,b,c`: browse a set of secret links instead of logging in. Each
+    //    link becomes an addressable root; nested links (e.g. a writable child plus
+    //    a read-only parent) each keep their own access level.
+    if let Some(links_csv) = links_arg {
+        let server = match server_arg.clone() {
+            Some(s) => s,
+            None => normalize_server(&prompt("Enter server address [https://peergos.net] > ")?),
+        };
+        let (poster, store, mutable) = build_transport(&server).await?;
+        let mut caps: Vec<AbsoluteCapability> = Vec::new();
+        for raw in links_csv.split(',') {
+            let link = raw.trim();
+            if link.is_empty() {
+                continue;
+            }
+            caps.push(resolve_link_interactive(link, store.as_ref()).await?);
+        }
+        if caps.is_empty() {
+            return Err("no secret links provided to --links".into());
+        }
+        let ctx = UserContext::from_link_caps(caps, poster, store, mutable).await?.with_session_caches();
+        let mounts = ctx.link_mount_paths();
+        println!("Opened {} secret link(s) on {server}:", mounts.len());
+        for m in &mounts {
+            println!("  {m}");
+        }
+        shell = Some(make_link_shell(ctx, server));
+    }
+
     // 1. Try to resume a saved session (unless --fresh), skipping password + KDF.
-    if !fresh {
+    if !fresh && shell.is_none() {
         if let Some((srv, user)) = load_session(&session_path) {
             let server_ok = server_arg.as_ref().map_or(true, |s| *s == srv);
             let user_ok = username_arg.as_ref().map_or(true, |u| *u == user.username);
@@ -166,13 +209,39 @@ impl Shell {
 
     async fn ls(&self, args: &[String]) -> Result<String, BoxErr> {
         let path = self.resolve_remote(args.first().map(|s| s.as_str()).unwrap_or(""));
-        let node = self.ctx.get_by_path(&path).await?.ok_or_else(|| format!("no such path: {path}"))?;
-        if !node.is_directory() {
-            return Ok(path);
+        if let Some(node) = self.ctx.get_by_path(&path).await? {
+            if !node.is_directory() {
+                return Ok(path);
+            }
+            let mut names: Vec<String> = node.children().await?.iter().map(|c| c.name().to_string()).collect();
+            names.sort();
+            return Ok(names.join("\n"));
         }
-        let mut names: Vec<String> = node.children().await?.iter().map(|c| c.name().to_string()).collect();
-        names.sort();
-        Ok(names.join("\n"))
+        // In a secret-link session a path can be a virtual directory: an ancestor of
+        // the mounted links that has no capability of its own. List its next segments.
+        if self.link_mode {
+            let kids = self.virtual_children(&path);
+            if !kids.is_empty() {
+                return Ok(kids.into_iter().map(|k| format!("{k}/")).collect::<Vec<_>>().join("\n"));
+            }
+        }
+        Err(format!("no such path: {path}").into())
+    }
+
+    /// The immediate child segments of `path` implied by the mounted link paths —
+    /// i.e. the contents of a virtual intermediate directory in a `--links` session.
+    fn virtual_children(&self, path: &str) -> Vec<String> {
+        let base = normalize_remote(path);
+        let prefix = if base == "/" { "/".to_string() } else { format!("{base}/") };
+        let mut kids = std::collections::BTreeSet::new();
+        for m in self.ctx.link_mount_paths() {
+            if let Some(rest) = normalize_remote(&m).strip_prefix(&prefix) {
+                if let Some(seg) = rest.split('/').find(|s| !s.is_empty()) {
+                    kids.insert(seg.to_string());
+                }
+            }
+        }
+        kids.into_iter().collect()
     }
 
     fn lls(&self, args: &[String]) -> Result<String, BoxErr> {
@@ -190,15 +259,23 @@ impl Shell {
 
     async fn cd(&mut self, args: &[String]) -> Result<String, BoxErr> {
         let path = match args.first() {
+            None if self.link_mode => "/".to_string(),
             None => format!("/{}", self.username),
             Some(a) => self.resolve_remote(a),
         };
-        let node = self.ctx.get_by_path(&path).await?.ok_or_else(|| format!("no such path: {path}"))?;
-        if !node.is_directory() {
-            return Err(format!("not a directory: {path}").into());
+        if let Some(node) = self.ctx.get_by_path(&path).await? {
+            if !node.is_directory() {
+                return Err(format!("not a directory: {path}").into());
+            }
+            self.pwd = path.clone();
+            return Ok(format!("Current directory: {path}"));
         }
-        self.pwd = path.clone();
-        Ok(format!("Current directory: {path}"))
+        // A virtual directory (root or an intermediate ancestor of the mounted links).
+        if self.link_mode && (path == "/" || !self.virtual_children(&path).is_empty()) {
+            self.pwd = normalize_remote(&path);
+            return Ok(format!("Current directory: {}", self.pwd));
+        }
+        Err(format!("no such path: {path}").into())
     }
 
     fn lcd(&mut self, args: &[String]) -> Result<String, BoxErr> {
@@ -562,6 +639,36 @@ fn make_shell(ctx: UserContext, username: String, server: String) -> Shell {
         ctx,
         username,
         server,
+        link_mode: false,
+    }
+}
+
+/// A shell over a secret-link context: no home, `/` is a virtual root listing the
+/// link targets, and each link target is an addressable root beneath it.
+fn make_link_shell(ctx: UserContext, server: String) -> Shell {
+    Shell {
+        pwd: "/".to_string(),
+        lpwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        ctx,
+        username: "links".to_string(),
+        server,
+        link_mode: true,
+    }
+}
+
+/// Resolve a secret link to its capability, prompting for a user password if the
+/// link turns out to be password-protected.
+async fn resolve_link_interactive(
+    link: &str,
+    store: &dyn ContentAddressedStorage,
+) -> Result<AbsoluteCapability, BoxErr> {
+    match retrieve_secret_link_capability(link, store, None).await {
+        Ok(cap) => Ok(cap),
+        Err(e) if e.to_string().to_lowercase().contains("password") => {
+            let pw = read_password(&format!("Password for link {link} > "))?;
+            Ok(retrieve_secret_link_capability(link, store, Some(&pw)).await?)
+        }
+        Err(e) => Err(e.into()),
     }
 }
 
