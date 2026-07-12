@@ -1,6 +1,7 @@
 //! An interactive Peergos shell, mirroring the Java `peergos.server.cli` shell:
 //! the same commands (ls/lls, get/put, mkdir, rm, cd/lcd, pwd/lpwd, space,
-//! follow, get_follow_requests, process_follow_request, share_read, passwd) over a
+//! follow, get_follow_requests, process_follow_request, share_read, share_write,
+//! passwd) over a
 //! remote working directory + a local working directory.
 //!
 //!   cargo run -p peergos-cli -- [--server URL] [--username NAME]
@@ -153,6 +154,7 @@ impl Shell {
             "get_follow_requests" => self.get_follow_requests().await,
             "process_follow_request" => self.process_follow_request(args).await,
             "share_read" => self.share_read(args).await,
+            "share_write" => self.share_write(args).await,
             "passwd" => self.passwd().await,
             other => Err(format!("unknown command '{other}' (try 'help')").into()),
         }
@@ -373,6 +375,31 @@ impl Shell {
         Ok(format!("Shared read-access to '{remote}' with {target}"))
     }
 
+    async fn share_write(&self, args: &[String]) -> Result<String, BoxErr> {
+        let remote_arg = args.first().ok_or("usage: share_write <remote-path> <user>")?;
+        let target = args.get(1).ok_or("usage: share_write <remote-path> <user>")?;
+        let remote = self.resolve_remote(remote_arg);
+        // Write sharing works on a child of a parent directory: split the path.
+        let rel = self.home_relative(&remote)?;
+        let (parent_rel, child_name) = match rel.rsplit_once('/') {
+            Some((p, n)) => (p.to_string(), n.to_string()),
+            None => (String::new(), rel.clone()),
+        };
+        let parent_remote = if parent_rel.is_empty() {
+            format!("/{}", self.username)
+        } else {
+            format!("/{}/{}", self.username, parent_rel)
+        };
+        let parent = self.ctx.get_by_path(&parent_remote).await?.ok_or_else(|| format!("no such path: {parent_remote}"))?;
+        let user = self.ctx.user().ok_or("not signed in")?;
+        let followers = peergos_fs::get_follower_names(user, self.ctx.store(), self.ctx.mutable().as_ref()).await?;
+        if !followers.contains(target) {
+            return Ok(format!("Not shared: '{target}' is not following you"));
+        }
+        peergos_fs::share_write_access(user, &parent_rel, parent.capability(), &child_name, target, self.ctx.store(), self.ctx.mutable().as_ref()).await?;
+        Ok(format!("Shared write-access to '{remote}' with {target}"))
+    }
+
     async fn passwd(&self) -> Result<String, BoxErr> {
         let old = read_password("Current password > ")?;
         let new1 = read_password("New password > ")?;
@@ -564,6 +591,7 @@ fn help_text() -> String {
         "  get_follow_requests                    list pending follow requests",
         "  process_follow_request <user> <accept|accept-and-reciprocate|reject>",
         "  share_read <remote> <user>             grant read access to a follower",
+        "  share_write <remote> <user>            grant write access to a follower",
         "  passwd                                 change your password",
         "  help | ?                               show this help",
         "  exit | quit | bye                      disconnect",
