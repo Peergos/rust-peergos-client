@@ -2,7 +2,7 @@
 
 A native Rust implementation of the [Peergos](https://peergos.org) client — a
 faithful port of the Java reference client that speaks the same wire protocol and
-is validated end-to-end against a live Peergos server.
+is validated end-to-end against a live Peergos server and against the Java client for interop.
 
 Peergos is a peer-to-peer, end-to-end encrypted file storage and social platform.
 Its security model is a *cryptree*: every file and directory is a tree of
