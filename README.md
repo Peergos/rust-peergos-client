@@ -25,7 +25,10 @@ below it:
 | `peergos-cbor` | A byte-exact CBOR codec whose map ordering and integer encoding match the Java client bit-for-bit (required for content-addressing and signatures). |
 | `peergos-multiformats` | CIDv1 / multihash / multibase encoding and the base58/base32 alphabets Peergos uses. |
 | `peergos-core` | The network layer: the content-addressed block store client, mutable pointers (signed CAS), the CHAMP hash-array-mapped-trie, the buffered-write network decorator, and direct-to-S3 block access. |
-| `peergos-fs` | The cryptree filesystem: files and directories, capabilities, sharing and revocation, social features, publishing, upload transactions, and the ergonomic `FileWrapper` / `UserContext` handles. |
+| `peergos-fs` | The cryptree filesystem: files and directories, capabilities, sharing and revocation, social features, email, publishing, upload transactions, and the ergonomic `FileWrapper` / `UserContext` handles. |
+| `peergos-sync` | Bidirectional local ↔ remote directory sync, mirroring the Java `DirectorySync`: content-hashed state diffing, batched transfers, and optional deletion propagation. |
+| `peergos-cli` | The interactive `peergos-shell` — a login (or secret-link) session with remote and local working directories and the same command set as the Java shell. |
+| `peergos-mock-server` | An in-process Peergos server used to drive the end-to-end tests without a live backend. |
 
 ## What it does
 
@@ -38,6 +41,12 @@ below it:
 - **Secret links** — create and resolve password-protected shareable links.
 - **Social** — follow requests, friends/followers groups, a social feed with posts,
   comments and media, and per-user profiles.
+- **Email** — an end-to-end encrypted email bridge: encrypt, outbox, inbox and sent
+  folders over the Peergos email protocol.
+- **Sync** — bidirectional local ↔ remote directory sync with content-hashed change
+  detection, batched transfers, and optional deletion propagation.
+- **Interactive shell** — `peergos-shell`, a login or secret-link session with paired
+  remote/local working directories and the same commands as the Java CLI.
 - **Publishing** — make files public and serve a website through the Peergos gateway.
 - **Efficient reads** — the server-side `champ/get` lookup returns a whole tree path
   in one round-trip, and every returned block is re-hashed and re-resolved locally so
@@ -87,6 +96,25 @@ cargo run -p peergos-fs --example resume_upload -- http://localhost:7777/
 
 There are runnable examples for most features — sharing, revocation, secret links,
 social/feed, publishing, the buffered network, upload transactions, and more.
+
+### Interactive shell
+
+`peergos-shell` mirrors the Java `peergos.server.cli`: a login (or secret-link)
+session with a remote and a local working directory, and commands such as
+`ls`/`lls`, `get`/`put`, `mkdir`, `rm`, `cd`/`lcd`, `pwd`/`lpwd`, `space`, `follow`,
+`share_read`, `share_write`, `link`, and `passwd`, with command history and line
+editing.
+
+```sh
+# log in and drop into the shell
+cargo run -p peergos-cli -- --server http://localhost:7777/ --username alice
+
+# cache the session to ~/.peergos-shell/session.cbor so later runs skip login
+cargo run -p peergos-cli -- --username alice --stay-logged-in
+
+# open the shell over a set of secret links, each mounted at its true path
+cargo run -p peergos-cli -- --links LINK1,LINK2
+```
 
 ## Using it as a library
 
