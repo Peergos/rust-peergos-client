@@ -1,4 +1,4 @@
-# rust-peergos-client
+# Rust Peergos client
 
 A native Rust implementation of the [Peergos](https://peergos.org) client — a
 port of the Java reference client that speaks the same wire protocol and
