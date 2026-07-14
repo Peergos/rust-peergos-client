@@ -1,7 +1,7 @@
 # rust-peergos-client
 
 A native Rust implementation of the [Peergos](https://peergos.org) client — a
-faithful port of the Java reference client that speaks the same wire protocol and
+port of the Java reference client that speaks the same wire protocol and
 is validated end-to-end against a live Peergos server and against the Java client for interop.
 
 Peergos is a peer-to-peer, end-to-end encrypted file storage and social platform.
@@ -15,9 +15,6 @@ in Rust with no plaintext or key material ever leaving the process unencrypted.
 > API is still evolving.
 
 ## Architecture
-
-The project is a Cargo workspace of layered crates, each depending only on those
-below it:
 
 | Crate | Responsibility |
 | --- | --- |
@@ -55,7 +52,7 @@ below it:
   content-addressed tree root (so entries can never go stale).
 - **Random access** — read or overwrite an arbitrary byte range of a file, touching
   only the chunks that overlap the range rather than the whole file.
-- **Crash-safe uploads** — large uploads commit chunk-by-chunk through a transaction
+- **Crash-safe/resumable uploads** — large uploads commit chunk-by-chunk through a transaction
   record, and re-uploading the same content automatically resumes an interrupted
   upload from the first missing chunk.
 
