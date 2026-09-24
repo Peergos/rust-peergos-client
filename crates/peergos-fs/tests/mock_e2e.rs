@@ -4195,3 +4195,41 @@ async fn nested_writing_space_survives_grant_and_revoke_of_parent() {
         .iter().map(|c| c.name().to_string()).collect();
     assert!(names.contains(&"four.txt".to_string()), "bob's write landed in alice's tree: {names:?}");
 }
+
+/// As in Java, a write-shared item's parent link is the link node that names it in
+/// its parent, and the link node carries the item's own properties marked as a link.
+/// Copying a folder holding one copies the item's contents, not the link.
+#[tokio::test]
+async fn write_shared_item_is_parented_by_its_link_node() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        sign_up(u, p, &poster, &store, &mutable).await;
+    }
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    alice.get_home().await.unwrap().mkdir("d").await.unwrap().upload("f.txt", b"shared file").await.unwrap();
+    alice.share_write_access("d/f.txt", "bob").await.unwrap();
+
+    let d = alice.get_by_path("d").await.unwrap().unwrap();
+    let link = peergos_fs::list_directory(d.capability(), store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.name == "f.txt").unwrap();
+    let (_, link_props) = peergos_fs::retrieve_file_metadata(&link.cap, store.clone(), mutable.as_ref()).await.unwrap();
+    assert!(link_props.is_link && !link_props.is_directory, "a file's link node has the file's properties");
+    assert_eq!(link_props.name, "f.txt");
+
+    let f = alice.get_by_path("d/f.txt").await.unwrap().unwrap();
+    let (node, _) = peergos_fs::retrieve_file_metadata(f.capability(), store.clone(), mutable.as_ref()).await.unwrap();
+    let parent = node.parent_link(&f.capability().r_base_key).unwrap().unwrap();
+    assert_eq!(parent.map_key, link.cap.map_key, "the file's parent is its link node");
+    assert_eq!(parent.writer.as_ref(), Some(&d.capability().writer));
+    assert_eq!(
+        peergos_fs::reconstruct_link_path(f.capability(), store.clone(), mutable.as_ref()).await.unwrap(),
+        "/alice/d/f.txt"
+    );
+
+    let home = alice.get_home().await.unwrap();
+    home.copy_child("d", &home.mkdir("copies").await.unwrap()).await.unwrap();
+    let copied = alice.get_by_path("copies/d/f.txt").await.unwrap().unwrap();
+    assert_eq!(copied.read().await.unwrap(), b"shared file");
+}

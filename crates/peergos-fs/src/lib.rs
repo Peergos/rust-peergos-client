@@ -1704,6 +1704,7 @@ async fn parent_writer_signer(
 async fn create_writable_shared_dir(
     parent_cap: &AbsoluteCapability,
     name: &str,
+    link: &LinkNodeKeys,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
     mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
@@ -1789,17 +1790,7 @@ async fn create_writable_shared_dir(
         .put("n", next_chunk.to_cbor())
         .build();
     let props = FileProperties::new_directory(name.to_string(), epoch);
-    // Parent link back to `parent_cap` so the new dir can resolve its path
-    // (`getPath` walks up). The new dir has its own writer, so the link names the
-    // parent's writer explicitly; its read key is the parent's parent-key.
-    let parent_node = retrieve_file_metadata(parent_cap, store.clone(), mutable).await?.0;
-    let to_parent = RelCap {
-        writer: Some(parent_cap.writer.clone()),
-        map_key: parent_cap.map_key.clone(),
-        bat: parent_cap.bat.clone(),
-        r_base_key: parent_node.get_parent_key(&parent_cap.r_base_key),
-        w_base_key_link: None,
-    };
+    let to_parent = link.parent_link(&parent_cap.writer);
     let from_parent = CborObject::map().put("p", to_parent.to_cbor()).put("s", props.to_cbor()).build();
     let empty_children = retrieve::FragmentedPaddedCipherText::build_inline(
         &dir_r,
@@ -1849,35 +1840,68 @@ async fn create_writable_shared_dir(
     )
 }
 
-/// Create a **link node** in `parent_cap`'s writer subspace that points to
-/// `target` (which lives in a different writer subspace), and add a child link to
-/// the parent naming it. This keeps the name/rename authority in the parent's
+/// Where a link node goes and its keys (`createAndCommitLink`'s `linkCap` and
+/// parent key). Chosen before the link node exists, so the target's parent link
+/// can already point at it.
+pub(crate) struct LinkNodeKeys {
+    map_key: Vec<u8>,
+    bat: Bat,
+    r_base: SymmetricKey,
+    parent_key: SymmetricKey,
+    w_base: SymmetricKey,
+}
+
+impl LinkNodeKeys {
+    pub(crate) fn random() -> Result<LinkNodeKeys> {
+        Ok(LinkNodeKeys {
+            map_key: random_bytes(32),
+            bat: Bat::new(random_bytes(32))?,
+            r_base: random_symmetric_key()?,
+            parent_key: random_symmetric_key()?,
+            w_base: random_symmetric_key()?,
+        })
+    }
+
+    /// The parent link a link node's target carries: to the link node, which lives
+    /// in `parent_writer`'s writing space.
+    pub(crate) fn parent_link(&self, parent_writer: &PublicKeyHash) -> RelCap {
+        RelCap {
+            writer: Some(parent_writer.clone()),
+            map_key: self.map_key.clone(),
+            bat: Some(self.bat.clone()),
+            r_base_key: self.parent_key.clone(),
+            w_base_key_link: None,
+        }
+    }
+}
+
+/// Create a **link node** in `parent_cap`'s writer subspace, at `keys`, that points
+/// to `target` (which lives in a different writer subspace), and add a child link
+/// to the parent naming it. This keeps the name/rename authority in the parent's
 /// writer space (`CryptreeNode.createAndCommitLink`): a holder of write access to
-/// the target can edit its contents but cannot rename it. Overwrites any existing
-/// child with `name`.
+/// the target can edit its contents but cannot rename it. The link node carries
+/// the target's properties marked as a link. Overwrites any existing child with
+/// `name`.
 #[allow(clippy::too_many_arguments)]
 async fn create_link_node(
     parent_cap: &AbsoluteCapability,
     name: &str,
     target: &AbsoluteCapability,
-    is_dir: bool,
-    mime_type: Option<String>,
-    created_epoch: i64,
+    target_props: &FileProperties,
+    keys: &LinkNodeKeys,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
     mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<()> {
-    let link_r = random_symmetric_key()?;
-    let link_parent_key = loop {
-        let k = random_symmetric_key()?;
-        if k != link_r {
-            break k;
-        }
-    };
-    let link_w = random_symmetric_key()?;
-    let link_map_key = random_bytes(32);
-    let link_bat = Bat::new(random_bytes(32))?;
+    let link_r = keys.r_base.clone();
+    let link_parent_key = keys.parent_key.clone();
+    let link_w = keys.w_base.clone();
+    let link_map_key = keys.map_key.clone();
+    let link_bat = keys.bat.clone();
+    let is_dir = target_props.is_directory;
+    let mime_type = Some(target_props.mime_type.clone());
+    let created_epoch = target_props.created_epoch;
 
     let mut ctx = begin_dir_write(parent_cap, entry_signer.clone(), mirror_bat, &store, mutable).await?;
 
@@ -1917,7 +1941,8 @@ async fn create_link_node(
         .put("k", link_parent_key.to_cbor())
         .put("n", next_chunk.to_cbor())
         .build();
-    let mut props = FileProperties::new_directory(name.to_string(), created_epoch);
+    let mut props = target_props.clone();
+    props.name = name.to_string();
     props.is_link = true;
     let from_parent = CborObject::map()
         .put("p", to_parent.to_cbor())
@@ -1981,19 +2006,22 @@ fn copy_dir_contents<'a>(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
         for e in list_directory(old_cap, store.clone(), mutable).await? {
-            if let Some(old_owner) = keep_nested {
-                if let Some(target) = nested_writing_space(old_cap, &e, &store, mutable).await? {
+            // a copy takes a nested writing space's contents, reached through its link node
+            let mut source = e.cap.clone();
+            if let Some(target) = nested_writing_space(old_cap, &e, &store, mutable).await? {
+                if let Some(old_owner) = keep_nested {
                     relink_writing_space(new_cap, &e.name, &target, old_owner, new_signer, mirror_bat, &store, mutable)
                         .await?;
                     continue;
                 }
+                source = target;
             }
             if e.is_dir == Some(true) {
                 let sub_new =
                     create_directory(new_cap, &e.name, Some(new_signer.clone()), mirror_bat, store.clone(), mutable).await?;
-                copy_dir_contents(&e.cap, &sub_new, new_signer, keep_nested, mirror_bat, store.clone(), mutable).await?;
+                copy_dir_contents(&source, &sub_new, new_signer, keep_nested, mirror_bat, store.clone(), mutable).await?;
             } else {
-                let (props, bytes) = read_file(&e.cap, store.clone(), mutable).await?;
+                let (props, bytes) = read_file(&source, store.clone(), mutable).await?;
                 upload_file(
                     new_cap,
                     &e.name,
@@ -2022,9 +2050,8 @@ async fn nested_writing_space(
     if e.cap.writer != dir.writer {
         return Ok(Some(e.cap.clone()));
     }
-    if e.is_dir != Some(true) {
-        return Ok(None);
-    }
+    // a link node is a directory node even when its target is a file, so the
+    // entry's type hint can't tell us
     let (_n, props) = retrieve_file_metadata(&e.cap, store.clone(), mutable).await?;
     if !props.is_link {
         return Ok(None);
@@ -2046,17 +2073,10 @@ async fn relink_writing_space(
     mutable: &dyn MutablePointers,
 ) -> Result<()> {
     let (_n, props) = retrieve_file_metadata(target, store.clone(), mutable).await?;
-    let mime = if props.is_directory { None } else { Some(props.mime_type.clone()) };
-    create_link_node(new_dir, name, target, props.is_directory, mime, props.created_epoch, Some(new_owner.clone()), mirror_bat, store.clone(), mutable)
+    let keys = LinkNodeKeys::random()?;
+    create_link_node(new_dir, name, target, &props, &keys, Some(new_owner.clone()), mirror_bat, store.clone(), mutable)
         .await?;
-    let dir_node = retrieve_file_metadata(new_dir, store.clone(), mutable).await?.0;
-    let parent_link = RelCap {
-        writer: Some(new_dir.writer.clone()),
-        map_key: new_dir.map_key.clone(),
-        bat: new_dir.bat.clone(),
-        r_base_key: dir_node.get_parent_key(&new_dir.r_base_key),
-        w_base_key_link: None,
-    };
+    let parent_link = keys.parent_link(&new_dir.writer);
     let tid = store.start_transaction(&target.owner).await?;
     writing_space::reparent_writing_space(target, |_| parent_link, old_owner, new_owner, store, mutable, &tid).await?;
     store.close_transaction(&target.owner, &tid).await?;
@@ -2109,6 +2129,7 @@ async fn create_writable_shared_file(
     name: &str,
     content: &[u8],
     old_props: &FileProperties,
+    link: &LinkNodeKeys,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
     mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
@@ -2172,14 +2193,7 @@ async fn create_writable_shared_file(
     // --- 2. Write the file's chunk nodes (writer link on chunk 0) in the new writer.
     let writer_link = peergos_core::symmetric::CipherText::build(&file_w, &writer)?.to_cbor();
     let mime = mimetype::calculate_mime_type(content, name);
-    let parent_node = retrieve_file_metadata(parent_cap, store.clone(), mutable).await?.0;
-    let to_parent = RelCap {
-        writer: Some(parent_cap.writer.clone()),
-        map_key: parent_cap.map_key.clone(),
-        bat: parent_cap.bat.clone(),
-        r_base_key: parent_node.get_parent_key(&parent_cap.r_base_key),
-        w_base_key_link: None,
-    };
+    let to_parent = link.parent_link(&parent_cap.writer);
     let chunks = write_file_chunks(
         owner,
         &writer,
@@ -2354,26 +2368,23 @@ pub async fn force_rotate_child_to_new_writer(
     let old_writer = recover_signer(&old_target, store.clone(), mutable).await?;
     let (_old_meta, old_props) = retrieve_file_metadata(&old_target, store.clone(), mutable).await?;
     let is_dir = old_props.is_directory;
-    let created = old_props.created_epoch;
 
     // Create a fresh writer subspace, copy the old contents across, and relink.
+    let link_keys = LinkNodeKeys::random()?;
     let new_target = if is_dir {
-        let new_dir = create_writable_shared_dir(parent_cap, child_name, entry_signer.clone(), mirror_bat, store.clone(), mutable).await?;
+        let new_dir =
+            create_writable_shared_dir(parent_cap, child_name, &link_keys, entry_signer.clone(), mirror_bat, store.clone(), mutable).await?;
         let new_signer = recover_signer(&new_dir, store.clone(), mutable).await?;
         copy_dir_contents(&old_target, &new_dir, &new_signer, Some(&old_writer), mirror_bat, store.clone(), mutable).await?;
-        create_link_node(parent_cap, child_name, &new_dir, true, None, created, entry_signer.clone(), mirror_bat, store.clone(), mutable)
-            .await?;
         new_dir
     } else {
         let (props, content) = read_file(&old_target, store.clone(), mutable).await?;
-        let mime = props.mime_type.clone();
-        let new_file = create_writable_shared_file(
-            parent_cap, child_name, &content, &props, entry_signer.clone(), mirror_bat, store.clone(), mutable,
-        ).await?;
-        create_link_node(parent_cap, child_name, &new_file, false, Some(mime), created, entry_signer.clone(), mirror_bat, store.clone(), mutable)
-            .await?;
-        new_file
+        create_writable_shared_file(
+            parent_cap, child_name, &content, &props, &link_keys, entry_signer.clone(), mirror_bat, store.clone(), mutable,
+        ).await?
     };
+    create_link_node(parent_cap, child_name, &new_target, &old_props, &link_keys, entry_signer.clone(), mirror_bat, store.clone(), mutable)
+        .await?;
 
     // Delete the old target subspace (while its writer is still authorised), then
     // remove the orphaned old link node, then deauthorise the old writer.

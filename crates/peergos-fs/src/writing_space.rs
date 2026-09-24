@@ -3,8 +3,8 @@
 //!
 //! Granting write access compromises no key, so the subtree's cryptree nodes are
 //! re-homed under a new signing key unchanged rather than re-encrypted. Only the
-//! subtree root is rewritten, to carry the new signer and name the parent's writer
-//! in its parent link. Writing spaces nested inside the subtree keep their blocks
+//! subtree root is rewritten, to carry the new signer and a parent link to the link
+//! node that names it in the parent. Writing spaces nested inside the subtree keep their blocks
 //! and signer; only their parent link and which key owns them change. Revoking
 //! access is different, and still re-keys.
 
@@ -292,10 +292,9 @@ pub async fn move_to_new_writing_space(
     // signed by the new writer
     add_owned_writer(&owner, &old_signer, &new_signer, &store, mutable, &tid).await?;
 
-    let parent_link = root
-        .parent_link(&entry.cap.r_base_key)?
-        .ok_or_else(|| Error::Protocol(format!("{child_name} has no parent link")))?;
-    let new_parent_link = RelCap { writer: Some(parent_cap.writer.clone()), ..parent_link };
+    // the root's parent becomes the link node that will name it in the parent
+    let link_keys = LinkNodeKeys::random()?;
+    let new_parent_link = link_keys.parent_link(&parent_cap.writer);
     let new_root = with_parent_link(
         &with_writer_link(&root, &entry.cap.r_base_key, &w_base_key, &new_signer)?,
         &entry.cap.r_base_key,
@@ -355,14 +354,12 @@ pub async fn move_to_new_writing_space(
         .await?;
     }
 
-    let mime = if props.is_directory { None } else { Some(props.mime_type.clone()) };
     create_link_node(
         parent_cap,
         child_name,
         &new_cap,
-        props.is_directory,
-        mime,
-        props.created_epoch,
+        &props,
+        &link_keys,
         entry_signer.clone(),
         mirror_bat,
         store.clone(),
