@@ -1,7 +1,7 @@
 //! File content retrieval, ported from `FragmentedPaddedCipherText` /
 //! `EncryptedChunkRetriever`.
 //!
-//! A file's data is stored as one or more chunks (each ≤ 5 MiB). Each chunk's
+//! A file's data is stored as one or more chunks (each at most the file's chunk size). Each chunk's
 //! ciphertext is either inlined in the cryptree node or split across fragment
 //! blocks referenced by Merkle links. Currently single-chunk files are
 //! supported (inline and fragmented); multi-chunk traversal is a later step.
@@ -16,8 +16,38 @@ use peergos_crypto::hash::sha256;
 use peergos_crypto::random_bytes;
 use peergos_multiformats::Cid;
 
-/// Max chunk size (`Chunk.MAX_SIZE`).
-pub const CHUNK_MAX_SIZE: u64 = 5 * 1024 * 1024;
+/// The chunk size of every file written before the size became a property of the
+/// file (`Chunk.LEGACY_SIZE`). Files at this size use the legacy sha256 hash tree.
+pub const LEGACY_CHUNK_SIZE: u64 = 5 * 1024 * 1024;
+/// `Chunk.DEFAULT_SIZE`: a power of two, so each chunk is a whole BLAKE3 subtree.
+pub const DEFAULT_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+
+/// `Chunk.usesBlake3`: the chunk size also says which hash tree a file has.
+pub fn uses_blake3(chunk_size: u64) -> bool {
+    chunk_size != LEGACY_CHUNK_SIZE
+}
+
+/// `FileProperties.chunkSizeForNewFiles`: the single place that picks a size for a
+/// new file; everything else takes it from the file's own properties.
+pub fn chunk_size_for_new_files() -> u64 {
+    LEGACY_CHUNK_SIZE
+}
+
+/// `FileProperties.chunkSizeFromLog2`: only the sizes actually in use are accepted.
+pub fn chunk_size_from_log2(log2: i64) -> Result<u64> {
+    if !(0..=30).contains(&log2) {
+        return Err(Error::Cbor(format!("Unsupported chunk size in file properties: 2^{log2}")));
+    }
+    let size = 1u64 << log2;
+    if size != DEFAULT_CHUNK_SIZE && size != LEGACY_CHUNK_SIZE {
+        return Err(Error::Cbor(format!("Unsupported chunk size in file properties: 2^{log2}")));
+    }
+    Ok(size)
+}
+
+pub fn chunk_size_log2(size: u64) -> i64 {
+    size.trailing_zeros() as i64
+}
 /// Padding block size for chunk data (`CryptreeNode.MIN_FRAGMENT_SIZE`).
 pub const MIN_FRAGMENT_SIZE: usize = 4096;
 /// Threshold below which a chunk is inlined rather than fragmented.

@@ -4,7 +4,7 @@
 //! now_millis}` signed with the account's *identity* key, sent as `&auth=<hex>`.
 
 use crate::login::LoggedInUser;
-use crate::mfa::{MultiFactorAuthMethod, MultiFactorAuthResponse, TotpKey};
+use crate::mfa::{BackupCodes, MultiFactorAuthMethod, MultiFactorAuthResponse, TotpKey};
 use peergos_cbor::CborObject;
 use peergos_core::error::{Error, Result};
 use peergos_core::poster::HttpPoster;
@@ -50,6 +50,15 @@ pub async fn list_second_factors(
         .iter()
         .map(MultiFactorAuthMethod::from_cbor)
         .collect()
+}
+
+/// `Account.generateBackupCodes` (`genBackupCodes`): a fresh set of single use
+/// backup codes, replacing any earlier set. The plaintext codes are only returned
+/// here, so show them to the user now.
+pub async fn generate_backup_codes(user: &LoggedInUser, poster: &dyn HttpPoster) -> Result<BackupCodes> {
+    let auth = signed_auth(user, "genBackupCodes")?;
+    let url = format!("{LOGIN_URL}genBackupCodes?username={}&auth={auth}", user.username);
+    BackupCodes::from_cbor(&CborObject::from_bytes(&poster.get(&url).await?)?)
 }
 
 /// `Account.addTotpFactor` (`addTotp`): enrol a new (not-yet-enabled) TOTP factor,

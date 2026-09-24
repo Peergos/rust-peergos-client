@@ -235,12 +235,16 @@ impl SyncFilesystem for PeergosSyncFS {
         Ok(())
     }
 
-    async fn hash_file(&self, p: &Path, _size: u64) -> Result<[u8; 32]> {
-        let data = self.read(p).await?;
-        let root = peergos_fs::content_root_hash(&data)?;
+    async fn hash_file(&self, p: &Path, _size: u64, _chunk_size: u64) -> Result<([u8; 32], u64)> {
+        let cap = self.resolve_cap(p).await?
+            .ok_or_else(|| Error::Protocol(format!("not found: {}", p.display())))?;
+        // the file knows its own scheme; the caller's is only a guess about what it will
+        // be compared against, and this side is the authority
+        let (props, data) = read_file(&cap, self.bstore(), &*self.bmutable()).await?;
+        let root = peergos_fs::content_root_hash(&data, props.chunk_size)?;
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&root.hash);
-        Ok(hash)
+        Ok((hash, props.chunk_size))
     }
 
     async fn set_hash(&self, p: &Path, hash: [u8; 32], _size: u64) -> Result<()> {

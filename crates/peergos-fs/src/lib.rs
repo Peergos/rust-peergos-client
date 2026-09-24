@@ -31,20 +31,20 @@ pub mod transaction;
 pub use capability::{AbsoluteCapability, EncryptedCapability, Location, SecretLink, SecretLinkTarget};
 pub use login::{change_password, login, EntryPoint, LoggedInUser, MfaResponder};
 pub use mfa::{
-    current_totp, generate_totp, MfaType, MultiFactorAuthMethod, MultiFactorAuthRequest,
+    current_totp, generate_totp, BackupCodes, MfaType, MultiFactorAuthMethod, MultiFactorAuthRequest,
     MultiFactorAuthResponse, TotpKey,
 };
 pub use signup::signup;
 pub use social::{
     accept_follow_request, add_friend_annotation, add_member_to_group, block, collect_shares_for_user,
     get_blocked, get_directory_sharing_state, get_follow_requests, get_follower_names,
-    get_friend_annotations, get_following, get_friends, get_links, get_or_create_groups,
+    get_all_shares, get_friend_annotations, get_following, get_friends, get_links, get_or_create_groups,
     get_pending_outgoing, get_public_keys, get_shared_with, group_uid, unblock, unfollow,
     load_read_access_sharing_links, load_write_access_sharing_links, move_file,
     process_follow_reply, read_shared_capabilities, read_write_shared_capabilities, record_link,
     reject_follow_request, remove_link, send_follow_request, share_read_access, share_read_with_group, share_write_access,
     share_write_with_group, unshare_read_access, unshare_write_access, Access, CapabilitiesFromUser,
-    CapabilityWithPath, FileSharedWithState, FriendAnnotation, Groups, LinkProperties,
+    CapabilityWithPath, FileSharedWithState, FriendAnnotation, Groups, LinkMember, LinkProperties,
     ReceivedFollowRequest, SharedWithState, SocialState, FOLLOWERS_GROUP, FRIENDS_GROUP,
 };
 pub use cryptree::{
@@ -56,12 +56,12 @@ pub use admin::{
     AllowedSignups, LabelledSignedSpaceRequest, VersionInfo,
 };
 pub use cache::CryptreeCache;
-pub use context::{PaymentProperties, UserContext};
+pub use context::{PaymentProperties, SecretLinkSummary, UserContext, MAX_LINK_MEMBERS};
 pub use feed::{Content, FileRef, Resharing, SharedItem, SocialFeed, SocialPost};
 pub use filewrapper::FileWrapper;
 pub use profile::Profile;
 pub use incoming::{CapsInDirectory, ChildElement, IncomingCapCache, ProcessedCaps};
-pub use retrieve::{FragmentedPaddedCipherText, CHUNK_MAX_SIZE};
+pub use retrieve::{chunk_size_for_new_files, FragmentedPaddedCipherText, DEFAULT_CHUNK_SIZE, LEGACY_CHUNK_SIZE};
 pub use transaction::FileUploadTransaction;
 // move_to, rename_child, delete_child etc. are `pub async fn` at the crate root.
 
@@ -103,14 +103,28 @@ fn max_child_links_per_blob() -> usize {
         .unwrap_or(500)
 }
 
-/// Resolve a secret link to its [`AbsoluteCapability`] by fetching the encrypted
-/// capability from the server and decrypting it with the link password (plus an
-/// optional user password when the link requires one).
+/// Resolve a secret link to the capability it opens on: its first item. See
+/// [`retrieve_secret_link_capabilities`] for every item of a multi-item link.
 pub async fn retrieve_secret_link_capability(
     link_str: &str,
     store: &dyn ContentAddressedStorage,
     user_password: Option<&str>,
 ) -> Result<AbsoluteCapability> {
+    retrieve_secret_link_capabilities(link_str, store, user_password)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::Protocol("Secret link has no capabilities".into()))
+}
+
+/// Resolve a secret link to every [`AbsoluteCapability`] it holds, in order, by
+/// fetching the encrypted payload from the server and decrypting it with the link
+/// password (plus an optional user password when the link requires one).
+pub async fn retrieve_secret_link_capabilities(
+    link_str: &str,
+    store: &dyn ContentAddressedStorage,
+    user_password: Option<&str>,
+) -> Result<Vec<AbsoluteCapability>> {
     let link = SecretLink::from_link(link_str)?;
     let label = link.label_string();
     let enc_cbor = store.get_secret_link(&link.owner, &label).await?;
@@ -145,16 +159,18 @@ pub async fn create_secret_link(
     mutable: &dyn MutablePointers,
 ) -> Result<SecretLink> {
     let link = SecretLink::create(cap.owner.clone())?;
-    put_secret_link(cap, &link, user_password, expiry_epoch_secs, max_retrievals, signer, mirror_bat, store, mutable).await?;
+    put_secret_link(std::slice::from_ref(cap), &link, user_password, expiry_epoch_secs, max_retrievals, signer, mirror_bat, store, mutable).await?;
     Ok(link)
 }
 
-/// Store (or overwrite) the secret link `link` mapping `cap`, under `link`'s label —
+/// Store (or overwrite) the secret link `link` mapping `caps`, under `link`'s label —
 /// used both to mint a fresh link and to RE-MINT an existing one under the same
-/// label/password after the target's keys rotate (Java `updateSecretLink`).
+/// label/password after the target's keys rotate or its members change (Java
+/// `updateSecretLink`). Every cap must belong to the link's owner. Returns the cid
+/// of the stored link target.
 #[allow(clippy::too_many_arguments)]
 pub async fn put_secret_link(
-    cap: &AbsoluteCapability,
+    caps: &[AbsoluteCapability],
     link: &SecretLink,
     user_password: &str,
     expiry_epoch_secs: Option<i64>,
@@ -163,12 +179,25 @@ pub async fn put_secret_link(
     mirror_bat: Option<&BatWithId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
-) -> Result<()> {
+) -> Result<Cid> {
     let full_password = format!("{}{}", link.link_password, user_password);
     let has_user_password = !user_password.is_empty();
-    let enc = EncryptedCapability::create_from_password(cap, &link.label_string(), &full_password, has_user_password)?;
+    if let Some(foreign) = caps.iter().find(|c| c.owner != link.owner) {
+        return Err(Error::Protocol(format!(
+            "A secret link can only contain your own files, not one owned by {}", foreign.owner
+        )));
+    }
+    let enc = EncryptedCapability::create_from_password(caps, &link.label_string(), &full_password, has_user_password)?;
     let target = SecretLinkTarget { cap: enc, expiry_epoch_secs, max_retrievals };
-    add_secret_link(&cap.owner, signer, link.label, &target, mirror_bat, &store, mutable).await
+    // the serialised link has to fit in one block
+    let size = target.to_cbor().to_bytes().len();
+    if size > peergos_core::storage::MAX_BLOCK_SIZE {
+        return Err(Error::Protocol(format!(
+            "This link is too large at {size} bytes (limit {}). Remove some items, or share a folder instead.",
+            peergos_core::storage::MAX_BLOCK_SIZE
+        )));
+    }
+    add_secret_link(&link.owner, signer, link.label, &target, mirror_bat, &store, mutable).await
 }
 
 /// The secret-link CHAMP key for a label: sha256 of its 8 little-endian bytes
@@ -188,7 +217,7 @@ fn writer_data_with_link_field(wd: &CborObject, field: &str, cid: &Cid) -> Resul
 }
 
 /// Store `target` under `label` in the identity writer's secret-link CHAMP
-/// (`WriterData.addLink`) and commit the identity pointer.
+/// (`WriterData.addLink`) and commit the identity pointer, returning the target's cid.
 async fn add_secret_link(
     identity: &PublicKeyHash,
     signer: &SigningPrivateKeyAndPublicHash,
@@ -197,7 +226,7 @@ async fn add_secret_link(
     mirror_bat: Option<&BatWithId>,
     store: &Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
-) -> Result<()> {
+) -> Result<Cid> {
     let pointer = mutable.get_pointer_target(identity, &signer.public_key_hash, store.as_ref()).await?;
     let wd_cid = pointer.updated.clone().ok_or_else(|| Error::Protocol("identity has no data".into()))?;
     let wd = store.get(identity, &wd_cid, None).await?.ok_or_else(|| Error::Protocol("writer data missing".into()))?;
@@ -232,7 +261,7 @@ async fn add_secret_link(
         return Err(Error::Protocol("secret-link pointer rejected (concurrent modification?)".into()));
     }
     store.close_transaction(identity, &tid).await?;
-    Ok(())
+    Ok(value_cid)
 }
 
 /// Remove the secret link `label` from the identity writer's secret-link CHAMP and
@@ -475,7 +504,7 @@ async fn first_non_link_parent(
     }
 }
 
-/// Stream a file's contents: walk all chunks (each ≤ 5 MiB), decrypt one at a
+/// Stream a file's contents: walk all chunks (each at most the file's chunk size), decrypt one at a
 /// time and hand each plaintext slice to `sink`, never holding more than a single
 /// chunk in memory. Returns the file properties. This is the RAM-safe primitive
 /// for large files.
@@ -630,7 +659,7 @@ pub(crate) async fn read_file_section_cached(
         return Ok(Vec::new());
     }
     let end = (offset + length).min(props.size);
-    let chunk_size = retrieve::CHUNK_MAX_SIZE;
+    let chunk_size = props.chunk_size;
     let start_chunk = offset / chunk_size;
     let end_chunk = (end - 1) / chunk_size;
 
@@ -1231,7 +1260,7 @@ where
 }
 
 /// Stream a file of `size` bytes into a writable directory, holding at most one
-/// 5 MiB chunk in memory. `open` yields a fresh reader over the same content and
+/// chunk in memory. `open` yields a fresh reader over the same content and
 /// is called twice: once to compute the content hash tree, once to encrypt and
 /// upload. The thumbnail (if any) goes on chunk 0.
 #[allow(clippy::too_many_arguments)]
@@ -1250,7 +1279,29 @@ where
     R: std::io::Read,
     F: Fn() -> std::io::Result<R>,
 {
-    upload_file_streaming_inner(dir_cap, name, size, false, thumbnail, entry_signer, mirror_bat, open, store, mutable).await
+    upload_file_streaming_inner(dir_cap, name, size, false, retrieve::chunk_size_for_new_files(), thumbnail, entry_signer, mirror_bat, open, store, mutable).await
+}
+
+/// [`upload_file_streaming`] at an explicit chunk size rather than the one new files
+/// get, to write the files a newer client would for interop testing.
+#[allow(clippy::too_many_arguments)]
+pub async fn upload_file_streaming_at_chunk_size<R, F>(
+    dir_cap: &AbsoluteCapability,
+    name: &str,
+    size: u64,
+    chunk_size: u64,
+    entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
+    open: F,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<AbsoluteCapability>
+where
+    R: std::io::Read,
+    F: Fn() -> std::io::Result<R>,
+{
+    retrieve::chunk_size_from_log2(retrieve::chunk_size_log2(chunk_size))?;
+    upload_file_streaming_inner(dir_cap, name, size, false, chunk_size, None, entry_signer, mirror_bat, open, store, mutable).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1259,6 +1310,7 @@ async fn upload_file_streaming_inner<R, F>(
     name: &str,
     size: u64,
     hidden: bool,
+    chunk_size: u64,
     thumbnail: Option<(String, Vec<u8>)>,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
     mirror_bat: Option<&BatId>,
@@ -1295,7 +1347,7 @@ where
         Some(file_w_base.clone()),
     )?;
 
-    let chunk_size = retrieve::CHUNK_MAX_SIZE as usize;
+    let chunk_size = chunk_size as usize;
     let n_chunks = if size == 0 { 1 } else { size.div_ceil(chunk_size as u64) as usize };
     let chunk_len = |i: usize| -> usize {
         if i + 1 == n_chunks { (size as usize) - i * chunk_size } else { chunk_size }
@@ -1314,9 +1366,9 @@ where
             let n = want.min(mimetype::HEADER_BYTES_TO_IDENTIFY_MIME_TYPE);
             header = buf[..n].to_vec();
         }
-        chunk_hashes.push(peergos_crypto::hash::sha256(&buf[..want]));
+        chunk_hashes.push(hashtree::chunk_hash(&buf[..want], i as u64, chunk_size as u64, n_chunks == 1));
     }
-    let tree = hashtree::HashTree::build(&chunk_hashes)?;
+    let tree = hashtree::HashTree::build(&chunk_hashes, chunk_size as u64)?;
     let mime_type = mimetype::calculate_mime_type(&header, name);
     let thumbnail = auto_thumbnail(thumbnail, &mime_type, size, &open)?;
 
@@ -1361,6 +1413,7 @@ where
             if i == 0 { thumbnail.take() } else { None },
         );
         props.is_hidden = hidden;
+        props.chunk_size = chunk_size as u64;
         if i % 1024 == 0 {
             props.tree_hash = Some(tree.branch(i as u64));
         }
@@ -1476,6 +1529,7 @@ pub async fn upload_file_hidden(
         name,
         contents.len() as u64,
         true,
+        retrieve::chunk_size_for_new_files(),
         thumbnail,
         entry_signer,
         mirror_bat,
@@ -2114,6 +2168,7 @@ async fn create_writable_shared_file(
         &file_r,
         &file_data_key,
         &stream_secret,
+        old_props.chunk_size,
         &to_parent,
         Some(&writer_link),
         name,
@@ -2493,6 +2548,7 @@ async fn write_file_chunks(
     r_base_key: &SymmetricKey,
     data_key: &SymmetricKey,
     stream_secret: &[u8],
+    chunk_size: u64,
     to_parent: &RelCap,
     writer_link: Option<&CborObject>,
     name: &str,
@@ -2504,12 +2560,15 @@ async fn write_file_chunks(
     store: &Arc<dyn ContentAddressedStorage>,
     tid: &TransactionId,
 ) -> Result<Vec<(Vec<u8>, Cid)>> {
-    let chunk_size = retrieve::CHUNK_MAX_SIZE as usize;
+    let chunk_size = chunk_size as usize;
     let n_chunks = if content.is_empty() { 1 } else { content.len().div_ceil(chunk_size) };
     let hashes: Vec<Vec<u8>> = (0..n_chunks)
-        .map(|i| peergos_crypto::hash::sha256(&content[i * chunk_size..((i + 1) * chunk_size).min(content.len())]))
+        .map(|i| {
+            let chunk = &content[i * chunk_size..((i + 1) * chunk_size).min(content.len())];
+            hashtree::chunk_hash(chunk, i as u64, chunk_size as u64, n_chunks == 1)
+        })
         .collect();
-    let tree = hashtree::HashTree::build(&hashes)?;
+    let tree = hashtree::HashTree::build(&hashes, chunk_size as u64)?;
 
     let mut out = Vec::with_capacity(n_chunks);
     let mut map_key = first_map_key.to_vec();
@@ -2540,6 +2599,7 @@ async fn write_file_chunks(
             stream_secret.to_vec(),
             if i == 0 { thumbnail.clone() } else { None },
         );
+        props.chunk_size = chunk_size as u64;
         if i % 1024 == 0 {
             props.tree_hash = Some(tree.branch(i as u64));
         }
@@ -2585,7 +2645,7 @@ pub async fn rewrite_file_content(
         .stream_secret
         .clone()
         .ok_or_else(|| Error::Protocol("file without a stream secret".into()))?;
-    let old_n = chunk_count(old_props.size);
+    let old_n = chunk_count(old_props.size, old_props.chunk_size);
 
     let owner = &cap.owner;
     let pointer = mutable.get_pointer_target(owner, &cap.writer, store.as_ref()).await?;
@@ -2603,6 +2663,7 @@ pub async fn rewrite_file_content(
         r_base,
         &data_key,
         &stream_secret,
+        old_props.chunk_size,
         &to_parent,
         writer_link.as_ref(),
         &old_props.name,
@@ -2696,7 +2757,7 @@ pub async fn overwrite_file_section(
             "overwrite_file_section cannot grow the file; the range must lie within the current size".into(),
         ));
     }
-    let chunk_size = retrieve::CHUNK_MAX_SIZE;
+    let chunk_size = props.chunk_size;
     let start_chunk = offset / chunk_size;
     let end_chunk = (end - 1) / chunk_size;
 
@@ -3043,9 +3104,9 @@ struct ChunkLoc {
     r_base_key: SymmetricKey,
 }
 
-/// `ceil(size / CHUNK_MAX_SIZE)`, at least one (`FileProperties.chunkCount`).
-fn chunk_count(size: u64) -> u64 {
-    size.div_ceil(retrieve::CHUNK_MAX_SIZE).max(1)
+/// `ceil(size / chunk_size)`, at least one (`FileProperties.chunkCount`).
+fn chunk_count(size: u64, chunk_size: u64) -> u64 {
+    size.div_ceil(chunk_size).max(1)
 }
 
 /// Remove a champ entry for `map_key` (CAS on its current value), if present.
@@ -3092,7 +3153,7 @@ fn remove_all_chunks<'a>(
         if !node.is_directory() {
             // A file: walk its chunk chain and remove every chunk.
             if let Some(stream_secret) = &props.stream_secret {
-                let n = chunk_count(props.size);
+                let n = chunk_count(props.size, props.chunk_size);
                 let mut map_key = loc.map_key.clone();
                 let mut bat = loc.bat.clone();
                 for i in 0..n {
@@ -3694,7 +3755,7 @@ where
 {
     let owner = &txn.owner;
     let signer = &txn.writer;
-    let chunk_size = retrieve::CHUNK_MAX_SIZE as usize;
+    let chunk_size = txn.props.chunk_size as usize;
     let n_chunks = txn.chunk_count() as usize;
     let size = txn.size as usize;
     let chunk_len = |i: usize| if i + 1 == n_chunks { size - i * chunk_size } else { chunk_size };
@@ -3873,7 +3934,7 @@ where
     let first_bat = Bat::new(random_bytes(32))?;
 
     // Pass 1: content hash tree + MIME (bounded RAM).
-    let chunk_size = retrieve::CHUNK_MAX_SIZE as usize;
+    let chunk_size = retrieve::chunk_size_for_new_files() as usize;
     let n_chunks = if size == 0 { 1 } else { size.div_ceil(chunk_size as u64) as usize };
     let mut reader = open().map_err(|e| Error::Protocol(format!("open error: {e}")))?;
     let mut buf = vec![0u8; chunk_size];
@@ -3885,9 +3946,9 @@ where
         if i == 0 {
             header = buf[..want.min(mimetype::HEADER_BYTES_TO_IDENTIFY_MIME_TYPE)].to_vec();
         }
-        chunk_hashes.push(peergos_crypto::hash::sha256(&buf[..want]));
+        chunk_hashes.push(hashtree::chunk_hash(&buf[..want], i as u64, chunk_size as u64, n_chunks == 1));
     }
-    let tree = hashtree::HashTree::build(&chunk_hashes)?;
+    let tree = hashtree::HashTree::build(&chunk_hashes, chunk_size as u64)?;
     let mime_type = mimetype::calculate_mime_type(&header, name);
     let thumbnail = auto_thumbnail(thumbnail, &mime_type, size, &open)?;
 
@@ -3927,6 +3988,7 @@ where
         write_key,
         stream_secret,
         size,
+        hash: Some(tree.clone()),
     };
 
     open_transaction(home_cap, &txn, store.clone(), mutable).await?;
@@ -3938,7 +4000,7 @@ where
 }
 
 /// The standard user-facing upload. Routes exactly like Java's `uploadFilePart`
-/// (`FileWrapper.java`): a single-chunk file (`size <= CHUNK_MAX_SIZE`) is written
+/// (`FileWrapper.java`): a single-chunk file (`size <= chunk_size_for_new_files()`) is written
 /// with one atomic [`upload_file_streaming`], while a multi-chunk file goes
 /// through a crash-safe [`upload_file_with_transaction`] (record in
 /// `.transactions` + incremental per-chunk commits, so it can be listed, cleaned
@@ -3962,7 +4024,7 @@ where
     R: std::io::Read,
     F: Fn() -> std::io::Result<R>,
 {
-    if size <= retrieve::CHUNK_MAX_SIZE {
+    if size <= retrieve::chunk_size_for_new_files() {
         upload_file_streaming(dir_cap, name, size, thumbnail, entry_signer, mirror_bat, open, store, mutable).await
     } else {
         upload_file_with_transaction(
@@ -4051,7 +4113,7 @@ impl FileUpload {
     /// unchanged copy is skipped.
     pub fn from_bytes(name: impl Into<String>, data: Vec<u8>) -> FileUpload {
         let size = data.len() as u64;
-        let hash = content_root_hash(&data).ok();
+        let hash = content_root_hash(&data, retrieve::chunk_size_for_new_files()).ok();
         let data = Arc::new(data);
         FileUpload {
             name: name.into(),
@@ -4076,35 +4138,35 @@ pub struct FolderUpload {
     pub files: Vec<FileUpload>,
 }
 
-/// The content hash-tree root a file's bytes would produce on upload (the same
-/// `HashTree` upload builds), for content-based dedup against a remote file's
-/// stored `tree_hash`.
-pub fn content_root_hash(data: &[u8]) -> Result<hashtree::RootHash> {
-    let chunk = retrieve::CHUNK_MAX_SIZE as usize;
+/// The content hash-tree root these bytes would have as a file of `chunk_size`
+/// chunks (the same `HashTree` upload builds), for content-based dedup against a
+/// remote file's stored `tree_hash`. Pass the remote file's chunk size, since the
+/// chunk size also picks the hash algorithm.
+pub fn content_root_hash(data: &[u8], chunk_size: u64) -> Result<hashtree::RootHash> {
+    let chunk = chunk_size as usize;
     let n = if data.is_empty() { 1 } else { data.len().div_ceil(chunk) };
     let mut hashes = Vec::with_capacity(n);
     for i in 0..n {
         let end = ((i + 1) * chunk).min(data.len());
-        hashes.push(peergos_crypto::hash::sha256(&data[i * chunk..end]));
+        hashes.push(hashtree::chunk_hash(&data[i * chunk..end], i as u64, chunk_size, n == 1));
     }
-    Ok(hashtree::HashTree::build(&hashes)?.root_hash)
+    Ok(hashtree::HashTree::build(&hashes, chunk_size)?.root_hash)
 }
 
-/// Compute the Merkle tree root hash of a file at `path` by reading it in 5 MiB
-/// chunks, SHA-256 hashing each chunk, and building the hash tree.
+/// Compute the content hash tree root of a file at `path` as a Peergos file of
+/// `chunk_size` chunks, which also picks the scheme (sha256 or BLAKE3).
 /// Uses [`std::thread::available_parallelism`] threads automatically.
-pub fn hash_file_parallel(path: &std::path::Path, size: u64) -> Result<hashtree::RootHash> {
+pub fn hash_file_parallel(path: &std::path::Path, size: u64, chunk_size: u64) -> Result<hashtree::RootHash> {
     let n_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    hash_file_with_threads(path, size, n_threads)
+    hash_file_with_threads(path, size, chunk_size, n_threads)
 }
 
 /// Like [`hash_file_parallel`] but with an explicit thread count.
-pub fn hash_file_with_threads(path: &std::path::Path, size: u64, n_threads: usize) -> Result<hashtree::RootHash> {
-    let chunk_size = retrieve::CHUNK_MAX_SIZE;
+pub fn hash_file_with_threads(path: &std::path::Path, size: u64, chunk_size: u64, n_threads: usize) -> Result<hashtree::RootHash> {
     if size == 0 {
-        return hashtree::HashTree::build(&[peergos_crypto::hash::sha256(&[])])
+        return hashtree::HashTree::build(&[hashtree::chunk_hash(&[], 0, chunk_size, true)], chunk_size)
             .map(|t| t.root_hash);
     }
     let n_chunks = size.div_ceil(chunk_size) as usize;
@@ -4115,10 +4177,10 @@ pub fn hash_file_with_threads(path: &std::path::Path, size: u64, n_threads: usiz
     } else {
         read_chunk_hashes_parallel(path, size, n_chunks, n_threads, chunk_size as usize)?
     };
-    hashtree::HashTree::build(&chunk_hashes).map(|t| t.root_hash)
+    hashtree::HashTree::build(&chunk_hashes, chunk_size).map(|t| t.root_hash)
 }
 
-/// Read a file and SHA-256 hash each 5 MiB chunk serially.
+/// Read a file and hash each chunk serially.
 fn read_chunk_hashes_serial(
     file: &mut impl Read,
     size: u64,
@@ -4145,7 +4207,7 @@ fn read_chunk_hashes_serial(
         if total == 0 {
             break;
         }
-        hashes.push(peergos_crypto::hash::sha256(&buf[..total]));
+        hashes.push(hashtree::chunk_hash(&buf[..total], hashes.len() as u64, chunk_size as u64, n_chunks == 1));
         remaining -= total as u64;
         if total < to_read {
             break;
@@ -4155,7 +4217,7 @@ fn read_chunk_hashes_serial(
     Ok(hashes)
 }
 
-/// Read a file and SHA-256 hash each 5 MiB chunk in parallel across `n_threads`.
+/// Read a file and hash each chunk in parallel across `n_threads`.
 fn read_chunk_hashes_parallel(
     path: &std::path::Path,
     size: u64,
@@ -4174,8 +4236,8 @@ fn read_chunk_hashes_parallel(
             }
             let results = std::sync::Arc::clone(&results);
             s.spawn(move || {
-                let start_offset = start_chunk as u64 * retrieve::CHUNK_MAX_SIZE;
-                let end_offset = size.min(end_chunk as u64 * retrieve::CHUNK_MAX_SIZE);
+                let start_offset = start_chunk as u64 * chunk_size as u64;
+                let end_offset = size.min(end_chunk as u64 * chunk_size as u64);
                 let range_len = end_offset - start_offset;
                 let result = (|| -> Result<Vec<Vec<u8>>> {
                     let mut file = std::fs::File::open(path)
@@ -4199,7 +4261,8 @@ fn read_chunk_hashes_parallel(
                         if total == 0 {
                             break;
                         }
-                        hashes.push(peergos_crypto::hash::sha256(&buf[..total]));
+                        let index = (start_chunk + hashes.len()) as u64;
+                        hashes.push(hashtree::chunk_hash(&buf[..total], index, chunk_size as u64, n_chunks == 1));
                         remaining -= total as u64;
                         if total < to_read {
                             break;
@@ -4316,7 +4379,7 @@ pub async fn upload_subtree(
                     continue;
                 }
             }
-            if f.size > retrieve::CHUNK_MAX_SIZE {
+            if f.size > retrieve::chunk_size_for_new_files() {
                 if !batch.is_empty() {
                     commit_small_batch(&dir_cap, &base_signer, mirror_bat, std::mem::take(&mut batch), &bstore, bmutable.as_ref()).await?;
                     batch_bytes = 0;
@@ -4414,6 +4477,7 @@ async fn commit_small_batch(
             &file_r_base,
             &file_data_key,
             &stream_secret,
+            retrieve::chunk_size_for_new_files(),
             &to_parent,
             None,
             &f.name,
@@ -4619,21 +4683,23 @@ where
 {
     let _ = &entry_signer; // the transaction records the parent's writer directly
     let start = find_first_absent_chunk(txn, &store, mutable).await? as usize;
-    // The record only stored chunk 0's hash-tree branch, which is the whole tree for
-    // files up to 1024 chunks. For larger files, recompute the tree from the source
-    // so every branch (one per 1024 chunks) is set on the resumed chunks.
+    // Chunk 0's hash-tree branch is the whole tree for files up to 1024 chunks. For
+    // larger files every branch is needed: take the full tree from the record, or
+    // for a record that predates carrying it, recompute it from the source.
     let n_chunks = txn.chunk_count() as usize;
-    let tree = if n_chunks > 1024 {
-        let chunk_size = retrieve::CHUNK_MAX_SIZE as usize;
+    let tree = if txn.hash.is_some() {
+        txn.hash.clone()
+    } else if n_chunks > 1024 {
+        let chunk_size = txn.props.chunk_size as usize;
         let mut reader = open().map_err(|e| Error::Protocol(format!("open error: {e}")))?;
         let mut buf = vec![0u8; chunk_size];
         let mut chunk_hashes = Vec::with_capacity(n_chunks);
         for i in 0..n_chunks {
             let want = if i + 1 == n_chunks { (txn.size as usize) - i * chunk_size } else { chunk_size };
             read_exact(&mut reader, &mut buf[..want])?;
-            chunk_hashes.push(peergos_crypto::hash::sha256(&buf[..want]));
+            chunk_hashes.push(hashtree::chunk_hash(&buf[..want], i as u64, chunk_size as u64, n_chunks == 1));
         }
-        Some(hashtree::HashTree::build(&chunk_hashes)?)
+        Some(hashtree::HashTree::build(&chunk_hashes, chunk_size as u64)?)
     } else {
         None
     };

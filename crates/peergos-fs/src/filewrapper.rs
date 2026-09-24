@@ -435,11 +435,10 @@ impl FileWrapper {
     /// `new_size` bytes (best-effort: falls back to just chunk 0 if metadata can't
     /// be read).
     async fn rewrite_chunk_keys(&self, new_size: u64) -> Vec<Vec<u8>> {
-        let chunk = crate::retrieve::CHUNK_MAX_SIZE;
-        let new_n = new_size.div_ceil(chunk).max(1);
         match crate::retrieve_file_metadata(&self.cap, self.store.clone(), self.mutable.as_ref()).await {
             Ok((_, props)) => {
-                let old_n = props.size.div_ceil(chunk).max(1);
+                let new_n = new_size.div_ceil(props.chunk_size).max(1);
+                let old_n = props.size.div_ceil(props.chunk_size).max(1);
                 let n = new_n.max(old_n);
                 match &props.stream_secret {
                     Some(ss) => crate::file_chunk_map_keys(&self.cap, ss, n).unwrap_or_else(|_| vec![self.cap.map_key.clone()]),
@@ -451,7 +450,7 @@ impl FileWrapper {
     }
 
     /// Upload a file into this directory and return its wrapper (`uploadFile`).
-    /// Multi-chunk files (`> CHUNK_MAX_SIZE`) go through a crash-safe transaction;
+    /// Multi-chunk files go through a crash-safe transaction;
     /// single-chunk files are written atomically — matching Java's `uploadFilePart`.
     pub async fn upload(&self, name: &str, data: &[u8]) -> Result<FileWrapper> {
         let path = join(&self.path, name);

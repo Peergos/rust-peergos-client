@@ -8,6 +8,7 @@
 //! resumed later (the record has everything needed to recompute chunk locations).
 
 use crate::cryptree::FileProperties;
+use crate::hashtree::HashTree;
 use peergos_cbor::{CborObject, Cborable, CborString};
 use peergos_core::auth::Bat;
 use peergos_core::error::{Error, Result};
@@ -36,6 +37,8 @@ pub struct FileUploadTransaction {
     pub write_key: SymmetricKey,
     pub stream_secret: Vec<u8>,
     pub size: u64,
+    /// The whole content hash tree, so a resume of a file over 1024 chunks needn't rehash it.
+    pub hash: Option<HashTree>,
 }
 
 impl FileUploadTransaction {
@@ -44,9 +47,9 @@ impl FileUploadTransaction {
         Ok(hash_to_cid(path.as_bytes(), true)?.to_string())
     }
 
-    /// The number of chunks (`ceil(size / CHUNK_MAX_SIZE)`, at least one).
+    /// The number of chunks (`ceil(size / chunk_size)`, at least one).
     pub fn chunk_count(&self) -> u64 {
-        self.size.div_ceil(crate::retrieve::CHUNK_MAX_SIZE).max(1)
+        self.size.div_ceil(self.props.chunk_size).max(1)
     }
 
     pub fn to_cbor(&self) -> CborObject {
@@ -69,6 +72,9 @@ impl FileUploadTransaction {
         put("mapKey", CborObject::ByteString(self.first_map_key.clone()));
         put("streamSecret", CborObject::ByteString(self.stream_secret.clone()));
         put("size", CborObject::Long(self.size as i64));
+        if let Some(h) = &self.hash {
+            put("hash", h.to_cbor());
+        }
         CborObject::Map(m)
     }
 
@@ -89,6 +95,7 @@ impl FileUploadTransaction {
             write_key: SymmetricKey::from_cbor(g("writeKey")?)?,
             stream_secret: g("streamSecret")?.as_bytes().ok_or_else(|| Error::Cbor("bad streamSecret".into()))?.to_vec(),
             size: g("size")?.as_long().ok_or_else(|| Error::Cbor("bad size".into()))? as u64,
+            hash: cbor.get("hash").map(HashTree::from_cbor).transpose()?,
         })
     }
 }

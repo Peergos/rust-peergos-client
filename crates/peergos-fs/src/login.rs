@@ -259,7 +259,7 @@ fn sign_now(login_secret: &SecretSigningKey) -> Result<Vec<u8>> {
 pub type MfaResponder<'a> =
     dyn Fn(&crate::mfa::MultiFactorAuthRequest) -> Result<crate::mfa::MultiFactorAuthResponse> + 'a;
 
-/// GET `login/getLogin`, optionally carrying an MFA response, decoding the
+/// POST `login/getLogin`, optionally carrying an MFA response, decoding the
 /// `LoginResponse` cbor `{"a": bool, "r": UserStaticData | MultiFactorAuthRequest}`.
 async fn fetch_login(
     poster: &dyn HttpPoster,
@@ -268,12 +268,15 @@ async fn fetch_login(
     auth: &str,
     mfa: Option<&crate::mfa::MultiFactorAuthResponse>,
 ) -> Result<CborObject> {
-    let mut url =
-        format!("{LOGIN_URL}getLogin?username={username}&author={author}&auth={auth}&proxy=false");
+    let mut url = format!(
+        "{LOGIN_URL}getLogin?username={username}&author={author}&auth={auth}&proxy=false&mfaTypes={}",
+        crate::mfa::supported_mfa_types_param()
+    );
     if let Some(m) = mfa {
         url.push_str(&format!("&mfa={}", to_hex(&m.serialize())));
     }
-    Ok(CborObject::from_bytes(&poster.get(&url).await?)?)
+    // always a POST: a server that isn't public refuses a GET
+    Ok(CborObject::from_bytes(&poster.post_unzip(&url, Vec::new(), peergos_core::poster::DEFAULT_TIMEOUT_MS).await?)?)
 }
 
 /// `Account.getLoginData` — fetch and decrypt the encrypted entry points. If the

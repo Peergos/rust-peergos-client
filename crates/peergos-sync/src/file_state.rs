@@ -10,22 +10,35 @@ pub struct FileState {
     pub modification_time: i64,
     /// File size in bytes.
     pub size: u64,
-    /// BLAKE2b-256 hash of the file content.
+    /// Root of the file's content hash tree, built at `chunk_size`.
     pub hash: [u8; 32],
+    /// The chunk size, and so the scheme, the hash was built with. A local file must
+    /// be hashed the way the file it is compared against was hashed, and a local file
+    /// has no properties of its own, so the last synced state is where it is kept.
+    pub chunk_size: u64,
 }
 
 impl FileState {
     pub fn new(rel_path: String, modification_time: i64, size: u64, hash: [u8; 32]) -> Self {
-        FileState { rel_path, modification_time, size, hash }
+        FileState { rel_path, modification_time, size, hash, chunk_size: peergos_fs::LEGACY_CHUNK_SIZE }
+    }
+
+    pub fn with_chunk_size(mut self, chunk_size: u64) -> Self {
+        self.chunk_size = chunk_size;
+        self
     }
 
     pub fn to_cbor(&self) -> CborObject {
-        CborObject::map()
+        let mut b = CborObject::map()
             .put("r", CborObject::Str(self.rel_path.clone()))
             .put("m", CborObject::Long(self.modification_time))
             .put("s", CborObject::Long(self.size as i64))
-            .put("h", CborObject::ByteString(self.hash.to_vec()))
-            .build()
+            .put("h", CborObject::ByteString(self.hash.to_vec()));
+        // absent means the legacy size, so every state written before this stays readable
+        if self.chunk_size != peergos_fs::LEGACY_CHUNK_SIZE {
+            b = b.put("cs", CborObject::Long(self.chunk_size.trailing_zeros() as i64));
+        }
+        b.build()
     }
 
     pub fn from_cbor(cbor: &CborObject) -> Result<Self> {
@@ -39,6 +52,10 @@ impl FileState {
                 let len = b.len().min(32);
                 h[..len].copy_from_slice(&b[..len]);
                 h
+            },
+            chunk_size: match cbor.get("cs").and_then(|c| c.as_long()) {
+                Some(log2) => peergos_fs::retrieve::chunk_size_from_log2(log2)?,
+                None => peergos_fs::LEGACY_CHUNK_SIZE,
             },
         })
     }

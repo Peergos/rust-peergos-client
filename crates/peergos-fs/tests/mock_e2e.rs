@@ -4001,3 +4001,120 @@ async fn uploaded_image_gets_thumbnail() {
     let txt = ctx.get_by_path("/dave/notes.txt").await.unwrap().unwrap();
     assert!(txt.properties().thumbnail.is_none(), "a text file should not get a thumbnail");
 }
+
+/// A file written at the 4 MiB BLAKE3 chunk size, as a newer client will write them,
+/// must read back byte for byte, including ranges that straddle its chunk boundaries,
+/// and keep its chunk size when rewritten.
+#[tokio::test]
+async fn read_and_rewrite_4mib_chunk_file() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = UserContext::sign_up("bea", "bpw", None, poster.clone(), store.clone(), mutable).await.expect("sign up");
+    let home = ctx.get_home().await.unwrap();
+
+    let chunk = peergos_fs::DEFAULT_CHUNK_SIZE as usize;
+    let data: Vec<u8> = (0..2 * chunk + 12345).map(|i| (i % 251) as u8).collect();
+    let bytes = data.clone();
+    peergos_fs::upload_file_streaming_at_chunk_size(
+        home.capability(),
+        "b3.bin",
+        data.len() as u64,
+        peergos_fs::DEFAULT_CHUNK_SIZE,
+        home.signer().cloned(),
+        ctx.mirror_bat_id().as_ref(),
+        move || Ok(std::io::Cursor::new(bytes.clone())),
+        ctx.store(),
+        ctx.mutable().as_ref(),
+    )
+    .await
+    .unwrap();
+
+    let f = ctx.get_by_path("b3.bin").await.unwrap().unwrap();
+    assert_eq!(f.properties().chunk_size, peergos_fs::DEFAULT_CHUNK_SIZE);
+    let root = &f.properties().tree_hash.as_ref().unwrap().root_hash.hash;
+    assert_eq!(root, &peergos_crypto::hash::blake3(&data), "the stored root is the file's BLAKE3 hash");
+    assert_eq!(f.read().await.unwrap(), data);
+    for (offset, len) in [(chunk - 10, 20), (2 * chunk - 1, 2), (chunk, chunk), (0, data.len())] {
+        let got = f.read_section(offset as u64, len as u64).await.unwrap();
+        assert_eq!(got, &data[offset..(offset + len).min(data.len())], "section {offset}+{len}");
+    }
+
+    let cut = chunk + 100;
+    f.truncate(cut as u64).await.unwrap();
+    let f = ctx.get_by_path("b3.bin").await.unwrap().unwrap();
+    assert_eq!(f.properties().chunk_size, peergos_fs::DEFAULT_CHUNK_SIZE, "a rewrite keeps the chunk size");
+    assert_eq!(f.read().await.unwrap(), &data[..cut]);
+}
+
+/// A link over several items, each read-only or writable, that keeps its string as
+/// items are added, lists once, and survives one of its items being re-keyed.
+#[tokio::test]
+async fn multi_item_secret_link() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = UserContext::sign_up("mia", "mpw", None, poster.clone(), store.clone(), mutable.clone()).await.expect("sign up");
+    let home = ctx.get_home().await.unwrap();
+    home.upload("a.txt", b"alpha").await.unwrap();
+    home.get_latest().await.unwrap().upload("b.txt", b"beta").await.unwrap();
+    let docs = home.get_latest().await.unwrap().mkdir("docs").await.unwrap();
+    docs.upload("c.txt", b"gamma").await.unwrap();
+
+    let paths = vec!["a.txt".to_string(), "docs".to_string()];
+    let props = ctx.create_secret_link_to(&paths, &["docs".to_string()], "", None, None).await.expect("create");
+    assert_eq!(props.members.len(), 2);
+    assert!(props.writable);
+    let link = ctx.secret_link_string(&props).unwrap();
+
+    let caps = peergos_fs::retrieve_secret_link_capabilities(&link, store.as_ref(), None).await.unwrap();
+    assert_eq!(caps.len(), 2);
+    assert!(caps[0].w_base_key.is_none(), "a.txt is read-only");
+    assert!(caps[1].w_base_key.is_some(), "docs is writable");
+
+    // Opening it mounts every item at its own path and lands on the first.
+    let viewer = UserContext::from_secret_link(&link, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    assert_eq!(viewer.link_mount_paths(), vec!["/mia/a.txt".to_string(), "/mia/docs".to_string()]);
+    assert_eq!(viewer.get_by_path("/mia/a.txt").await.unwrap().unwrap().read().await.unwrap(), b"alpha");
+    assert_eq!(viewer.get_by_path("/mia/docs/c.txt").await.unwrap().unwrap().read().await.unwrap(), b"gamma");
+
+    // Listed once, although recorded under each item.
+    let all = ctx.get_all_secret_links().await.unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].paths(), paths);
+
+    // Adding an item keeps the link string, and whoever holds it gets the new item.
+    let grown = ctx.add_to_secret_link(&all[0], "b.txt", false).await.unwrap();
+    assert_eq!(ctx.secret_link_string(&grown).unwrap(), link);
+    assert_eq!(peergos_fs::retrieve_secret_link_capabilities(&link, store.as_ref(), None).await.unwrap().len(), 3);
+    let members = ctx.get_secret_link_members(&grown).await.unwrap();
+    let member_paths: Vec<&str> = members.iter().map(|m| m.path.as_str()).collect();
+    assert_eq!(member_paths, vec!["/mia/a.txt", "/mia/docs", "/mia/b.txt"]);
+
+    // Moving b.txt into its own writing space re-keys it; re-minting the links to it
+    // must keep every other item of this link.
+    let _single = ctx.create_secret_link("b.txt", true, "", None, None).await.unwrap();
+    let after = peergos_fs::retrieve_secret_link_capabilities(&link, store.as_ref(), None).await.unwrap();
+    assert_eq!(after.len(), 3, "re-minting one item must not drop the others");
+    assert_eq!(peergos_fs::read_file(&after[2], store.clone(), mutable.as_ref()).await.unwrap().1, b"beta");
+
+    // Deleting clears it from every item it held.
+    ctx.delete_secret_link("docs", props.label).await.unwrap();
+    assert!(peergos_fs::retrieve_secret_link_capabilities(&link, store.as_ref(), None).await.is_err());
+    let remaining = ctx.get_all_secret_links().await.unwrap();
+    assert!(remaining.iter().all(|l| l.props.label != props.label));
+}
+
+/// A single item link is written exactly as before (a bare capability, not a list),
+/// so older clients can still open it.
+#[tokio::test]
+async fn single_item_link_payload_is_a_bare_capability() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = UserContext::sign_up("sol", "spw", None, poster, store.clone(), mutable).await.expect("sign up");
+    ctx.get_home().await.unwrap().upload("f.txt", b"x").await.unwrap();
+    let link = ctx.create_secret_link("f.txt", false, "", None, None).await.unwrap();
+    let parsed = peergos_fs::SecretLink::from_link(&link).unwrap();
+    let enc = peergos_fs::EncryptedCapability::from_cbor(&store.get_secret_link(&parsed.owner, &parsed.label_string()).await.unwrap()).unwrap();
+    let key = peergos_fs::EncryptedCapability::derive_key(&parsed.label_string(), &parsed.link_password).unwrap();
+    let is_map = enc.payload.decrypt(&key, |c| Ok(matches!(c, peergos_cbor::CborObject::Map(_)))).unwrap();
+    assert!(is_map);
+}

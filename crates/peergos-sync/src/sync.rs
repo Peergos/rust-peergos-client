@@ -8,7 +8,6 @@ use crate::file_state::FileState;
 use crate::filesystem::{FileProps, SyncFilesystem, UploadFile, UploadFolder};
 use crate::state::SyncState;
 
-const CHUNK_MAX_SIZE: u64 = 5 * 1024 * 1024;
 const BATCH_MAX_COUNT: u64 = 1_000;
 const BATCH_MAX_SIZE: u64 = 100 * 1024 * 1024;
 
@@ -55,8 +54,14 @@ pub async fn build_dir_state(
     };
 
     for (rel_path, mtime, size) in pending {
-        let hash = fs.hash_file(&std::path::PathBuf::from(&rel_path), size).await?;
-        let f = FileState::new(rel_path, mtime, size, hash);
+        // the chunk size it had when last synced, or for a file neither side has seen
+        // before, the one a new file gets
+        let chunk_size = synced
+            .by_path(&rel_path)
+            .map(|s| s.chunk_size)
+            .unwrap_or_else(peergos_fs::chunk_size_for_new_files);
+        let (hash, chunk_size) = fs.hash_file(&std::path::PathBuf::from(&rel_path), size, chunk_size).await?;
+        let f = FileState::new(rel_path, mtime, size, hash).with_chunk_size(chunk_size);
         res.add(f);
     }
 
@@ -165,7 +170,7 @@ pub async fn sync_dir(
         // ---- small-file bulk-upload classification ----
         let is_small_remote_copy = synced_fs.is_none()
             && remote_fs.is_none()
-            && local_fs.map(|l| l.size < CHUNK_MAX_SIZE).unwrap_or(false);
+            && local_fs.map(|l| l.size < peergos_fs::chunk_size_for_new_files()).unwrap_or(false);
         if is_small_remote_copy {
             let local = local_fs.unwrap();
             let l_hash = local.hash;
@@ -968,7 +973,7 @@ async fn rename_on_conflict(
     } else {
         new_name.clone()
     };
-    Ok(FileState::new(new_rel_path, new_mtime, state.size, state.hash))
+    Ok(FileState::new(new_rel_path, new_mtime, state.size, state.hash).with_chunk_size(state.chunk_size))
 }
 
 fn split_path(path: &str) -> (String, String) {

@@ -2,8 +2,8 @@
 //!
 //! When the server has a second factor enabled, `login/getLogin` returns a
 //! [`MultiFactorAuthRequest`] instead of the encrypted login data. The client
-//! answers with a [`MultiFactorAuthResponse`] — either the current TOTP 6-digit
-//! code or a [`WebauthnResponse`] — and retries `getLogin` with it.
+//! answers with a [`MultiFactorAuthResponse`] — the current TOTP 6-digit code, a
+//! single use backup code, or a [`WebauthnResponse`] — and retries `getLogin` with it.
 //!
 //! TOTP here is RFC 6238 with the Google-Authenticator-compatible parameters that
 //! Peergos fixes (`TotpKey.ALGORITHM = HmacSHA1`, 6 digits, 30-second step).
@@ -28,17 +28,48 @@ pub struct MultiFactorAuthMethod {
 pub enum MfaType {
     Totp,
     Webauthn,
+    /// Single use codes for when an authenticator is lost.
+    BackupCodes,
+    /// A code factor belonging to a device mount rather than a person; never
+    /// offered to a client a human logs in through.
+    Mount,
     Unknown(i64),
 }
+
+/// The second factor types this client can present, sent as `mfaTypes` on
+/// `getLogin` so a newer server doesn't offer one we would fail to answer.
+pub const SUPPORTED_MFA_TYPES: [MfaType; 3] = [MfaType::Totp, MfaType::Webauthn, MfaType::BackupCodes];
 
 impl MfaType {
     fn from_value(v: i64) -> MfaType {
         match v {
             0x1 => MfaType::Totp,
             0x2 => MfaType::Webauthn,
+            0x3 => MfaType::BackupCodes,
+            0x4 => MfaType::Mount,
             other => MfaType::Unknown(other),
         }
     }
+
+    pub fn value(&self) -> i64 {
+        match self {
+            MfaType::Totp => 0x1,
+            MfaType::Webauthn => 0x2,
+            MfaType::BackupCodes => 0x3,
+            MfaType::Mount => 0x4,
+            MfaType::Unknown(v) => *v,
+        }
+    }
+
+    /// Whether a client driven by a human should be offered this as a way to log in.
+    pub fn is_interactive(&self) -> bool {
+        !matches!(self, MfaType::Mount | MfaType::Unknown(_))
+    }
+}
+
+/// The `mfaTypes` query value: the supported type values, comma separated.
+pub fn supported_mfa_types_param() -> String {
+    SUPPORTED_MFA_TYPES.iter().map(|t| t.value().to_string()).collect::<Vec<_>>().join(",")
 }
 
 impl MultiFactorAuthMethod {
@@ -90,6 +121,60 @@ impl MultiFactorAuthRequest {
     pub fn webauthn_method(&self) -> Option<&MultiFactorAuthMethod> {
         self.methods.iter().find(|m| m.kind == MfaType::Webauthn && m.enabled)
     }
+
+    /// The enabled backup codes factor, if any. Its name is the number of unused codes.
+    pub fn backup_codes_method(&self) -> Option<&MultiFactorAuthMethod> {
+        self.methods.iter().find(|m| m.kind == MfaType::BackupCodes && m.enabled)
+    }
+}
+
+/// A set of single use codes usable as a second factor if an authenticator app or
+/// security key is lost (`BackupCodes`). The plaintext codes are only available
+/// when generated; the server stores only their hashes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupCodes {
+    pub credential_id: Vec<u8>,
+    pub codes: Vec<String>,
+}
+
+impl BackupCodes {
+    const GROUP: usize = 5;
+
+    pub fn from_cbor(cbor: &CborObject) -> Result<BackupCodes> {
+        Ok(BackupCodes {
+            credential_id: cbor
+                .get("i")
+                .and_then(|c| c.as_bytes())
+                .ok_or_else(|| Error::Cbor("BackupCodes missing 'i'".into()))?
+                .to_vec(),
+            codes: cbor
+                .get("c")
+                .and_then(|c| c.as_list())
+                .ok_or_else(|| Error::Cbor("BackupCodes missing 'c'".into()))?
+                .iter()
+                .map(|c| c.as_string().map(|s| s.to_string()).ok_or_else(|| Error::Cbor("bad backup code".into())))
+                .collect::<Result<_>>()?,
+        })
+    }
+
+    /// Display form of a code, e.g. `a3f5b-2xqz7`.
+    pub fn format(code: &str) -> String {
+        code.as_bytes()
+            .chunks(Self::GROUP)
+            .map(|g| String::from_utf8_lossy(g).into_owned())
+            .collect::<Vec<_>>()
+            .join("-")
+    }
+
+    pub fn formatted(&self) -> Vec<String> {
+        self.codes.iter().map(|c| Self::format(c)).collect()
+    }
+
+    /// Users retype codes with the grouping separator, spaces or in upper case, so
+    /// reduce to the canonical form before sending.
+    pub fn normalise(code: &str) -> String {
+        code.to_lowercase().chars().filter(|c| c.is_ascii_lowercase() || ('2'..='7').contains(c)).collect()
+    }
 }
 
 /// WebAuthn assertion / attestation data (`WebauthnResponse` in Java).
@@ -140,6 +225,11 @@ pub struct MultiFactorAuthResponse {
 impl MultiFactorAuthResponse {
     pub fn new_totp(credential_id: Vec<u8>, code: String) -> MultiFactorAuthResponse {
         MultiFactorAuthResponse { credential_id, response: MfaResponseKind::Totp(code) }
+    }
+
+    /// Answer with a single use backup code; it travels as a code string, like TOTP.
+    pub fn new_backup_code(credential_id: Vec<u8>, code: &str) -> MultiFactorAuthResponse {
+        MultiFactorAuthResponse { credential_id, response: MfaResponseKind::Totp(BackupCodes::normalise(code)) }
     }
 
     pub fn new_webauthn(credential_id: Vec<u8>, webauthn: WebauthnResponse) -> MultiFactorAuthResponse {

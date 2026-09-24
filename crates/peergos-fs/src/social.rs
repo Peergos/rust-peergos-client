@@ -1095,20 +1095,84 @@ pub enum Access {
     Write,
 }
 
+/// One item in a secret link, as the owner remembers it (`LinkMember`). Owner-private
+/// and a display hint only: the path goes stale on a rename while the capability in
+/// the payload does not, so membership is decided by the payload, never this list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkMember {
+    /// Absolute, `/owner/a/b`, as Java records it.
+    pub path: String,
+    pub writable: bool,
+}
+
+impl LinkMember {
+    fn to_cbor(&self) -> CborObject {
+        let mut b = CborObject::map().put("p", CborObject::Str(self.path.clone()));
+        if self.writable {
+            b = b.put("w", CborObject::Boolean(true));
+        }
+        b.build()
+    }
+
+    fn from_cbor(cbor: &CborObject) -> Option<LinkMember> {
+        Some(LinkMember {
+            path: cbor.get("p")?.as_string()?.to_string(),
+            writable: cbor.get("w").and_then(|c| c.as_bool()).unwrap_or(false),
+        })
+    }
+}
+
 /// A recorded secret link, enough to re-mint it under the same label/password when
-/// the target's keys rotate (`LinkProperties`). Cbor `{l,p,u,w,o,[h],[m],[e]}`.
-#[derive(Debug, Clone)]
+/// the target's keys rotate (`LinkProperties`). Cbor `{l,p,u,w,o,[h],[m],[e],[ms]}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkProperties {
     pub label: i64,
     pub link_password: String,
     pub user_password: String,
+    /// Whether any member is writable.
     pub writable: bool,
     pub open: bool,
     pub max_retrievals: Option<i64>,
     pub expiry_epoch_secs: Option<i64>,
+    /// The cid of the stored link target, as merkle link bytes.
+    pub existing: Option<Vec<u8>>,
+    /// What is in the link. Empty on every link written before members existed,
+    /// which is a one member link of the file it is recorded under.
+    pub members: Vec<LinkMember>,
 }
 
 impl LinkProperties {
+    /// A new link's properties; writability is a property of the members.
+    pub fn build(
+        link: &crate::SecretLink,
+        user_password: &str,
+        max_retrievals: Option<i64>,
+        expiry_epoch_secs: Option<i64>,
+        members: Vec<LinkMember>,
+    ) -> LinkProperties {
+        LinkProperties {
+            label: link.label,
+            link_password: link.link_password.clone(),
+            user_password: user_password.to_string(),
+            writable: members.iter().any(|m| m.writable),
+            open: false,
+            max_retrievals,
+            expiry_epoch_secs,
+            existing: None,
+            members,
+        }
+    }
+
+    pub fn with_members(mut self, members: Vec<LinkMember>) -> LinkProperties {
+        self.writable = members.iter().any(|m| m.writable);
+        self.members = members;
+        self
+    }
+
+    pub fn to_link(&self, owner: &PublicKeyHash) -> crate::SecretLink {
+        crate::SecretLink { owner: owner.clone(), label: self.label, link_password: self.link_password.clone() }
+    }
+
     fn to_cbor(&self) -> CborObject {
         let mut b = CborObject::map()
             .put("l", CborObject::Long(self.label))
@@ -1122,6 +1186,13 @@ impl LinkProperties {
         if let Some(e) = self.expiry_epoch_secs {
             b = b.put("e", CborObject::Long(e));
         }
+        if let Some(h) = &self.existing {
+            b = b.put("h", CborObject::MerkleLink(h.clone()));
+        }
+        // absent on every link written before members existed, which is a one member link
+        if !self.members.is_empty() {
+            b = b.put("ms", CborObject::List(self.members.iter().map(|m| m.to_cbor()).collect()));
+        }
         b.build()
     }
 
@@ -1134,6 +1205,11 @@ impl LinkProperties {
             open: cbor.get("o").and_then(|c| c.as_bool()).unwrap_or(false),
             max_retrievals: cbor.get("m").and_then(|c| c.as_long()),
             expiry_epoch_secs: cbor.get("e").and_then(|c| c.as_long()),
+            existing: cbor.get("h").and_then(|c| c.as_link()).map(|l| l.to_vec()),
+            members: match cbor.get("ms").and_then(|c| c.as_list()) {
+                Some(ms) => ms.iter().map(LinkMember::from_cbor).collect::<Option<Vec<_>>>()?,
+                None => Vec::new(),
+            },
         })
     }
 }
@@ -1419,6 +1495,38 @@ pub async fn remove_link(
         entry.retain(|l| l.label != label);
     }
     write_shared_with_at(user, &dir_path, &state, store, mutable).await
+}
+
+/// Every directory's recorded sharing state, keyed by its home-relative path
+/// (`SharedWithCache.getAllShares`). Read-only.
+pub async fn get_all_shares(
+    user: &LoggedInUser,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<Vec<(String, SharedWithState)>> {
+    let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
+    let cap_cache = match list_directory(home, store.clone(), mutable).await?.into_iter().find(|e| e.name == CAP_CACHE_DIR) {
+        Some(e) => e.cap,
+        None => return Ok(Vec::new()),
+    };
+    let outbound = match list_directory(&cap_cache, store.clone(), mutable).await?.into_iter().find(|e| e.name == OUTBOUND_DIR) {
+        Some(e) => e.cap,
+        None => return Ok(Vec::new()),
+    };
+    let mut res = Vec::new();
+    let mut todo = vec![(String::new(), outbound)];
+    while let Some((path, dir)) = todo.pop() {
+        for e in list_directory(&dir, store.clone(), mutable).await? {
+            if e.name == DIR_CACHE_FILE {
+                let bytes = crate::read_file(&e.cap, store.clone(), mutable).await?.1;
+                res.push((path.clone(), SharedWithState::from_cbor(&CborObject::from_bytes(&bytes)?)));
+            } else if e.is_dir != Some(false) {
+                let child = if path.is_empty() { e.name.clone() } else { format!("{path}/{}", e.name) };
+                todo.push((child, e.cap));
+            }
+        }
+    }
+    Ok(res)
 }
 
 /// The secret links recorded for the file at home-relative `path`.

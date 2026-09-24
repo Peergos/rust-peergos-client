@@ -1,5 +1,6 @@
 use crate::capability::*;
 use crate::hashtree::{HashBranch, HashTree};
+use crate::retrieve::LEGACY_CHUNK_SIZE;
 use peergos_cbor::{CborObject, Cborable};
 use peergos_core::keys::PublicKeyHash;
 use peergos_core::symmetric::SymmetricKey;
@@ -39,7 +40,7 @@ fn hash_tree_single_chunk_matches_formula() {
     // root = sha256(CborList([ChunkHashList]).serialize()).
     let data = b"the quick brown fox";
     let chunk_hash = sha256(data);
-    let branch = HashTree::build(&[chunk_hash.clone()]).unwrap().branch(0);
+    let branch = HashTree::build(&[chunk_hash.clone()], LEGACY_CHUNK_SIZE).unwrap().branch(0);
 
     let l1 = branch.level1.clone().unwrap();
     assert_eq!(l1.chunk_hashes, chunk_hash); // 32 bytes, one hash
@@ -56,7 +57,7 @@ fn hash_tree_single_chunk_matches_formula() {
 fn hash_tree_multi_chunk_groups_hashes() {
     // 24 chunk hashes → one level-1 list of 24*32 bytes.
     let hashes: Vec<Vec<u8>> = (0u8..24).map(|i| sha256(&[i; 8])).collect();
-    let branch = HashTree::build(&hashes).unwrap().branch(0);
+    let branch = HashTree::build(&hashes, LEGACY_CHUNK_SIZE).unwrap().branch(0);
     let l1 = branch.level1.unwrap();
     assert_eq!(l1.chunk_hashes.len(), 24 * 32);
     // the concatenation is the chunk hashes in order
@@ -134,7 +135,7 @@ fn absolute_capability_cbor_roundtrip_writable_with_bat() {
 #[test]
 fn hash_tree_1k_chunks_single_level() {
     let hashes: Vec<Vec<u8>> = (0..1024).map(|_| [0u8; 32].to_vec()).collect();
-    let tree = HashTree::build(&hashes).unwrap();
+    let tree = HashTree::build(&hashes, LEGACY_CHUNK_SIZE).unwrap();
     assert_eq!(tree.level1.len(), 1);
     assert_eq!(tree.level1[0].chunk_hashes.len(), 1024 * 32);
     assert!(tree.level2.is_empty());
@@ -144,7 +145,7 @@ fn hash_tree_1k_chunks_single_level() {
 #[test]
 fn hash_tree_2k_chunks_two_levels() {
     let hashes: Vec<Vec<u8>> = (0..2048).map(|_| [0u8; 32].to_vec()).collect();
-    let tree = HashTree::build(&hashes).unwrap();
+    let tree = HashTree::build(&hashes, LEGACY_CHUNK_SIZE).unwrap();
     assert_eq!(tree.level1.len(), 2);
     assert_eq!(tree.level1[0].chunk_hashes.len(), 1024 * 32);
     assert_eq!(tree.level2.len(), 1);
@@ -154,7 +155,7 @@ fn hash_tree_2k_chunks_two_levels() {
 #[test]
 fn hash_tree_1m_chunks_three_level_structure() {
     let hashes: Vec<Vec<u8>> = (0..1024 * 1024).map(|_| [0u8; 32].to_vec()).collect();
-    let tree = HashTree::build(&hashes).unwrap();
+    let tree = HashTree::build(&hashes, LEGACY_CHUNK_SIZE).unwrap();
     assert_eq!(tree.level1.len(), 1024);
     assert_eq!(tree.level2.len(), 1);
     assert!(tree.level3.is_empty());
@@ -162,13 +163,13 @@ fn hash_tree_1m_chunks_three_level_structure() {
 
 #[test]
 fn hash_tree_rejects_empty() {
-    assert!(HashTree::build(&[]).is_err());
+    assert!(HashTree::build(&[], LEGACY_CHUNK_SIZE).is_err());
 }
 
 #[test]
 fn hash_tree_cbor_roundtrip() {
     let hashes: Vec<Vec<u8>> = (0..2048).map(|i| sha256(&[i as u8; 8])).collect();
-    let tree = HashTree::build(&hashes).unwrap();
+    let tree = HashTree::build(&hashes, LEGACY_CHUNK_SIZE).unwrap();
     for i in 0..2048 {
         let branch = tree.branch(i);
         let decoded = HashBranch::from_cbor(&branch.to_cbor()).unwrap();
@@ -176,7 +177,7 @@ fn hash_tree_cbor_roundtrip() {
     }
 }
 
-use crate::retrieve::{FragmentedPaddedCipherText, CHUNK_MAX_SIZE, FRAGMENT_MAX_LENGTH, INLINE_LIMIT, remove_raw_block_bat_prefix};
+use crate::retrieve::{FragmentedPaddedCipherText, FRAGMENT_MAX_LENGTH, INLINE_LIMIT, remove_raw_block_bat_prefix};
 use crate::cryptree::ChildrenLinks;
 use peergos_core::auth::BatId;
 use peergos_crypto::random_bytes;
@@ -208,7 +209,7 @@ fn fragmented_ciphertext_fragment_count_and_alignment() {
     let test_lens: Vec<usize> = vec![
         0, 4000, 4093, 4096, 4099,
         FRAGMENT_MAX_LENGTH - 3, FRAGMENT_MAX_LENGTH, FRAGMENT_MAX_LENGTH + 3,
-        CHUNK_MAX_SIZE as usize - 4, CHUNK_MAX_SIZE as usize,
+        LEGACY_CHUNK_SIZE as usize - 4, LEGACY_CHUNK_SIZE as usize,
     ];
 
     for len in test_lens {
@@ -222,8 +223,8 @@ fn fragmented_ciphertext_fragment_count_and_alignment() {
             let stripped = remove_raw_block_bat_prefix(block).unwrap();
             assert_eq!(stripped.len() % 4096, 0, "misaligned block for len={len}");
         }
-        assert!(raw.len() as u64 <= CHUNK_MAX_SIZE / FRAGMENT_MAX_LENGTH as u64,
-            "too many fragments for len={len}: {} (max {})", raw.len(), CHUNK_MAX_SIZE / FRAGMENT_MAX_LENGTH as u64);
+        assert!(raw.len() as u64 <= LEGACY_CHUNK_SIZE / FRAGMENT_MAX_LENGTH as u64,
+            "too many fragments for len={len}: {} (max {})", raw.len(), LEGACY_CHUNK_SIZE / FRAGMENT_MAX_LENGTH as u64);
 
         if len > INLINE_LIMIT {
             let expected_frags = (len + FRAGMENT_MAX_LENGTH - 1) / FRAGMENT_MAX_LENGTH;
@@ -466,5 +467,185 @@ async fn logarithmic_round_trips() {
             );
         }
         previous_calls = call_count.get();
+    }
+}
+
+// ---- per-file chunk size and BLAKE3 hash trees (Blake3HashTreeTests, ChunkArithmeticTests) ----
+
+mod blake3_hash_tree {
+    use crate::cryptree::FileProperties;
+    use crate::hashtree::{chunk_hash, HashTree};
+    use crate::retrieve::{uses_blake3, DEFAULT_CHUNK_SIZE, LEGACY_CHUNK_SIZE};
+    use peergos_crypto::hash::{blake3, blake3_merge_as_root, blake3_merge_subtree, sha256};
+
+    /// 4 BLAKE3 chunks, so a blob of 1024 covers 4096 of them, as 4 MiB blobs cover 4M.
+    const SMALL_CHUNK: u64 = 4096;
+
+    fn data(len: usize) -> Vec<u8> {
+        let mut x = len as u64 ^ 0x9e3779b97f4a7c15;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    fn tree_of(data: &[u8], chunk_size: u64) -> HashTree {
+        let cs = chunk_size as usize;
+        let n = if data.is_empty() { 1 } else { data.len().div_ceil(cs) };
+        let hashes: Vec<Vec<u8>> = (0..n)
+            .map(|i| chunk_hash(&data[i * cs..((i + 1) * cs).min(data.len())], i as u64, chunk_size, n == 1))
+            .collect();
+        HashTree::build(&hashes, chunk_size).unwrap()
+    }
+
+    fn interesting_sizes(chunk: usize) -> Vec<usize> {
+        let mut sizes = vec![0, 1, 2, chunk - 1, chunk, chunk + 1];
+        for chunks in [2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 100] {
+            sizes.extend([chunks * chunk, chunks * chunk - 1, chunks * chunk + chunk / 2]);
+        }
+        for chunks in [1023, 1024, 1025, 1536, 2048, 2049] {
+            sizes.extend([chunks * chunk, chunks * chunk + chunk / 3]);
+        }
+        sizes
+    }
+
+    #[test]
+    fn root_is_the_files_blake3_hash() {
+        for size in interesting_sizes(SMALL_CHUNK as usize) {
+            let d = data(size);
+            assert_eq!(tree_of(&d, SMALL_CHUNK).root_hash.hash, blake3(&d), "a file of {size} bytes");
+        }
+    }
+
+    #[test]
+    fn root_is_the_files_blake3_hash_at_the_real_chunk_size() {
+        let chunk = DEFAULT_CHUNK_SIZE as usize;
+        for size in [0, 1, chunk - 1, chunk, chunk + 1, 2 * chunk, 3 * chunk - 1, 3 * chunk + 1024] {
+            let d = data(size);
+            assert_eq!(tree_of(&d, DEFAULT_CHUNK_SIZE).root_hash.hash, blake3(&d), "a file of {size} bytes");
+        }
+    }
+
+    #[test]
+    fn levels_hold_one_value_per_child_blob() {
+        let tree = tree_of(&data(2049 * SMALL_CHUNK as usize), SMALL_CHUNK);
+        assert_eq!(tree.level1.len(), 3);
+        assert_eq!(tree.level1[0].hashes().len(), 1024);
+        assert_eq!(tree.level1[2].hashes().len(), 1, "only the rightmost blob is partial");
+        assert_eq!(tree.level2.len(), 1);
+        assert_eq!(tree.level2[0].hashes().len(), 3);
+        assert!(tree.level3.is_empty());
+        assert_eq!(tree.branch(1500).level1.as_ref(), Some(&tree.level1[1]));
+        assert_eq!(tree.branch(2048).level2.as_ref(), Some(&tree.level2[0]));
+    }
+
+    #[test]
+    fn interior_values_are_subtree_merges() {
+        let tree = tree_of(&data(1500 * SMALL_CHUNK as usize), SMALL_CHUNK);
+        let level2 = tree.level2[0].hashes();
+        assert_eq!(level2.len(), tree.level1.len());
+        for (i, blob) in tree.level1.iter().enumerate() {
+            assert_eq!(blake3_merge_subtree(&blob.hashes()), level2[i], "level 2 entry {i}");
+        }
+        assert_eq!(blake3_merge_as_root(&level2), tree.root_hash.hash);
+    }
+
+    #[test]
+    fn a_chunks_value_depends_on_whether_it_is_alone() {
+        let d = data(100);
+        let alone = chunk_hash(&d, 0, DEFAULT_CHUNK_SIZE, true);
+        let in_a_tree = chunk_hash(&d, 0, DEFAULT_CHUNK_SIZE, false);
+        assert_ne!(alone, in_a_tree);
+        assert_eq!(alone, blake3(&d));
+    }
+
+    #[test]
+    fn legacy_files_keep_their_sha256_tree() {
+        let d = data(3 * SMALL_CHUNK as usize);
+        let legacy = tree_of(&d, LEGACY_CHUNK_SIZE);
+        assert_eq!(legacy.level1[0].hashes(), vec![sha256(&d)]);
+        assert_ne!(legacy.root_hash, tree_of(&d, DEFAULT_CHUNK_SIZE).root_hash);
+        assert!(!uses_blake3(LEGACY_CHUNK_SIZE));
+        assert!(uses_blake3(DEFAULT_CHUNK_SIZE));
+    }
+
+    #[test]
+    fn hash_tree_cbor_round_trips() {
+        let tree = tree_of(&data(1500 * SMALL_CHUNK as usize), SMALL_CHUNK);
+        assert_eq!(HashTree::from_cbor(&tree.to_cbor()).unwrap(), tree);
+    }
+
+    #[test]
+    fn file_properties_chunk_size_round_trips() {
+        let legacy = FileProperties::new_file("a".into(), "text/plain".into(), 10, 0, vec![1; 32], None);
+        assert_eq!(legacy.chunk_size, LEGACY_CHUNK_SIZE);
+        assert!(legacy.to_cbor().get("cs").is_none(), "legacy cbor is unchanged");
+        assert_eq!(FileProperties::from_cbor(&legacy.to_cbor()).unwrap().chunk_size, LEGACY_CHUNK_SIZE);
+
+        let mut modern = legacy.clone();
+        modern.chunk_size = DEFAULT_CHUNK_SIZE;
+        let cbor = modern.to_cbor();
+        assert_eq!(cbor.get("cs").and_then(|c| c.as_long()), Some(22));
+        assert_eq!(FileProperties::from_cbor(&cbor).unwrap(), modern);
+    }
+
+    #[test]
+    fn unsupported_chunk_sizes_are_rejected() {
+        let mut cbor = FileProperties::new_file("a".into(), "".into(), 10, 0, vec![1; 32], None).to_cbor();
+        if let peergos_cbor::CborObject::Map(m) = &mut cbor {
+            m.insert(peergos_cbor::CborString::new("cs"), peergos_cbor::CborObject::Long(20));
+        }
+        assert!(FileProperties::from_cbor(&cbor).is_err());
+    }
+}
+
+mod mfa_types {
+    use crate::mfa::*;
+    use peergos_cbor::CborObject;
+
+    #[test]
+    fn supported_types_are_sent_as_values() {
+        assert_eq!(supported_mfa_types_param(), "1,2,3");
+    }
+
+    #[test]
+    fn new_factor_types_parse() {
+        let method = |t: i64| {
+            MultiFactorAuthMethod::from_cbor(
+                &CborObject::map()
+                    .put("n", CborObject::Str("9".into()))
+                    .put("i", CborObject::ByteString(vec![1, 2]))
+                    .put("t", CborObject::Long(t))
+                    .put("e", CborObject::Boolean(true))
+                    .build(),
+            )
+            .unwrap()
+        };
+        assert_eq!(method(3).kind, MfaType::BackupCodes);
+        assert_eq!(method(4).kind, MfaType::Mount);
+        assert!(!MfaType::Mount.is_interactive());
+        assert_eq!(method(9).kind, MfaType::Unknown(9));
+        let req = MultiFactorAuthRequest { methods: vec![method(1), method(3)], challenge: vec![] };
+        assert_eq!(req.backup_codes_method().unwrap().kind, MfaType::BackupCodes);
+    }
+
+    #[test]
+    fn backup_codes_normalise_and_format() {
+        assert_eq!(BackupCodes::format("a3f5b2xqz7"), "a3f5b-2xqz7");
+        assert_eq!(BackupCodes::normalise(" A3F5B-2xqz7 "), "a3f5b2xqz7");
+        let r = MultiFactorAuthResponse::new_backup_code(vec![7], "A3F5B-2XQZ7");
+        assert_eq!(r.to_cbor().get("r").and_then(|c| c.as_string()), Some("a3f5b2xqz7"));
+        let codes = BackupCodes::from_cbor(
+            &CborObject::map()
+                .put("i", CborObject::ByteString(vec![1]))
+                .put("c", CborObject::List(vec![CborObject::Str("abcdefghij".into())]))
+                .build(),
+        )
+        .unwrap();
+        assert_eq!(codes.formatted(), vec!["abcde-fghij".to_string()]);
     }
 }

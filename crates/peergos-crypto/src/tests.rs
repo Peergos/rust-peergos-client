@@ -183,3 +183,35 @@ fn keypair_from_seed_matches_java_layout() {
     let signed = sign::crypto_sign(b"x", &secret).unwrap();
     assert_eq!(sign::crypto_sign_open(&signed, &public).unwrap(), b"x");
 }
+
+fn blake3_pieces(data: &[u8], piece_len: usize) -> Vec<Vec<u8>> {
+    let chunks_per_piece = (piece_len as u64) / hash::BLAKE3_CHUNK_LEN;
+    data.chunks(piece_len)
+        .enumerate()
+        .map(|(i, p)| hash::blake3_chaining_value(p, i as u64 * chunks_per_piece))
+        .collect()
+}
+
+#[test]
+fn blake3_pieces_merge_to_whole_hash() {
+    let piece_len = 4 * 1024;
+    for len in [piece_len + 1, 2 * piece_len, 3 * piece_len - 7, 5 * piece_len, 17 * piece_len + 1000] {
+        let data: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+        let cvs = blake3_pieces(&data, piece_len);
+        assert_eq!(hash::blake3_merge_as_root(&cvs), hash::blake3(&data), "len {len}");
+    }
+}
+
+/// The shape the file hash tree uses: groups of a power of two pieces merged as
+/// subtrees, then the group values merged as the root.
+#[test]
+fn blake3_grouped_merge_matches_whole_hash() {
+    let piece_len = 1024;
+    let group = 4;
+    for n_pieces in [5usize, 8, 9, 13, 16, 17] {
+        let data: Vec<u8> = (0..n_pieces * piece_len - 3).map(|i| (i * 7 % 253) as u8).collect();
+        let cvs = blake3_pieces(&data, piece_len);
+        let groups: Vec<Vec<u8>> = cvs.chunks(group).map(hash::blake3_merge_subtree).collect();
+        assert_eq!(hash::blake3_merge_as_root(&groups), hash::blake3(&data), "n {n_pieces}");
+    }
+}

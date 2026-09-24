@@ -27,6 +27,50 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const SPACE_USAGE_URL: &str = "peergos/v0/storage/";
 
+/// A link can hold this many items; the real limit is that the serialised link fits
+/// in one block, which [`crate::put_secret_link`] enforces.
+pub const MAX_LINK_MEMBERS: usize = 100;
+
+/// One of the owner's secret links, deduplicated across the paths it is recorded
+/// under (`SecretLinkSummary`).
+#[derive(Debug, Clone)]
+pub struct SecretLinkSummary {
+    pub props: crate::LinkProperties,
+    /// A home-relative path this link was recorded under, used when the link
+    /// predates member lists.
+    pub recorded_under: String,
+    username: String,
+}
+
+impl SecretLinkSummary {
+    fn new(props: crate::LinkProperties, recorded_under: String, username: &str) -> SecretLinkSummary {
+        SecretLinkSummary { props, recorded_under, username: username.to_string() }
+    }
+
+    /// What is in the link, home-relative: its members, or the one path it was
+    /// recorded under if it has none.
+    pub fn paths(&self) -> Vec<String> {
+        if self.props.members.is_empty() {
+            return vec![self.recorded_under.clone()];
+        }
+        let prefix = format!("/{}/", self.username);
+        self.props
+            .members
+            .iter()
+            .map(|m| m.path.strip_prefix(&prefix).unwrap_or(&m.path).to_string())
+            .collect()
+    }
+
+    pub fn item_count(&self) -> usize {
+        self.props.members.len().max(1)
+    }
+
+    /// Whether this link already contains the home-relative `path`.
+    pub fn contains(&self, path: &str) -> bool {
+        self.paths().iter().any(|p| p == path.trim_matches('/'))
+    }
+}
+
 fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -234,7 +278,13 @@ impl UserContext {
         store: Arc<dyn ContentAddressedStorage>,
         mutable: Arc<dyn MutablePointers>,
     ) -> Result<UserContext> {
-        let cap = crate::retrieve_secret_link_capability(link, store.as_ref(), user_password).await?;
+        let mut caps = crate::retrieve_secret_link_capabilities(link, store.as_ref(), user_password).await?;
+        if caps.len() > 1 {
+            // A multi item link mounts each item at its own path; the first is where it
+            // lands, and is first in `link_mount_paths`.
+            return Self::from_link_caps(caps, poster, store, mutable).await;
+        }
+        let cap = caps.pop().ok_or_else(|| Error::Protocol("Secret link has no capabilities".into()))?;
         Ok(UserContext { user: None, link_caps: vec![cap], link_mounts: Vec::new(), store, mutable, poster, cache: CryptreeCache::new() })
     }
 
@@ -600,12 +650,7 @@ impl UserContext {
     /// server-enforced limits. Returns the link string
     /// `secret/z<owner>/<label>#<password>`, resolvable via
     /// [`crate::retrieve_secret_link_capability`] / [`UserContext::from_secret_link`].
-    ///
-    /// A `writable` link grants write access, so — matching Java — the target is
-    /// first relocated into its own writing space (its keys rotate if it was sharing
-    /// the parent's writer); every EXISTING share and secret link to it is then
-    /// re-sent / re-minted to the new capability before the new link is minted, so
-    /// nothing breaks. We assert the target's writer differs from its parent's.
+    /// See [`UserContext::create_secret_link_to`] for a link over several items.
     pub async fn create_secret_link(
         &self,
         path: &str,
@@ -614,76 +659,250 @@ impl UserContext {
         expiry_epoch_secs: Option<i64>,
         max_retrievals: Option<i64>,
     ) -> Result<String> {
+        let writable_paths: Vec<String> = if writable { vec![path.to_string()] } else { Vec::new() };
+        let props = self
+            .create_secret_link_to(&[path.to_string()], &writable_paths, user_password, expiry_epoch_secs, max_retrievals)
+            .await?;
+        self.secret_link_string(&props)
+    }
+
+    /// Create a link over several files and directories (home-relative `paths`, in
+    /// the order they should be listed), each read-only or, if in `writable_paths`,
+    /// writable (`UserContext.createSecretLinkTo`). The link opens on the first.
+    pub async fn create_secret_link_to(
+        &self,
+        paths: &[String],
+        writable_paths: &[String],
+        user_password: &str,
+        expiry_epoch_secs: Option<i64>,
+        max_retrievals: Option<i64>,
+    ) -> Result<crate::LinkProperties> {
         let user = self.require_user()?;
-        let mirror = self.get_mirror_bat().await?;
-        let cap = if writable {
-            // shareWriteAccessWith(file, {}) — ensure the target has its own writer.
-            let trimmed = path.trim_matches('/');
-            let (parent_path, name) = match trimmed.rsplit_once('/') {
-                Some((p, n)) => (p, n),
-                None => ("", trimmed),
-            };
-            let parent = self
-                .get_by_path(parent_path)
-                .await?
-                .ok_or_else(|| Error::Protocol(format!("no parent directory for {path}")))?;
-            let parent_cap = parent.capability().clone();
-            let target = parent
-                .child(name)
-                .await?
-                .ok_or_else(|| Error::Protocol(format!("no file at {path}")))?;
-            let mb = self.require_user()?.mirror_bat_id();
-            let writable_cap = if target.is_directory() {
-                crate::move_dir_to_own_writer(&parent_cap, name, parent.signer().cloned(), mb.as_ref(), self.store.clone(), self.mutable.as_ref()).await?
-            } else {
-                crate::move_file_to_own_writer(&parent_cap, name, parent.signer().cloned(), mb.as_ref(), self.store.clone(), self.mutable.as_ref()).await?
-            };
-            // The relocation should have given it its own writer; assert the invariant.
-            if writable_cap.writer == parent_cap.writer {
-                return Err(Error::Protocol(
-                    "a writable secret link's target must be in a different writing space to its parent".into(),
-                ));
-            }
-            // Rotation invalidated the old cap: re-send all existing shares and
-            // re-mint all existing links to the new one (Java reSendAllSharesAndLinks).
-            self.reshare_all_shares_and_links(path).await?;
-            writable_cap
+        let link = crate::SecretLink::create(user.identity.clone())?;
+        let props = crate::LinkProperties::build(&link, user_password, max_retrievals, expiry_epoch_secs, Vec::new());
+        self.set_secret_link_members(paths, writable_paths, props).await
+    }
+
+    /// The shareable string for a link (`getLinkString`).
+    pub fn secret_link_string(&self, props: &crate::LinkProperties) -> Result<String> {
+        Ok(props.to_link(&self.require_user()?.identity).to_link())
+    }
+
+    /// Rewrite a link's membership (`setSecretLinkMembers`). The label and password
+    /// do not change, so the link string stays exactly as it was and anyone already
+    /// holding it gets the new members.
+    ///
+    /// A writable member must first be in its own writing space, which rewrites keys
+    /// and can fail, so that all happens before the payload is touched: a failure
+    /// part way through leaves the link as it was.
+    pub async fn set_secret_link_members(
+        &self,
+        paths: &[String],
+        writable_paths: &[String],
+        props: crate::LinkProperties,
+    ) -> Result<crate::LinkProperties> {
+        if paths.is_empty() {
+            return Err(Error::Protocol("A secret link must contain at least one item!".into()));
+        }
+        if paths.len() > MAX_LINK_MEMBERS {
+            return Err(Error::Protocol(format!(
+                "A secret link can hold at most {MAX_LINK_MEMBERS} items, not {}. Share a folder instead.",
+                paths.len()
+            )));
+        }
+        let paths: Vec<String> = paths.iter().map(|p| p.trim_matches('/').to_string()).collect();
+        let writable: std::collections::HashSet<String> =
+            writable_paths.iter().map(|p| p.trim_matches('/').to_string()).collect();
+        for path in paths.iter().filter(|p| writable.contains(*p)) {
+            self.split_into_own_writing_space(path).await?;
+        }
+        let before: Vec<String> = props.members.iter().filter_map(|m| self.home_relative(&m.path).ok()).collect();
+        let props = self.mint_link(&paths, &writable, props).await?;
+        // the owner's listing should only show a link under the items it still holds
+        let user = self.require_user()?;
+        for gone in before.iter().filter(|p| !paths.contains(p)) {
+            crate::remove_link(user, gone, props.label, self.store.clone(), self.mutable.as_ref()).await?;
+        }
+        Ok(props)
+    }
+
+    /// Append one file or folder to a link that already exists (`addToSecretLink`).
+    /// The link string does not change, so whoever already holds it gets this too.
+    pub async fn add_to_secret_link(
+        &self,
+        link: &SecretLinkSummary,
+        path: &str,
+        writable: bool,
+    ) -> Result<crate::LinkProperties> {
+        let path = path.trim_matches('/').to_string();
+        if path.is_empty() {
+            return Err(Error::Protocol("No file given to add to this link.".into()));
+        }
+        let mut paths = link.paths();
+        if paths.contains(&path) {
+            return Err(Error::Protocol(format!("{path} is already in this link.")));
+        }
+        let mut writable_paths: Vec<String> = if link.props.members.is_empty() {
+            if link.props.writable { paths.clone() } else { Vec::new() }
         } else {
-            self.get_by_path(path)
-                .await?
-                .ok_or_else(|| Error::Protocol(format!("no file at {path}")))?
-                .capability()
-                .read_only()
+            link.props
+                .members
+                .iter()
+                .filter(|m| m.writable)
+                .filter_map(|m| self.home_relative(&m.path).ok())
+                .collect()
         };
-        let link = crate::create_secret_link(
-            &cap,
-            user_password,
-            expiry_epoch_secs,
-            max_retrievals,
+        paths.push(path.clone());
+        if writable {
+            writable_paths.push(path);
+        }
+        self.set_secret_link_members(&paths, &writable_paths, link.props.clone()).await
+    }
+
+    /// Every secret link this user has, once each (`getAllSecretLinks`). A link is
+    /// recorded under each path it contains; records are deduplicated by label,
+    /// keeping whichever knows its members.
+    pub async fn get_all_secret_links(&self) -> Result<Vec<SecretLinkSummary>> {
+        let user = self.require_user()?;
+        let mut by_label: Vec<SecretLinkSummary> = Vec::new();
+        for (dir, state) in crate::get_all_shares(user, self.store.clone(), self.mutable.as_ref()).await? {
+            for (name, links) in state.links() {
+                let path = if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") };
+                for props in links {
+                    match by_label.iter_mut().find(|s| s.props.label == props.label) {
+                        Some(existing) => {
+                            if existing.props.members.is_empty() && !props.members.is_empty() {
+                                *existing = SecretLinkSummary::new(props.clone(), path.clone(), &user.username);
+                            }
+                        }
+                        None => by_label.push(SecretLinkSummary::new(props.clone(), path.clone(), &user.username)),
+                    }
+                }
+            }
+        }
+        Ok(by_label)
+    }
+
+    /// What a link actually contains, with each member's absolute path as it is now
+    /// (`getSecretLinkMembers`). Read from the payload, whose capabilities survive a
+    /// rename, rather than from the recorded paths, which do not.
+    pub async fn get_secret_link_members(&self, props: &crate::LinkProperties) -> Result<Vec<crate::LinkMember>> {
+        let link = props.to_link(&self.require_user()?.identity).to_link();
+        let pw = if props.user_password.is_empty() { None } else { Some(props.user_password.as_str()) };
+        let caps = crate::retrieve_secret_link_capabilities(&link, self.store.as_ref(), pw).await?;
+        let mut members = Vec::with_capacity(caps.len());
+        for cap in caps {
+            let path = crate::reconstruct_link_path(&cap, self.store.clone(), self.mutable.as_ref()).await?;
+            members.push(crate::LinkMember { path, writable: cap.w_base_key.is_some() });
+        }
+        Ok(members)
+    }
+
+    /// Ensure the item at `path` is in its own writing space, so a writable link or
+    /// share can be granted to it. If it moves, every existing share and link to it
+    /// is re-sent to the new capability.
+    async fn split_into_own_writing_space(&self, path: &str) -> Result<AbsoluteCapability> {
+        let (parent_path, name) = match path.rsplit_once('/') {
+            Some((p, n)) => (p, n),
+            None => ("", path),
+        };
+        let parent = self
+            .get_by_path(parent_path)
+            .await?
+            .ok_or_else(|| Error::Protocol(format!("no parent directory for {path}")))?;
+        let parent_cap = parent.capability().clone();
+        let target = parent
+            .child(name)
+            .await?
+            .ok_or_else(|| Error::Protocol(format!("no file at {path}")))?;
+        let before = target.capability().writer.clone();
+        let mb = self.require_user()?.mirror_bat_id();
+        let writable_cap = if target.is_directory() {
+            crate::move_dir_to_own_writer(&parent_cap, name, parent.signer().cloned(), mb.as_ref(), self.store.clone(), self.mutable.as_ref()).await?
+        } else {
+            crate::move_file_to_own_writer(&parent_cap, name, parent.signer().cloned(), mb.as_ref(), self.store.clone(), self.mutable.as_ref()).await?
+        };
+        if writable_cap.writer == parent_cap.writer {
+            return Err(Error::Protocol(
+                "a writable secret link's target must be in a different writing space to its parent".into(),
+            ));
+        }
+        if writable_cap.writer != before {
+            self.reshare_all_shares_and_links(path).await?;
+        }
+        Ok(writable_cap)
+    }
+
+    /// Write a link's payload for `paths` under its existing label and password, and
+    /// record it under every member. Writable members must already be in their own
+    /// writing space.
+    async fn mint_link(
+        &self,
+        paths: &[String],
+        writable: &std::collections::HashSet<String>,
+        props: crate::LinkProperties,
+    ) -> Result<crate::LinkProperties> {
+        let user = self.require_user()?;
+        let mut caps = Vec::with_capacity(paths.len());
+        let mut members = Vec::with_capacity(paths.len());
+        for path in paths {
+            let file = self
+                .get_by_path(path)
+                .await?
+                .ok_or_else(|| Error::Protocol(format!("Couldn't retrieve {path}")))?;
+            let is_writable = writable.contains(path);
+            let cap = if is_writable {
+                let cap = file.capability().clone();
+                if cap.w_base_key.is_none() {
+                    return Err(Error::Protocol(format!("{path} is not writable")));
+                }
+                cap
+            } else {
+                file.capability().read_only()
+            };
+            // A link carries one owner, and expiry, retrieval limits and revocation are
+            // all enforced against that owner's record.
+            if cap.owner != user.identity {
+                return Err(Error::Protocol(format!(
+                    "A secret link can only contain your own files. {path} belongs to someone else - ask them for a link to it."
+                )));
+            }
+            caps.push(cap);
+            members.push(crate::LinkMember { path: format!("/{}/{path}", user.username), writable: is_writable });
+        }
+        let mirror = self.get_mirror_bat().await?;
+        let link = props.to_link(&user.identity);
+        let target = crate::put_secret_link(
+            &caps,
+            &link,
+            &props.user_password,
+            props.expiry_epoch_secs,
+            props.max_retrievals,
             &user.signer,
             mirror.as_ref(),
             self.store.clone(),
             self.mutable.as_ref(),
         )
         .await?;
-        // Record the link so a future rotation re-mints it (Java addSecretLink).
-        crate::record_link(
-            user,
-            path,
-            crate::LinkProperties {
-                label: link.label,
-                link_password: link.link_password.clone(),
-                user_password: user_password.to_string(),
-                writable,
-                open: false,
-                max_retrievals,
-                expiry_epoch_secs,
-            },
-            self.store.clone(),
-            self.mutable.as_ref(),
-        )
-        .await?;
-        Ok(link.to_link())
+        let mut props = props.with_members(members);
+        props.existing = Some(target.to_bytes());
+        // the champ is what resolves the link and the records are the owner's listing,
+        // so the champ goes first: a crash between them under-reports membership
+        for path in paths {
+            crate::record_link(user, path, props.clone(), self.store.clone(), self.mutable.as_ref()).await?;
+        }
+        Ok(props)
+    }
+
+    /// An absolute `/owner/a/b` path as a home-relative one, for this user's files.
+    fn home_relative(&self, path: &str) -> Result<String> {
+        let username = &self.require_user()?.username;
+        let trimmed = path.trim_start_matches('/');
+        match trimmed.split_once('/') {
+            Some((owner, rest)) if owner == username => Ok(rest.to_string()),
+            None if trimmed == username => Ok(String::new()),
+            _ => Err(Error::Protocol(format!("{path} is not in {username}'s home"))),
+        }
     }
 
     /// A snapshot of the user's social state (`getSocialState`): pending incoming
@@ -814,10 +1033,28 @@ impl UserContext {
         crate::delete_account(&user.identity, &user.signer, &home, self.store.clone(), self.mutable.as_ref()).await
     }
 
-    /// Delete a secret link by its `label` (`deleteSecretLink`): remove it from the
-    /// identity writer's link CHAMP so it no longer resolves, and forget it from the
-    /// shared-with cache for `path` (so a later rotation won't re-mint it).
+    /// Delete a secret link by its `label` (`deleteSecretLink`), found recorded under
+    /// `path`: remove it from the identity writer's link CHAMP so it no longer
+    /// resolves, and forget it from every item it held.
     pub async fn delete_secret_link(&self, path: &str, label: i64) -> Result<()> {
+        let user = self.require_user()?;
+        let path = path.trim_matches('/').to_string();
+        let recorded = crate::get_links(user, &path, self.store.clone(), self.mutable.as_ref()).await?;
+        let mut paths: Vec<String> = recorded
+            .iter()
+            .find(|l| l.label == label)
+            .map(|l| l.members.iter().filter_map(|m| self.home_relative(&m.path).ok()).collect())
+            .unwrap_or_default();
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+        self.delete_secret_link_from(label, &paths).await
+    }
+
+    /// Delete a link and clear it from every path it contained
+    /// (`deleteSecretLinkFrom`). Deleting the champ entry is what stops the link
+    /// resolving; the per path records are the owner's own listing.
+    pub async fn delete_secret_link_from(&self, label: i64, member_paths: &[String]) -> Result<()> {
         let user = self.require_user()?;
         let mirror = self.get_mirror_bat().await?;
         crate::delete_secret_link(
@@ -829,7 +1066,10 @@ impl UserContext {
             self.mutable.as_ref(),
         )
         .await?;
-        crate::remove_link(user, path, label, self.store.clone(), self.mutable.as_ref()).await
+        for path in member_paths {
+            crate::remove_link(user, path.trim_matches('/'), label, self.store.clone(), self.mutable.as_ref()).await?;
+        }
+        Ok(())
     }
 
     /// After a target's keys rotate, re-send every recorded read/write share and
@@ -860,22 +1100,24 @@ impl UserContext {
         for u in crate::get_shared_with(user, path, crate::Access::Write, self.store.clone(), self.mutable.as_ref()).await? {
             crate::share_write_access(user, parent_path, &parent_cap, name, &u, self.store.clone(), self.mutable.as_ref()).await?;
         }
-        let mirror = self.get_mirror_bat().await?;
+        // Re-sign each link keeping whatever membership it already has, so re-minting
+        // one item of a multi-item link does not drop the others.
         for lp in crate::get_links(user, path, self.store.clone(), self.mutable.as_ref()).await? {
-            let link_cap = if lp.writable { new_cap.clone() } else { new_cap.read_only() };
-            let link = crate::SecretLink { owner: new_cap.owner.clone(), label: lp.label, link_password: lp.link_password.clone() };
-            crate::put_secret_link(
-                &link_cap,
-                &link,
-                &lp.user_password,
-                lp.expiry_epoch_secs,
-                lp.max_retrievals,
-                &user.signer,
-                mirror.as_ref(),
-                self.store.clone(),
-                self.mutable.as_ref(),
-            )
-            .await?;
+            let (paths, writable): (Vec<String>, std::collections::HashSet<String>) = if lp.members.is_empty() {
+                let p = trimmed.to_string();
+                let w = if lp.writable { [p.clone()].into_iter().collect() } else { Default::default() };
+                (vec![p], w)
+            } else {
+                let paths = lp.members.iter().map(|m| self.home_relative(&m.path)).collect::<Result<Vec<_>>>()?;
+                let writable = lp
+                    .members
+                    .iter()
+                    .filter(|m| m.writable)
+                    .map(|m| self.home_relative(&m.path))
+                    .collect::<Result<_>>()?;
+                (paths, writable)
+            };
+            self.mint_link(&paths, &writable, lp).await?;
         }
         Ok(())
     }
@@ -1022,6 +1264,13 @@ impl UserContext {
             return Err(Error::Protocol("server rejected the TOTP enrollment code".into()));
         }
         Ok(key)
+    }
+
+    /// Generate a fresh set of single use backup codes (`generateBackupCodes`),
+    /// replacing any earlier set. The plaintext codes are only available now.
+    pub async fn generate_backup_codes(&self) -> Result<crate::mfa::BackupCodes> {
+        let user = self.require_user()?;
+        crate::account::generate_backup_codes(user, self.poster.as_ref()).await
     }
 
     /// Remove a registered second factor by credential id (`deleteMfa`).

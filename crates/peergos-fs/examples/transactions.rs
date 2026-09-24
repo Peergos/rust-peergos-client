@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let user = peergos_fs::login(u, p, poster.as_ref(), store.clone(), &mutable, None).await?;
     let home = user.home().ok_or("no home")?.clone();
 
-    let chunk = peergos_fs::CHUNK_MAX_SIZE as usize;
+    let chunk = peergos_fs::LEGACY_CHUNK_SIZE as usize;
     let size = chunk + 2 * 1024 * 1024; // ~7 MiB → 2 chunks
     let data: Vec<u8> = (0..size).map(|i| (i * 31 + 7) as u8).collect();
     let owned = data.clone();

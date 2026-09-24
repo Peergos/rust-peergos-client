@@ -5,7 +5,7 @@
 //! The log lives at `<chatRoot>/shared/peergos-chat-messages.cborstream`: a
 //! concatenation of serialized [`SignedMessage`]s. A companion
 //! `peergos-chat-messages.index.bin` maps message index → byte offset at every
-//! 5 MiB ([`crate::CHUNK_MAX_SIZE`]) chunk boundary, so a large log can be seeked
+//! chunk boundary (the log file's own chunk size), so a large log can be seeked
 //! close to a target message without scanning it from the start. Each index entry
 //! is two big-endian `i64`s (`msgIndex`, `byteOffset`); the file starts life as a
 //! single zero entry `(0, 0)`.
@@ -14,7 +14,6 @@ use super::envelope::SignedMessage;
 use super::store::MessageStore;
 use crate::context::UserContext;
 use crate::filewrapper::FileWrapper;
-use crate::CHUNK_MAX_SIZE;
 use async_trait::async_trait;
 use peergos_cbor::{Cborable, CborObject};
 use peergos_core::error::{Error, Result};
@@ -56,11 +55,11 @@ impl FileBackedMessageStore {
     /// The byte offset to seek to and the number of messages to skip from there to
     /// reach message `index` (`getChunkByteOffset`). Small logs (< one chunk) are
     /// scanned from the start; larger ones consult the index file.
-    async fn chunk_byte_offset(&self, log_size: u64, index: i64) -> Result<(u64, usize)> {
+    async fn chunk_byte_offset(&self, log_size: u64, chunk_size: u64, index: i64) -> Result<(u64, usize)> {
         if index <= 0 {
             return Ok((0, 0));
         }
-        if log_size < CHUNK_MAX_SIZE {
+        if log_size < chunk_size {
             return Ok((0, index as usize));
         }
         let idx_bytes = match self.resolve_index().await? {
@@ -78,7 +77,7 @@ impl FileBackedMessageStore {
             None => return Ok(Vec::new()),
         };
         let log_size = log.size();
-        let (offset, skip) = self.chunk_byte_offset(log_size, from).await?;
+        let (offset, skip) = self.chunk_byte_offset(log_size, log.properties().chunk_size, from).await?;
         if offset >= log_size || max == 0 {
             return Ok(Vec::new());
         }
@@ -120,7 +119,8 @@ impl MessageStore for FileBackedMessageStore {
 
         // If this append crossed a chunk boundary, record an index entry pointing at
         // the message that crossed it (mirrors Java's single-entry-per-append).
-        if let Some((entry_index, entry_offset)) = boundary_entry(size_before, &sizes, msg_index, raw.len() as u64) {
+        let chunk_size = log.properties().chunk_size;
+        if let Some((entry_index, entry_offset)) = boundary_entry(size_before, chunk_size, &sizes, msg_index, raw.len() as u64) {
             let mut two_longs = Vec::with_capacity(16);
             two_longs.extend_from_slice(&entry_index.to_be_bytes());
             two_longs.extend_from_slice(&(entry_offset as i64).to_be_bytes());
@@ -199,11 +199,11 @@ fn parse_stream(bytes: &[u8], skip: usize, max: usize) -> Result<Vec<SignedMessa
     Ok(out)
 }
 
-/// If appending `appended_len` bytes crosses a [`CHUNK_MAX_SIZE`] boundary, the
+/// If appending `appended_len` bytes crosses a `chunk_size` boundary, the
 /// index entry `(msgIndex, byteOffset)` to record — pointing just past the message
 /// that crossed it (`addMessages`'s boundary logic).
-fn boundary_entry(size_before: u64, sizes: &[usize], msg_index: i64, appended_len: u64) -> Option<(i64, u64)> {
-    let crossed = |extra: u64| (size_before + extra) / CHUNK_MAX_SIZE > size_before / CHUNK_MAX_SIZE;
+fn boundary_entry(size_before: u64, chunk_size: u64, sizes: &[usize], msg_index: i64, appended_len: u64) -> Option<(i64, u64)> {
+    let crossed = |extra: u64| (size_before + extra) / chunk_size > size_before / chunk_size;
     if !crossed(appended_len) {
         return None;
     }
@@ -276,12 +276,12 @@ mod tests {
     #[test]
     fn boundary_entry_detects_crossing() {
         // Append that stays within the first chunk → no entry.
-        assert_eq!(boundary_entry(0, &[10, 10, 10], 0, 30), None);
+        let big = crate::LEGACY_CHUNK_SIZE as usize;
+        assert_eq!(boundary_entry(0, big as u64, &[10, 10, 10], 0, 30), None);
         // Append that crosses the 5 MiB boundary on the 2nd message.
-        let big = CHUNK_MAX_SIZE as usize; // 5 MiB
         let sizes = [big - 10, 20, 30];
         let appended = (sizes.iter().sum::<usize>()) as u64;
-        let (idx, off) = boundary_entry(0, &sizes, 7, appended).expect("should cross a boundary");
+        let (idx, off) = boundary_entry(0, big as u64, &sizes, 7, appended).expect("should cross a boundary");
         // count = 2 (first message leaves us 10 bytes short, second crosses).
         assert_eq!(idx, 7 + 2);
         assert_eq!(off, (big - 10 + 20) as u64);

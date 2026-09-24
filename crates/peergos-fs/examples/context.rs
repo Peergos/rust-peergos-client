@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(ctx.list_open_transactions().await?.is_empty(), "atomic upload must leave no transaction");
 
     // --- multi-chunk upload: crash-safe transactional path --------------------
-    // > CHUNK_MAX_SIZE (5 MiB) => 2 chunks => routed through a transaction.
+    // > chunk size (5 MiB) => 2 chunks => routed through a transaction.
     let big_len: usize = 5 * 1024 * 1024 + 7 * 1024; // just over one chunk
     let big: Vec<u8> = (0..big_len).map(|i| (i * 31 + 7) as u8).collect();
     let big_file = dir.upload("big.bin", &big).await?;

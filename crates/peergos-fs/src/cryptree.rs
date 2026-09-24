@@ -229,6 +229,9 @@ pub struct FileProperties {
     pub thumbnail: Option<(String, Vec<u8>)>,
     /// Content hash-tree branch for this chunk's position.
     pub tree_hash: Option<HashBranch>,
+    /// Fixed for a file once written: reading at the wrong size derives valid chunk
+    /// labels at the wrong spacing, returning wrong bytes rather than an error.
+    pub chunk_size: u64,
 }
 
 impl FileProperties {
@@ -262,6 +265,10 @@ impl FileProperties {
                 (mime.to_string(), d.to_vec())
             }),
             tree_hash: cbor.get("th").map(HashBranch::from_cbor).transpose()?,
+            chunk_size: match cbor.get("cs").and_then(|c| c.as_long()) {
+                Some(log2) => crate::retrieve::chunk_size_from_log2(log2)?,
+                None => crate::retrieve::LEGACY_CHUNK_SIZE,
+            },
         })
     }
 
@@ -286,6 +293,7 @@ impl FileProperties {
             stream_secret: Some(stream_secret),
             thumbnail,
             tree_hash: None,
+            chunk_size: crate::retrieve::chunk_size_for_new_files(),
         }
     }
 
@@ -303,6 +311,7 @@ impl FileProperties {
             stream_secret: None,
             thumbnail: None,
             tree_hash: None,
+            chunk_size: crate::retrieve::LEGACY_CHUNK_SIZE,
         }
     }
 
@@ -320,6 +329,7 @@ impl FileProperties {
             stream_secret: None,
             thumbnail: None,
             tree_hash: None,
+            chunk_size: crate::retrieve::LEGACY_CHUNK_SIZE,
         }
     }
 
@@ -345,6 +355,10 @@ impl FileProperties {
         }
         if let Some(secret) = &self.stream_secret {
             b = b.put("p", CborObject::ByteString(secret.clone()));
+        }
+        // absent means the legacy size, so the cbor of every existing file is unchanged
+        if self.chunk_size != crate::retrieve::LEGACY_CHUNK_SIZE {
+            b = b.put("cs", CborObject::Long(crate::retrieve::chunk_size_log2(self.chunk_size)));
         }
         b.build()
     }

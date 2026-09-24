@@ -123,12 +123,12 @@ impl SyncFilesystem for LocalFileSystem {
         f.write_all(data).map_err(|e| Error::Protocol(e.to_string()))
     }
 
-    async fn hash_file(&self, p: &Path, size: u64) -> Result<[u8; 32]> {
+    async fn hash_file(&self, p: &Path, size: u64, chunk_size: u64) -> Result<([u8; 32], u64)> {
         let target = self.resolve(p);
-        let root = peergos_fs::hash_file_parallel(&target, size)?;
+        let root = peergos_fs::hash_file_parallel(&target, size, chunk_size)?;
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&root.hash);
-        Ok(hash)
+        Ok((hash, chunk_size))
     }
 
     async fn set_hash(&self, _p: &Path, _hash: [u8; 32], _size: u64) -> Result<()> {

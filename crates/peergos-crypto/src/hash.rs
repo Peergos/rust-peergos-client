@@ -52,6 +52,60 @@ pub fn blake3(input: &[u8]) -> Vec<u8> {
     blake3::hash(input).as_bytes().to_vec()
 }
 
+/// A BLAKE3 chunk, the unit the tree is built from (`Blake3.CHUNK_SIZE`).
+pub const BLAKE3_CHUNK_LEN: u64 = blake3::CHUNK_LEN as u64;
+
+/// `Blake3.tailChainingValue`: the chaining value of a piece of a larger input that
+/// starts at BLAKE3 chunk `start_chunk`. The piece must be an aligned power of two
+/// subtree, or the last piece of the input.
+pub fn blake3_chaining_value(input: &[u8], start_chunk: u64) -> Vec<u8> {
+    use blake3::hazmat::HasherExt;
+    let mut hasher = blake3::Hasher::new();
+    hasher.set_input_offset(start_chunk * BLAKE3_CHUNK_LEN);
+    hasher.update(input);
+    hasher.finalize_non_root().to_vec()
+}
+
+fn to_cv(cv: &[u8]) -> blake3::hazmat::ChainingValue {
+    cv.try_into().expect("a chaining value is 32 bytes")
+}
+
+/// `Blake3.mergeNonRoot`
+pub fn blake3_merge_non_root(left: &[u8], right: &[u8]) -> Vec<u8> {
+    blake3::hazmat::merge_subtrees_non_root(&to_cv(left), &to_cv(right), blake3::hazmat::Mode::Hash).to_vec()
+}
+
+/// `Blake3.mergeRoot`
+pub fn blake3_merge_root(left: &[u8], right: &[u8]) -> Vec<u8> {
+    blake3::hazmat::merge_subtrees_root(&to_cv(left), &to_cv(right), blake3::hazmat::Mode::Hash)
+        .as_bytes()
+        .to_vec()
+}
+
+/// BLAKE3 puts the largest power of two on the left, so the split is not pairwise.
+fn left_count(n: usize) -> usize {
+    1 << (usize::BITS - 1 - (n - 1).leading_zeros())
+}
+
+/// `Blake3.mergeSubtree`: the chaining value of the subtree whose consecutive pieces
+/// have these chaining values.
+pub fn blake3_merge_subtree(cvs: &[Vec<u8>]) -> Vec<u8> {
+    assert!(!cvs.is_empty(), "A subtree has at least one piece");
+    if cvs.len() == 1 {
+        return cvs[0].clone();
+    }
+    let left = left_count(cvs.len());
+    blake3_merge_non_root(&blake3_merge_subtree(&cvs[..left]), &blake3_merge_subtree(&cvs[left..]))
+}
+
+/// `Blake3.mergeAsRoot`: the hash of a whole input from its pieces' chaining values.
+/// A single piece has no merge to finalise, so needs at least two.
+pub fn blake3_merge_as_root(cvs: &[Vec<u8>]) -> Vec<u8> {
+    assert!(cvs.len() >= 2, "A root merge needs at least two pieces, not {}", cvs.len());
+    let left = left_count(cvs.len());
+    blake3_merge_root(&blake3_merge_subtree(&cvs[..left]), &blake3_merge_subtree(&cvs[left..]))
+}
+
 /// `ScryptJava.hashToKeyBytes`: the password is first SHA-256'd, the salt is the
 /// (username + extraSalt) string bytes, and `N = 1 << memory_cost`.
 pub fn hash_to_key_bytes(

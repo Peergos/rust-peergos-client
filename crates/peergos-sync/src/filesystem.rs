@@ -42,7 +42,11 @@ pub trait SyncFilesystem: Send + Sync {
     async fn truncate(&self, p: &Path, size: u64) -> Result<()>;
     async fn read(&self, p: &Path) -> Result<Vec<u8>>;
     async fn write(&self, p: &Path, data: &[u8], file_offset: u64) -> Result<()>;
-    async fn hash_file(&self, p: &Path, size: u64) -> Result<[u8; 32]>;
+    /// Hash a file at `chunk_size`: the chunk size of the file it will be compared
+    /// against, since the two schemes give different roots for the same bytes. A
+    /// remote file knows its own chunk size and uses that instead. Returns the root
+    /// and the chunk size it was built at.
+    async fn hash_file(&self, p: &Path, size: u64, chunk_size: u64) -> Result<([u8; 32], u64)>;
     async fn set_hash(&self, p: &Path, hash: [u8; 32], size: u64) -> Result<()>;
     async fn files_count(&self) -> Result<usize>;
     async fn upload_subtree(&self, folders: Vec<UploadFolder>) -> Result<()>;

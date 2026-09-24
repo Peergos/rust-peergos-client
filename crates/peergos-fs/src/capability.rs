@@ -212,22 +212,35 @@ impl EncryptedCapability {
         SymmetricKey::new(bytes, false)
     }
 
-    /// Decrypt the capability using the label as salt and the given password.
-    pub fn decrypt_from_password(&self, salt: &str, password: &str) -> Result<AbsoluteCapability> {
+    /// Decrypt the capabilities using the label as salt and the given password.
+    /// A link carries one capability or several, and the cbor type says which: a
+    /// capability is always a map, so every single item link decodes as a one
+    /// element list.
+    pub fn decrypt_from_password(&self, salt: &str, password: &str) -> Result<Vec<AbsoluteCapability>> {
         let key = EncryptedCapability::derive_key(salt, password)?;
-        self.payload.decrypt(&key, AbsoluteCapability::from_cbor)
+        self.payload.decrypt(&key, |cbor| match cbor {
+            CborObject::List(caps) => caps.iter().map(AbsoluteCapability::from_cbor).collect(),
+            single => Ok(vec![AbsoluteCapability::from_cbor(single)?]),
+        })
     }
 
-    /// Encrypt `cap` under a key derived from the label (salt) + password
+    /// Encrypt `caps` under a key derived from the label (salt) + password
     /// (`EncryptedCapability.createFromPassword`).
     pub fn create_from_password(
-        cap: &AbsoluteCapability,
+        caps: &[AbsoluteCapability],
         salt: &str,
         password: &str,
         has_user_password: bool,
     ) -> Result<EncryptedCapability> {
         let key = EncryptedCapability::derive_key(salt, password)?;
-        Ok(EncryptedCapability { payload: CipherText::build(&key, cap)?, has_user_password })
+        // One capability is written as a bare map, exactly as before, so a single item
+        // link is byte identical to one written by an older client and readable by one
+        let payload = match caps {
+            [] => return Err(Error::Protocol("A secret link must have at least one capability!".into())),
+            [single] => CipherText::build(&key, single)?,
+            many => CipherText::build(&key, &CborObject::List(many.iter().map(|c| c.to_cbor()).collect()))?,
+        };
+        Ok(EncryptedCapability { payload, has_user_password })
     }
 
     pub fn to_cbor(&self) -> CborObject {

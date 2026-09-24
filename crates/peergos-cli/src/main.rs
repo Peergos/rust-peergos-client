@@ -22,7 +22,7 @@
 use peergos_core::mutable::{HttpMutablePointers, MutablePointers};
 use peergos_core::{ContentAddressedStorage, DirectS3Storage, HttpPoster, HttpStorage, ReqwestPoster};
 use peergos_fs::{
-    retrieve_secret_link_capability, AbsoluteCapability, FileWrapper, MultiFactorAuthRequest, MultiFactorAuthResponse, UserContext,
+    retrieve_secret_link_capabilities, AbsoluteCapability, FileWrapper, MultiFactorAuthRequest, MultiFactorAuthResponse, UserContext,
 };
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -82,7 +82,7 @@ async fn main() -> Result<(), BoxErr> {
             if link.is_empty() {
                 continue;
             }
-            caps.push(resolve_link_interactive(link, store.as_ref()).await?);
+            caps.extend(resolve_link_interactive(link, store.as_ref()).await?);
         }
         if caps.is_empty() {
             return Err("no secret links provided to --links".into());
@@ -129,14 +129,31 @@ async fn main() -> Result<(), BoxErr> {
         let password = read_password("Enter password > ")?;
         let (poster, store, mutable) = build_transport(&server).await?;
 
-        // A TOTP prompt for second-factor accounts (only invoked if the server asks).
+        // A code prompt for second-factor accounts (only invoked if the server asks):
+        // a 6 digit TOTP code, or a single use backup code.
         let responder = |req: &MultiFactorAuthRequest| -> peergos_core::error::Result<MultiFactorAuthResponse> {
-            let method = req.totp_method().ok_or_else(|| {
-                peergos_core::error::Error::Protocol("this account needs a second factor the shell can't handle (only TOTP is supported)".into())
-            })?;
-            let code = prompt("Two-factor code (TOTP) > ")
-                .map_err(|e| peergos_core::error::Error::Protocol(format!("failed to read TOTP code: {e}")))?;
-            Ok(MultiFactorAuthResponse::new_totp(method.credential_id.clone(), code.trim().to_string()))
+            let totp = req.totp_method();
+            let backup = req.backup_codes_method();
+            let label = match (totp.is_some(), backup.is_some()) {
+                (true, true) => "Two-factor code (TOTP, or a backup code) > ",
+                (true, false) => "Two-factor code (TOTP) > ",
+                (false, true) => "Backup code > ",
+                (false, false) => {
+                    return Err(peergos_core::error::Error::Protocol(
+                        "this account needs a second factor the shell can't handle (only TOTP and backup codes are supported)".into(),
+                    ))
+                }
+            };
+            let code = prompt(label)
+                .map_err(|e| peergos_core::error::Error::Protocol(format!("failed to read code: {e}")))?;
+            let code = code.trim();
+            let is_totp_code = code.len() == 6 && code.chars().all(|c| c.is_ascii_digit());
+            match (totp, backup) {
+                (Some(t), _) if is_totp_code => Ok(MultiFactorAuthResponse::new_totp(t.credential_id.clone(), code.to_string())),
+                (_, Some(b)) => Ok(MultiFactorAuthResponse::new_backup_code(b.credential_id.clone(), code)),
+                (Some(t), None) => Ok(MultiFactorAuthResponse::new_totp(t.credential_id.clone(), code.to_string())),
+                (None, None) => unreachable!(),
+            }
         };
         let ctx = UserContext::sign_in(&username, &password, Some(&responder), poster, store, mutable)
             .await?
@@ -256,6 +273,7 @@ impl Shell {
             "share_read" => self.share_read(args).await,
             "share_write" => self.share_write(args).await,
             "link" => self.link(args).await,
+            "links" => self.links().await,
             "passwd" => self.passwd().await,
             other => Err(format!("unknown command '{other}' (try 'help')").into()),
         }
@@ -538,19 +556,27 @@ impl Shell {
     /// Mint a secret link to a file/dir. Read-only by default; `--write` makes it
     /// writable (rotating the target into its own writer). Optionally password-
     /// protect it, expire it after a duration, and/or cap the number of retrievals.
-    ///   link <remote> [--write] [--password [pw]] [--expiry <30m|24h|7d>] [--max-uses <n>]
+    ///   link <remote>... [--write] [--password [pw]] [--expiry <30m|24h|7d>] [--max-uses <n>]
     async fn link(&self, args: &[String]) -> Result<String, BoxErr> {
-        const USAGE: &str = "usage: link <remote-path> [--write] [--password [pw]] [--expiry <30m|24h|7d>] [--max-uses <n>]";
-        let path_arg = args.first().filter(|a| !a.starts_with("--")).ok_or(USAGE)?;
-        let remote = self.resolve_remote(path_arg);
-        let rel = self.home_relative(&remote)?;
+        const USAGE: &str = "usage: link <remote-path>... [--write] [--password [pw]] [--expiry <30m|24h|7d>] [--max-uses <n>]";
+        let path_args: Vec<&String> = args.iter().take_while(|a| !a.starts_with("--")).collect();
+        if path_args.is_empty() {
+            return Err(USAGE.into());
+        }
+        let mut remotes = Vec::with_capacity(path_args.len());
+        let mut rels = Vec::with_capacity(path_args.len());
+        for p in &path_args {
+            let remote = self.resolve_remote(p);
+            rels.push(self.home_relative(&remote)?);
+            remotes.push(remote);
+        }
 
         let mut writable = false;
         let mut password = String::new();
         let mut expiry: Option<i64> = None;
         let mut max_uses: Option<i64> = None;
 
-        let mut i = 1;
+        let mut i = path_args.len();
         while i < args.len() {
             match args[i].as_str() {
                 "--write" | "--writable" => writable = true,
@@ -580,10 +606,14 @@ impl Shell {
             i += 1;
         }
 
-        if self.ctx.get_by_path(&rel).await?.is_none() {
-            return Err(format!("no such path: {remote}").into());
+        for (rel, remote) in rels.iter().zip(&remotes) {
+            if self.ctx.get_by_path(rel).await?.is_none() {
+                return Err(format!("no such path: {remote}").into());
+            }
         }
-        let link = self.ctx.create_secret_link(&rel, writable, &password, expiry, max_uses).await?;
+        let writable_rels: Vec<String> = if writable { rels.clone() } else { Vec::new() };
+        let props = self.ctx.create_secret_link_to(&rels, &writable_rels, &password, expiry, max_uses).await?;
+        let link = self.ctx.secret_link_string(&props)?;
 
         let mut notes = vec![if writable { "writable" } else { "read-only" }.to_string()];
         if !password.is_empty() {
@@ -595,7 +625,33 @@ impl Shell {
         if let Some(n) = max_uses {
             notes.push(format!("max {n} use(s)"));
         }
-        Ok(format!("Created secret link to '{remote}' ({}):\n{link}", notes.join(", ")))
+        Ok(format!("Created secret link to '{}' ({}):\n{link}", remotes.join("', '"), notes.join(", ")))
+    }
+
+    /// `links`: every secret link this user has, with what it holds.
+    async fn links(&self) -> Result<String, BoxErr> {
+        let links = self.ctx.get_all_secret_links().await?;
+        if links.is_empty() {
+            return Ok("No secret links".to_string());
+        }
+        let mut out = Vec::new();
+        for l in links {
+            let mut notes = vec![if l.props.writable { "writable" } else { "read-only" }.to_string()];
+            if !l.props.user_password.is_empty() {
+                notes.push("password-protected".to_string());
+            }
+            if l.props.expiry_epoch_secs.is_some() {
+                notes.push("expiring".to_string());
+            }
+            if let Some(n) = l.props.max_retrievals {
+                notes.push(format!("max {n} use(s)"));
+            }
+            out.push(format!("{} ({})", self.ctx.secret_link_string(&l.props)?, notes.join(", ")));
+            for p in l.paths() {
+                out.push(format!("  /{p}"));
+            }
+        }
+        Ok(out.join("\n"))
     }
 
     async fn passwd(&self) -> Result<String, BoxErr> {
@@ -717,12 +773,12 @@ fn make_link_shell(ctx: UserContext, server: String) -> Shell {
 async fn resolve_link_interactive(
     link: &str,
     store: &dyn ContentAddressedStorage,
-) -> Result<AbsoluteCapability, BoxErr> {
-    match retrieve_secret_link_capability(link, store, None).await {
-        Ok(cap) => Ok(cap),
+) -> Result<Vec<AbsoluteCapability>, BoxErr> {
+    match retrieve_secret_link_capabilities(link, store, None).await {
+        Ok(caps) => Ok(caps),
         Err(e) if e.to_string().to_lowercase().contains("password") => {
             let pw = read_password(&format!("Password for link {link} > "))?;
-            Ok(retrieve_secret_link_capability(link, store, Some(&pw)).await?)
+            Ok(retrieve_secret_link_capabilities(link, store, Some(&pw)).await?)
         }
         Err(e) => Err(e.into()),
     }
@@ -839,8 +895,9 @@ fn help_text() -> String {
         "  process_follow_request <user> <accept|accept-and-reciprocate|reject>",
         "  share_read <remote> <user>             grant read access to a follower",
         "  share_write <remote> <user>            grant write access to a follower",
-        "  link <remote> [--write] [--password [pw]] [--expiry <30m|24h|7d>] [--max-uses <n>]",
-        "                                         mint a secret link to a file/dir",
+        "  link <remote>... [--write] [--password [pw]] [--expiry <30m|24h|7d>] [--max-uses <n>]",
+        "                                         mint a secret link to one or more files/dirs",
+        "  links                                  list your secret links",
         "  passwd                                 change your password",
         "  help | ?                               show this help",
         "  exit | quit | bye                      disconnect",
