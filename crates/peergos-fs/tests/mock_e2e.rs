@@ -4118,3 +4118,80 @@ async fn single_item_link_payload_is_a_bare_capability() {
     let is_map = enc.payload.decrypt(&key, |c| Ok(matches!(c, peergos_cbor::CborObject::Map(_)))).unwrap();
     assert!(is_map);
 }
+
+/// Granting write access moves the item into its own writing space without
+/// changing any key; a reader it was already shared with can still read it.
+#[tokio::test]
+async fn grant_write_keeps_keys_and_existing_readers() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw"), ("carol", "cpw")] {
+        sign_up(u, p, &poster, &store, &mutable).await;
+    }
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+    befriend(("alice", "apw"), ("carol", "cpw"), &poster, &store, &mutable).await;
+
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let docs = alice.get_home().await.unwrap().mkdir("docs").await.unwrap();
+    let big: Vec<u8> = (0..11 * 1024 * 1024).map(|i| (i % 253) as u8).collect();
+    docs.upload("big.bin", &big).await.unwrap();
+    docs.get_latest().await.unwrap().mkdir("sub").await.unwrap().upload("f.txt", b"inner").await.unwrap();
+    let before = alice.get_by_path("docs").await.unwrap().unwrap().capability().clone();
+    let docs_now = alice.get_by_path("docs").await.unwrap().unwrap();
+    peergos_fs::share_read_access(alice.user().unwrap(), "docs", docs_now.capability(), "carol", store.clone(), mutable.as_ref()).await.unwrap();
+
+    alice.share_write_access("docs", "bob").await.unwrap();
+
+    let after = alice.get_by_path("docs").await.unwrap().unwrap();
+    assert_ne!(after.capability().writer, before.writer, "moved to a writing space of its own");
+    assert_eq!(after.capability().map_key, before.map_key, "no key changed");
+    assert_eq!(after.capability().r_base_key, before.r_base_key, "no key changed");
+    assert_eq!(alice.get_by_path("docs/big.bin").await.unwrap().unwrap().read().await.unwrap(), big);
+    assert!(try_write(("bob", "bpw"), "alice", "from-bob.txt", &poster, &store, &mutable).await);
+
+    let carol = peergos_fs::login("carol", "cpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let from_alice = peergos_fs::get_friends(&carol, store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.owner_name == "alice").unwrap();
+    let caps = peergos_fs::read_shared_capabilities(&from_alice.pointer, store.clone(), mutable.as_ref()).await.unwrap();
+    let newest = caps.last().unwrap();
+    let sub = peergos_fs::list_directory(newest, store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.name == "sub").unwrap();
+    let f = peergos_fs::list_directory(&sub.cap, store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.name == "f.txt").unwrap();
+    assert_eq!(peergos_fs::read_file(&f.cap, store.clone(), mutable.as_ref()).await.unwrap().1, b"inner");
+}
+
+/// A writing space nested inside a subtree keeps working when the subtree is
+/// moved into a writing space of its own, and when that one is revoked.
+#[tokio::test]
+async fn nested_writing_space_survives_grant_and_revoke_of_parent() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw"), ("carol", "cpw")] {
+        sign_up(u, p, &poster, &store, &mutable).await;
+    }
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+    befriend(("alice", "apw"), ("carol", "cpw"), &poster, &store, &mutable).await;
+
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    alice.get_home().await.unwrap().mkdir("a").await.unwrap().mkdir("b").await.unwrap();
+    alice.share_write_access("a/b", "bob").await.unwrap();
+    assert!(try_write(("bob", "bpw"), "alice", "one.txt", &poster, &store, &mutable).await);
+
+    alice.share_write_access("a", "carol").await.unwrap();
+    assert!(try_write(("bob", "bpw"), "alice", "two.txt", &poster, &store, &mutable).await, "nested space survives the grant");
+    assert!(try_write(("carol", "cpw"), "alice", "three.txt", &poster, &store, &mutable).await);
+    let b = alice.get_by_path("a/b").await.unwrap().unwrap();
+    assert_eq!(
+        peergos_fs::reconstruct_link_path(b.capability(), store.clone(), mutable.as_ref()).await.unwrap(),
+        "/alice/a/b"
+    );
+
+    let alice = login("alice", "apw", &poster, &store, &mutable).await;
+    let home = alice.user().unwrap().home().unwrap().clone();
+    peergos_fs::unshare_write_access(alice.user().unwrap(), "", &home, "a", &["carol".to_string()], store.clone(), mutable.as_ref()).await.unwrap();
+    assert!(try_write(("bob", "bpw"), "alice", "four.txt", &poster, &store, &mutable).await, "nested space survives the revocation");
+    let names: Vec<String> = alice.get_by_path("a/b").await.unwrap().unwrap().children().await.unwrap()
+        .iter().map(|c| c.name().to_string()).collect();
+    assert!(names.contains(&"four.txt".to_string()), "bob's write landed in alice's tree: {names:?}");
+}

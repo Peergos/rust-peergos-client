@@ -439,7 +439,8 @@ impl HttpStorage {
             url_encode(&tid.to_string()),
             url_encode(&writer.to_string()),
         );
-        let raw = self.poster.post(&url, body, false, 30_000).await?;
+        let timeout = crate::poster::write_timeout_ms(30_000, body.len());
+        let raw = self.poster.post(&url, body, false, timeout).await?;
         let hashes = parse_hash_stream(&raw)?;
         if hashes.len() != blocks.len() {
             return Err(Error::Protocol(format!(

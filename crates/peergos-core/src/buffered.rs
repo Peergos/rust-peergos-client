@@ -43,6 +43,7 @@ const MAX_CONCURRENT_BATCH_UPLOADS: usize = 4;
 struct BufferedBlock {
     data: Vec<u8>,
     signature: Vec<u8>,
+    owner: PublicKeyHash,
     writer: PublicKeyHash,
     is_raw: bool,
 }
@@ -112,7 +113,6 @@ impl BufferedStorage {
     }
 
     fn buffer_put(&self, owner: &PublicKeyHash, writer: &PublicKeyHash, signed: Vec<Vec<u8>>, blocks: Vec<Vec<u8>>, is_raw: bool) -> Result<Vec<Cid>> {
-        let _ = owner;
         if signed.len() != blocks.len() {
             return Err(Error::Protocol("blocks/signatures length mismatch".into()));
         }
@@ -120,7 +120,7 @@ impl BufferedStorage {
         let mut cids = Vec::with_capacity(blocks.len());
         for (block, signature) in blocks.into_iter().zip(signed.into_iter()) {
             let cid = build_cid(peergos_crypto::hash::sha256(&block), is_raw)?;
-            buf.insert(cid.clone(), BufferedBlock { data: block, signature, writer: writer.clone(), is_raw });
+            buf.insert(cid.clone(), BufferedBlock { data: block, signature, owner: owner.clone(), writer: writer.clone(), is_raw });
             cids.push(cid);
         }
         Ok(cids)
@@ -155,8 +155,14 @@ impl BufferedStorage {
 
     /// GC to the blocks reachable from `roots`, then bulk-write them (in parallel
     /// per writer / codec) and clear the buffer (`gc` + `commit`).
+    /// Write `owner`'s buffered blocks reachable from `roots` to `owner`'s server,
+    /// leaving other owners' blocks buffered.
     pub async fn commit_blocks(&self, owner: &PublicKeyHash, roots: &[Cid], tid: &TransactionId) -> Result<()> {
-        let keep = self.reachable(roots);
+        let keep: HashSet<Cid> = {
+            let reachable = self.reachable(roots);
+            let buf = self.buffer.lock().unwrap();
+            reachable.into_iter().filter(|c| buf.get(c).is_some_and(|b| &b.owner == owner)).collect()
+        };
         // Split the surviving blocks per writer into Java's three flush groups
         // (`BufferedStorage.commit`): cbor, small raw (<100KiB) and (large) raw.
         let mut cbor: HashMap<PublicKeyHash, Vec<(Vec<u8>, Vec<u8>)>> = HashMap::new();
@@ -232,7 +238,8 @@ impl BufferedStorage {
         for h in handles {
             h.await.map_err(|e| Error::Protocol(format!("block flush task panicked: {e}")))??;
         }
-        self.clear();
+        let mut buf = self.buffer.lock().unwrap();
+        buf.retain(|c, _| !keep.contains(c));
         Ok(())
     }
 }
@@ -325,6 +332,7 @@ impl ContentAddressedStorage for BufferedStorage {
 /// A buffered pointer update for one writer (`BufferedPointers.WriterUpdate`).
 #[derive(Clone)]
 struct WriterUpdate {
+    owner: PublicKeyHash,
     writer: PublicKeyHash,
     update: PointerUpdate,
     signer: SigningPrivateKeyAndPublicHash,
@@ -378,15 +386,10 @@ impl BufferedPointers {
         if !auto.safe.load(Ordering::SeqCst) || auto.blocks.total_size() < auto.buffer_size {
             return Ok(());
         }
-        let roots = self.roots();
-        if roots.is_empty() {
+        if self.roots().is_empty() {
             return Ok(());
         }
-        let tid = auto.blocks.target().start_transaction(owner).await?;
-        auto.blocks.commit_blocks(owner, &roots, &tid).await?;
-        self.commit_pointers(owner, &auto.blocks, &tid).await?;
-        auto.blocks.target().close_transaction(owner, &tid).await?;
-        Ok(())
+        flush(&auto.blocks, self, owner).await
     }
 
     pub fn is_empty(&self) -> bool {
@@ -402,20 +405,39 @@ impl BufferedPointers {
         self.updates.lock().unwrap().iter().filter_map(|w| w.update.updated.clone()).collect()
     }
 
-    /// Commit all buffered pointer updates in order, resolving any CAS conflict per
-    /// writer via a 3-way champ merge. Sequential commit preserves the write order
-    /// (needed so a parent pointer commits before a dependent child's).
+    /// The roots of `owner`'s buffered updates.
+    pub fn roots_for(&self, owner: &PublicKeyHash) -> Vec<Cid> {
+        self.updates.lock().unwrap().iter().filter(|w| &w.owner == owner).filter_map(|w| w.update.updated.clone()).collect()
+    }
+
+    /// The owners with buffered updates, in the order first written. One operation
+    /// can write to several owners' spaces, e.g. uploading a large file into a folder
+    /// shared with us also writes the upload transaction to our own space.
+    pub fn owners(&self) -> Vec<PublicKeyHash> {
+        let mut res: Vec<PublicKeyHash> = Vec::new();
+        for w in self.updates.lock().unwrap().iter() {
+            if !res.contains(&w.owner) {
+                res.push(w.owner.clone());
+            }
+        }
+        res
+    }
+
+    /// Commit `owner`'s buffered pointer updates in order, resolving any CAS conflict
+    /// per writer via a 3-way champ merge. Sequential commit preserves the write
+    /// order (needed so a parent pointer commits before a dependent child's).
     pub async fn commit_pointers(
         &self,
         owner: &PublicKeyHash,
         blocks: &BufferedStorage,
         tid: &TransactionId,
     ) -> Result<()> {
-        let writes: Vec<WriterUpdate> = self.updates.lock().unwrap().clone();
+        let writes: Vec<WriterUpdate> =
+            self.updates.lock().unwrap().iter().filter(|w| &w.owner == owner).cloned().collect();
         for w in &writes {
             self.commit_one_with_merge(owner, w, blocks, tid).await?;
         }
-        self.clear();
+        self.updates.lock().unwrap().retain(|w| &w.owner != owner);
         Ok(())
     }
 
@@ -483,8 +505,11 @@ impl MutablePointers for BufferedPointers {
         {
             let mut list = self.updates.lock().unwrap();
             match list.last_mut() {
-                Some(last) if last.writer == writer.public_key_hash => last.update.updated = update.updated.clone(),
+                Some(last) if last.writer == writer.public_key_hash && &last.owner == owner => {
+                    last.update.updated = update.updated.clone()
+                }
                 _ => list.push(WriterUpdate {
+                    owner: owner.clone(),
                     writer: writer.public_key_hash.clone(),
                     update: update.clone(),
                     signer: writer.clone(),
@@ -509,6 +534,25 @@ impl MutablePointers for BufferedPointers {
         }
         self.target.get_pointer_target(owner, writer, ipfs).await
     }
+}
+
+/// Commit every owner's buffered writes, one owner and transaction at a time, then
+/// drop whatever the commits did not reach.
+async fn flush(blocks: &BufferedStorage, pointers: &BufferedPointers, default_owner: &PublicKeyHash) -> Result<()> {
+    let mut owners = pointers.owners();
+    if owners.is_empty() {
+        owners.push(default_owner.clone());
+    }
+    for owner in owners {
+        let roots = pointers.roots_for(&owner);
+        let tid = blocks.target().start_transaction(&owner).await?;
+        blocks.commit_blocks(&owner, &roots, &tid).await?;
+        pointers.commit_pointers(&owner, blocks, &tid).await?;
+        blocks.target().close_transaction(&owner, &tid).await?;
+    }
+    blocks.clear();
+    pointers.clear();
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -590,21 +634,113 @@ impl BufferedNetwork {
     }
 
     /// Flush all buffered blocks and pointer updates (`commit`): GC blocks to the
-    /// committed roots, bulk-write them, then commit the pointers.
+    /// committed roots, bulk-write them, then commit the pointers. Each owner's
+    /// writes go to that owner's server; `owner` is used if nothing records one.
     pub async fn commit(&self, owner: &PublicKeyHash) -> Result<()> {
         if self.blocks.is_empty() && self.pointers.is_empty() {
             return Ok(());
         }
-        let roots = self.pointers.roots();
-        let tid = self.blocks.target().start_transaction(owner).await?;
-        self.blocks.commit_blocks(owner, &roots, &tid).await?;
-        self.pointers.commit_pointers(owner, &self.blocks, &tid).await?;
-        self.blocks.target().close_transaction(owner, &tid).await?;
-        Ok(())
+        flush(&self.blocks, &self.pointers, owner).await
     }
 
     pub fn force_clear(&self) {
         self.blocks.clear();
         self.pointers.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keys::{PublicSigningKey, SecretSigningKey};
+    use crate::ram::RamStorage;
+
+    /// Records the owner every write and pointer update is sent under.
+    #[derive(Default)]
+    struct Recording {
+        ram: RamStorage,
+        puts: Mutex<Vec<PublicKeyHash>>,
+        pointers: Mutex<Vec<(PublicKeyHash, PublicKeyHash)>>,
+    }
+
+    #[async_trait]
+    impl ContentAddressedStorage for Recording {
+        async fn id(&self) -> Result<Cid> {
+            self.ram.id().await
+        }
+        async fn ids(&self) -> Result<Vec<Cid>> {
+            self.ram.ids().await
+        }
+        async fn start_transaction(&self, owner: &PublicKeyHash) -> Result<TransactionId> {
+            self.ram.start_transaction(owner).await
+        }
+        async fn close_transaction(&self, owner: &PublicKeyHash, tid: &TransactionId) -> Result<bool> {
+            self.ram.close_transaction(owner, tid).await
+        }
+        async fn get(&self, owner: &PublicKeyHash, hash: &Cid, bat: Option<&BatWithId>) -> Result<Option<CborObject>> {
+            self.ram.get(owner, hash, bat).await
+        }
+        async fn get_raw(&self, owner: &PublicKeyHash, hash: &Cid, bat: Option<&BatWithId>) -> Result<Option<Vec<u8>>> {
+            self.ram.get_raw(owner, hash, bat).await
+        }
+        async fn put(&self, owner: &PublicKeyHash, writer: &PublicKeyHash, s: Vec<Vec<u8>>, b: Vec<Vec<u8>>, tid: &TransactionId) -> Result<Vec<Cid>> {
+            self.puts.lock().unwrap().push(owner.clone());
+            self.ram.put(owner, writer, s, b, tid).await
+        }
+        async fn put_raw(&self, owner: &PublicKeyHash, writer: &PublicKeyHash, s: Vec<Vec<u8>>, b: Vec<Vec<u8>>, tid: &TransactionId) -> Result<Vec<Cid>> {
+            self.puts.lock().unwrap().push(owner.clone());
+            self.ram.put_raw(owner, writer, s, b, tid).await
+        }
+        async fn get_size(&self, owner: &PublicKeyHash, block: &Multihash) -> Result<Option<u64>> {
+            self.ram.get_size(owner, block).await
+        }
+        async fn get_secret_link(&self, owner: &PublicKeyHash, label: &str) -> Result<CborObject> {
+            self.ram.get_secret_link(owner, label).await
+        }
+    }
+
+    #[async_trait]
+    impl MutablePointers for Recording {
+        async fn set_pointer(&self, owner: &PublicKeyHash, writer: &PublicKeyHash, _p: Vec<u8>) -> Result<bool> {
+            self.pointers.lock().unwrap().push((owner.clone(), writer.clone()));
+            Ok(true)
+        }
+        async fn set_pointers(&self, _o: &PublicKeyHash, _u: Vec<SignedPointerUpdate>) -> Result<bool> {
+            Ok(true)
+        }
+        async fn get_pointer(&self, _o: &PublicKeyHash, _w: &PublicKeyHash) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+    }
+
+    fn signer(seed: u8) -> SigningPrivateKeyAndPublicHash {
+        let (pk, sk) = peergos_crypto::sign::keypair_from_seed(&[seed; 32]).unwrap();
+        SigningPrivateKeyAndPublicHash::new(PublicSigningKey::new(pk.to_vec()).hash().unwrap(), SecretSigningKey::new(sk.to_vec()))
+    }
+
+    /// One batch writing into two owners' spaces sends each owner's blocks and
+    /// pointer to that owner.
+    #[tokio::test]
+    async fn each_owners_writes_go_to_that_owner() {
+        let target = Arc::new(Recording::default());
+        let net = BufferedNetwork::new(target.clone(), target.clone(), usize::MAX, 0);
+        let (alice, bob) = (signer(1), signer(2));
+        let tid = TransactionId("t".into());
+        for (s, byte) in [(&alice, 1u8), (&bob, 2u8)] {
+            let owner = &s.public_key_hash;
+            let cid = net.storage().put(owner, owner, vec![vec![0]], vec![CborObject::Long(byte as i64).to_bytes()], &tid).await.unwrap()[0].clone();
+            net.pointers().set_pointer_update(owner, s, &PointerUpdate::new(None, Some(cid), Some(1))).await.unwrap();
+        }
+        net.commit(&alice.public_key_hash).await.unwrap();
+
+        assert_eq!(*target.puts.lock().unwrap(), vec![alice.public_key_hash.clone(), bob.public_key_hash.clone()]);
+        assert_eq!(
+            *target.pointers.lock().unwrap(),
+            vec![
+                (alice.public_key_hash.clone(), alice.public_key_hash.clone()),
+                (bob.public_key_hash.clone(), bob.public_key_hash.clone())
+            ]
+        );
+        assert!(net.storage().is_empty() && net.pointers().is_empty());
     }
 }

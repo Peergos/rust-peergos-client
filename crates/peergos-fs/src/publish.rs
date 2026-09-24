@@ -372,17 +372,17 @@ impl InodeFileSystem {
             Some(d) => d,
             None => return Ok(()),
         };
-        // Walk down, recording (dir inode, dir, child name, had-other-children) at
+        // Walk down, recording (dir inode, dir, child entry, had-other-children) at
         // each level. Bail if any element isn't present (nothing to remove).
         let mut cur_key = root;
-        let mut chain: Vec<(Inode, DirectoryInode, String, bool)> = Vec::new();
+        let mut chain: Vec<(Inode, DirectoryInode, InodeCap, bool)> = Vec::new();
         for (i, name) in elements.iter().enumerate() {
             let child = match cur_dir.get_child(name, &owner, store.as_ref()).await? {
                 Some(c) => c,
                 None => return Ok(()),
             };
             let had_other = cur_dir.child_count(&owner, store.as_ref()).await? > 1;
-            chain.push((cur_key.clone(), cur_dir.clone(), name.clone(), had_other));
+            chain.push((cur_key.clone(), cur_dir.clone(), child.clone(), had_other));
             if i + 1 < elements.len() {
                 cur_key = child.inode.clone();
                 cur_dir = match self.get_value(&cur_key).await? {
@@ -391,13 +391,28 @@ impl InodeFileSystem {
                 };
             }
         }
-        // Remove the leaf, then prune each parent whose only child we just removed.
-        let mut prune = true;
-        for (dir_key, mut dir, child_name, had_other_children) in chain.into_iter().rev() {
-            if !prune {
+        let (leaf_key, mut leaf_dir, leaf, leaf_had_other) = chain.pop().expect("at least one element");
+        let leaf_has_descendants = match self.get_value(&leaf.inode).await? {
+            Some(d) => d.child_count(&owner, store.as_ref()).await? > 0,
+            None => false,
+        };
+        if leaf_has_descendants {
+            // something below is published in its own right, so keep the node and drop
+            // only its capability, or that subtree is orphaned
+            leaf_dir.add_child(InodeCap { inode: leaf.inode, cap: None }, &owner, signer, store.as_ref(), tid).await?;
+            self.put_value(&leaf_key, &leaf_dir, signer, tid).await?;
+            return Ok(());
+        }
+        leaf_dir.remove_child(&leaf.inode.name, &owner, signer, store.as_ref(), tid).await?;
+        self.put_value(&leaf_key, &leaf_dir, signer, tid).await?;
+        // Prune each ancestor whose only child we just removed, unless it is itself
+        // published: an emptied published node is a live publication.
+        let mut prune = !leaf_had_other;
+        for (dir_key, mut dir, child, had_other_children) in chain.into_iter().rev() {
+            if !prune || child.cap.is_some() {
                 break;
             }
-            dir.remove_child(&child_name, &owner, signer, store.as_ref(), tid).await?;
+            dir.remove_child(&child.inode.name, &owner, signer, store.as_ref(), tid).await?;
             self.put_value(&dir_key, &dir, signer, tid).await?;
             prune = !had_other_children;
         }
@@ -668,5 +683,54 @@ mod tests {
         assert!(fs.get_by_path("/u/dir/file0").await.unwrap().is_none());
         assert!(fs.get_by_path("/u/dir/file39").await.unwrap().is_some());
         assert_eq!(fs.get_by_path("/u/dir/file20").await.unwrap().unwrap().map_key, cap(&owner, 20).map_key);
+    }
+
+    /// The cap published exactly at `path`, not at an ancestor.
+    async fn exact(fs: &InodeFileSystem, path: &str) -> Option<AbsoluteCapability> {
+        let mut current = Inode::root();
+        let mut found = None;
+        for name in canonical_elements(path) {
+            let dir = fs.get_value(&current).await.unwrap()?;
+            let child = dir.get_child(&name, &fs.owner, fs.store.as_ref()).await.unwrap()?;
+            found = child.cap;
+            current = child.inode;
+        }
+        found
+    }
+
+    /// Random publish / unpublish sequences over nested paths must leave exactly the
+    /// published set resolvable (WebsitePublishingFuzzTests).
+    #[tokio::test]
+    async fn publish_and_unpublish_sequences_over_nested_paths() {
+        let paths = ["/u/a", "/u/a/b", "/u/a/b/c", "/u/a/d", "/u/e", "/u/e/f/g"];
+        let store: Arc<dyn ContentAddressedStorage> = Arc::new(RamStorage::new());
+        let (pk, sk) = peergos_crypto::sign::keypair_from_seed(&[9u8; 32]).unwrap();
+        let owner = PublicSigningKey::new(pk.to_vec()).hash().unwrap();
+        let signer = SigningPrivateKeyAndPublicHash::new(owner.clone(), SecretSigningKey::new(sk.to_vec()));
+        let tid = store.start_transaction(&owner).await.unwrap();
+        let mut seed: u64 = 0x2545f4914f6cdd1d;
+        for _round in 0..20 {
+            let mut fs = InodeFileSystem::create_empty(owner.clone(), &signer, store.clone(), &tid).await.unwrap();
+            let mut published = std::collections::BTreeSet::new();
+            for _step in 0..25 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let i = (seed % paths.len() as u64) as usize;
+                let path = paths[i];
+                if (seed >> 32) % 2 == 0 {
+                    fs.add_cap(path, &cap(&owner, i), &signer, &tid).await.unwrap();
+                    published.insert(i);
+                } else {
+                    fs.remove_cap(path, &signer, &tid).await.unwrap();
+                    published.remove(&i);
+                }
+                for (j, p) in paths.iter().enumerate() {
+                    let got = exact(&fs, p).await.map(|c| c.map_key);
+                    let want = published.contains(&j).then(|| cap(&owner, j).map_key);
+                    assert_eq!(got, want, "{p} after {:?}", published);
+                }
+            }
+        }
     }
 }

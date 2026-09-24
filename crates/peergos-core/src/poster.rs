@@ -10,6 +10,16 @@ use async_trait::async_trait;
 /// The default per-request timeout used by the Java client (15s).
 pub const DEFAULT_TIMEOUT_MS: i32 = 15_000;
 
+/// The slowest upload we keep waiting for, in bytes per second: a 64 kbit/s link.
+pub const MIN_UPLOAD_BYTES_PER_SECOND: i64 = 8_000;
+
+/// How long to wait for a write of `body_bytes` to be answered
+/// (`ContentAddressedStorage.writeTimeoutMillis`): long enough for a slow upload,
+/// short enough that a lost stream fails rather than hangs.
+pub fn write_timeout_ms(base_ms: i32, body_bytes: usize) -> i32 {
+    (base_ms as i64 + body_bytes as i64 * 1000 / MIN_UPLOAD_BYTES_PER_SECOND).min(i32::MAX as i64) as i32
+}
+
 #[async_trait]
 pub trait HttpPoster: Send + Sync {
     /// POST `payload` to `url`. `unzip` is advisory; gzip responses are always
@@ -129,8 +139,12 @@ fn url_decode(s: &str) -> String {
 
 #[async_trait]
 impl HttpPoster for ReqwestPoster {
-    async fn post(&self, url: &str, payload: Vec<u8>, _unzip: bool, _timeout_ms: i32) -> Result<Vec<u8>> {
+    async fn post(&self, url: &str, payload: Vec<u8>, _unzip: bool, timeout_ms: i32) -> Result<Vec<u8>> {
         let mut req = self.client.post(self.url(url)?);
+        // zero or negative means no timeout, as for Java's HttpURLConnection
+        if timeout_ms > 0 {
+            req = req.timeout(std::time::Duration::from_millis(timeout_ms as u64));
+        }
         if let Some(agent) = &self.user_agent {
             req = req.header("User-Agent", agent);
         }
@@ -158,7 +172,7 @@ impl HttpPoster for ReqwestPoster {
 
     async fn get(&self, url: &str) -> Result<Vec<u8>> {
         if self.use_get {
-            let mut req = self.client.get(self.url(url)?);
+            let mut req = self.client.get(self.url(url)?).timeout(std::time::Duration::from_millis(DEFAULT_TIMEOUT_MS as u64));
             if let Some(agent) = &self.user_agent {
                 req = req.header("User-Agent", agent);
             }

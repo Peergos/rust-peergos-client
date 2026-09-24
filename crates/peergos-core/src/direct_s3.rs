@@ -266,7 +266,8 @@ impl DirectS3Storage {
             url_encode(&writer.to_string()),
             url_encode(&tid.to_string()),
         );
-        parse_presigned_list(&self.server.post_unzip(&url, body, 60_000).await?)
+        let timeout = crate::poster::write_timeout_ms(60_000, body.len());
+        parse_presigned_list(&self.server.post_unzip(&url, body, timeout).await?)
     }
 }
 

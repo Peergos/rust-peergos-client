@@ -713,6 +713,13 @@ impl UserContext {
         let paths: Vec<String> = paths.iter().map(|p| p.trim_matches('/').to_string()).collect();
         let writable: std::collections::HashSet<String> =
             writable_paths.iter().map(|p| p.trim_matches('/').to_string()).collect();
+        if paths.iter().any(|p| writable.contains(p)) {
+            // an interrupted grant leaves an owned writer with no pointer, so clear any
+            // before adding another; once for the batch, not once per member
+            if let Err(e) = self.remove_orphaned_writers().await {
+                log::warn!("Couldn't remove orphaned writers: {e}");
+            }
+        }
         for path in paths.iter().filter(|p| writable.contains(*p)) {
             self.split_into_own_writing_space(path).await?;
         }
@@ -796,6 +803,58 @@ impl UserContext {
             members.push(crate::LinkMember { path, writable: cap.w_base_key.is_some() });
         }
         Ok(members)
+    }
+
+    /// Grant `friend` write access to the file or directory at home-relative `path`
+    /// (`shareWriteAccessWith`). If the item has to move into a writing space of its
+    /// own, its capability changes, so every existing share and link to it is re-sent.
+    pub async fn share_write_access(&self, path: &str, friend: &str) -> Result<()> {
+        let user = self.require_user()?;
+        let path = path.trim_matches('/');
+        let (parent_path, name) = match path.rsplit_once('/') {
+            Some((p, n)) => (p, n),
+            None => ("", path),
+        };
+        self.split_into_own_writing_space(path).await?;
+        let parent = self
+            .get_by_path(parent_path)
+            .await?
+            .ok_or_else(|| Error::Protocol(format!("no parent directory for {path}")))?;
+        crate::share_write_access(user, parent_path, parent.capability(), name, friend, self.store.clone(), self.mutable.as_ref()).await
+    }
+
+    /// Remove every writer this user's writers own that has no pointer
+    /// (`removeOrphanedWriters`): left behind by a grant of write access that was
+    /// interrupted before the new writer's first commit. Returns how many.
+    pub async fn remove_orphaned_writers(&self) -> Result<usize> {
+        let user = self.require_user()?;
+        let mut signers = vec![user.signer.clone()];
+        if let Some(home) = user.home() {
+            signers.push(crate::recover_signer(home, self.store.clone(), self.mutable.as_ref()).await?);
+        }
+        // writers nested below home are reached through what has been shared from it
+        for (dir, state) in crate::get_all_shares(user, self.store.clone(), self.mutable.as_ref()).await? {
+            let names = state
+                .write_shares()
+                .keys()
+                .chain(state.links().iter().filter(|(_, ls)| ls.iter().any(|l| l.writable)).map(|(n, _)| n));
+            for name in names {
+                let path = if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") };
+                if let Some(f) = self.get_by_path(&path).await? {
+                    if let Ok(s) = crate::recover_signer(f.capability(), self.store.clone(), self.mutable.as_ref()).await {
+                        if !signers.iter().any(|x| x.public_key_hash == s.public_key_hash) {
+                            signers.push(s);
+                        }
+                    }
+                }
+            }
+        }
+        let mut removed = 0;
+        for s in &signers {
+            let orphans = crate::writing_space::orphaned_writers(s, &user.identity, &self.store, self.mutable.as_ref()).await?;
+            removed += crate::writing_space::remove_orphans(s, &user.identity, &orphans, &self.store, self.mutable.as_ref()).await?;
+        }
+        Ok(removed)
     }
 
     /// Ensure the item at `path` is in its own writing space, so a writable link or

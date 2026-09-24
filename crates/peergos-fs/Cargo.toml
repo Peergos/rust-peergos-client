@@ -15,6 +15,7 @@ peergos-crypto.workspace = true
 peergos-core.workspace = true
 
 async-trait = "0.1"
+log = "0.4"
 tempfile = { version = "3", optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"], optional = true }
 webp = { version = "0.3", optional = true }

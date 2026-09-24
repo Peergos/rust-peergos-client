@@ -534,22 +534,21 @@ impl Shell {
         let remote = self.resolve_remote(remote_arg);
         // Write sharing works on a child of a parent directory: split the path.
         let rel = self.home_relative(&remote)?;
-        let (parent_rel, child_name) = match rel.rsplit_once('/') {
-            Some((p, n)) => (p.to_string(), n.to_string()),
-            None => (String::new(), rel.clone()),
-        };
+        let parent_rel = rel.rsplit_once('/').map(|(p, _)| p.to_string()).unwrap_or_default();
         let parent_remote = if parent_rel.is_empty() {
             format!("/{}", self.username)
         } else {
             format!("/{}/{}", self.username, parent_rel)
         };
-        let parent = self.ctx.get_by_path(&parent_remote).await?.ok_or_else(|| format!("no such path: {parent_remote}"))?;
+        if self.ctx.get_by_path(&parent_remote).await?.is_none() {
+            return Err(format!("no such path: {parent_remote}").into());
+        }
         let user = self.ctx.user().ok_or("not signed in")?;
         let followers = peergos_fs::get_follower_names(user, self.ctx.store(), self.ctx.mutable().as_ref()).await?;
         if !followers.contains(target) {
             return Ok(format!("Not shared: '{target}' is not following you"));
         }
-        peergos_fs::share_write_access(user, &parent_rel, parent.capability(), &child_name, target, self.ctx.store(), self.ctx.mutable().as_ref()).await?;
+        self.ctx.share_write_access(&rel, target).await?;
         Ok(format!("Shared write-access to '{remote}' with {target}"))
     }
 

@@ -27,6 +27,7 @@ pub mod signup;
 pub mod social;
 pub mod thumbnail;
 pub mod transaction;
+pub mod writing_space;
 
 pub use capability::{AbsoluteCapability, EncryptedCapability, Location, SecretLink, SecretLinkTarget};
 pub use login::{change_password, login, EntryPoint, LoggedInUser, MfaResponder};
@@ -63,6 +64,7 @@ pub use profile::Profile;
 pub use incoming::{CapsInDirectory, ChildElement, IncomingCapCache, ProcessedCaps};
 pub use retrieve::{chunk_size_for_new_files, FragmentedPaddedCipherText, DEFAULT_CHUNK_SIZE, LEGACY_CHUNK_SIZE};
 pub use transaction::FileUploadTransaction;
+pub use writing_space::move_to_new_writing_space;
 // move_to, rename_child, delete_child etc. are `pub async fn` at the crate root.
 
 use cryptree::{
@@ -313,7 +315,7 @@ async fn open_writer_champ(
         .await?;
     let wd_cid = pointer
         .updated
-        .ok_or_else(|| Error::Protocol("writer has no data".into()))?;
+        .ok_or_else(|| Error::Protocol(format!("writing space {} has no pointer", cap.writer)))?;
     let wd_cbor = store
         .get(&cap.owner, &wd_cid, None)
         .await?
@@ -372,7 +374,7 @@ pub(crate) async fn open_writer_root(
         .await?;
     let wd_cid = pointer
         .updated
-        .ok_or_else(|| Error::Protocol("writer has no data".into()))?;
+        .ok_or_else(|| Error::Protocol(format!("writing space {} has no pointer", cap.writer)))?;
     let wd_cbor = store
         .get(&cap.owner, &wd_cid, None)
         .await?
@@ -976,7 +978,7 @@ async fn begin_dir_write(
     let wd_cid = pointer
         .updated
         .clone()
-        .ok_or_else(|| Error::Protocol("writer has no data".into()))?;
+        .ok_or_else(|| Error::Protocol(format!("writing space {} has no pointer", dir_cap.writer)))?;
     let wd_cbor = store
         .get(&dir_cap.owner, &wd_cid, None)
         .await?
@@ -1963,20 +1965,33 @@ async fn create_link_node(
 /// Recursively copy every child of `old_cap` into `new_cap` (which lives in a
 /// different writer subspace), re-encrypting under the new keys. Files are read
 /// and re-uploaded; subdirectories are recreated (sharing the new writer).
+///
+/// With `keep_nested` (the signer that owns writing spaces nested in `old_cap`), a
+/// nested writing space is not copied: it is linked into the new directory and
+/// re-parented under `new_signer`, so whoever can write it still can. That is what
+/// re-keying needs; a copy wants the contents duplicated instead.
 fn copy_dir_contents<'a>(
     old_cap: &'a AbsoluteCapability,
     new_cap: &'a AbsoluteCapability,
     new_signer: &'a SigningPrivateKeyAndPublicHash,
+    keep_nested: Option<&'a SigningPrivateKeyAndPublicHash>,
     mirror_bat: Option<&'a BatId>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &'a dyn MutablePointers,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
         for e in list_directory(old_cap, store.clone(), mutable).await? {
+            if let Some(old_owner) = keep_nested {
+                if let Some(target) = nested_writing_space(old_cap, &e, &store, mutable).await? {
+                    relink_writing_space(new_cap, &e.name, &target, old_owner, new_signer, mirror_bat, &store, mutable)
+                        .await?;
+                    continue;
+                }
+            }
             if e.is_dir == Some(true) {
                 let sub_new =
                     create_directory(new_cap, &e.name, Some(new_signer.clone()), mirror_bat, store.clone(), mutable).await?;
-                copy_dir_contents(&e.cap, &sub_new, new_signer, mirror_bat, store.clone(), mutable).await?;
+                copy_dir_contents(&e.cap, &sub_new, new_signer, keep_nested, mirror_bat, store.clone(), mutable).await?;
             } else {
                 let (props, bytes) = read_file(&e.cap, store.clone(), mutable).await?;
                 upload_file(
@@ -1994,6 +2009,58 @@ fn copy_dir_contents<'a>(
         }
         Ok(())
     })
+}
+
+/// The writing space `e` (a child of `dir`) is, if it is not in `dir`'s: either a
+/// child with its own writer, or a link node to one.
+async fn nested_writing_space(
+    dir: &AbsoluteCapability,
+    e: &DirEntry,
+    store: &Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<Option<AbsoluteCapability>> {
+    if e.cap.writer != dir.writer {
+        return Ok(Some(e.cap.clone()));
+    }
+    if e.is_dir != Some(true) {
+        return Ok(None);
+    }
+    let (_n, props) = retrieve_file_metadata(&e.cap, store.clone(), mutable).await?;
+    if !props.is_link {
+        return Ok(None);
+    }
+    Ok(list_directory(&e.cap, store.clone(), mutable).await?.into_iter().next().map(|t| t.cap))
+}
+
+/// Link the existing writing space `target` into `new_dir` as `name`, and make it
+/// a child of `new_dir` owned by `new_owner`, keeping its blocks and keys.
+#[allow(clippy::too_many_arguments)]
+async fn relink_writing_space(
+    new_dir: &AbsoluteCapability,
+    name: &str,
+    target: &AbsoluteCapability,
+    old_owner: &SigningPrivateKeyAndPublicHash,
+    new_owner: &SigningPrivateKeyAndPublicHash,
+    mirror_bat: Option<&BatId>,
+    store: &Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let (_n, props) = retrieve_file_metadata(target, store.clone(), mutable).await?;
+    let mime = if props.is_directory { None } else { Some(props.mime_type.clone()) };
+    create_link_node(new_dir, name, target, props.is_directory, mime, props.created_epoch, Some(new_owner.clone()), mirror_bat, store.clone(), mutable)
+        .await?;
+    let dir_node = retrieve_file_metadata(new_dir, store.clone(), mutable).await?.0;
+    let parent_link = RelCap {
+        writer: Some(new_dir.writer.clone()),
+        map_key: new_dir.map_key.clone(),
+        bat: new_dir.bat.clone(),
+        r_base_key: dir_node.get_parent_key(&new_dir.r_base_key),
+        w_base_key_link: None,
+    };
+    let tid = store.start_transaction(&target.owner).await?;
+    writing_space::reparent_writing_space(target, |_| parent_link, old_owner, new_owner, store, mutable, &tid).await?;
+    store.close_transaction(&target.owner, &tid).await?;
+    Ok(())
 }
 
 /// Remove an orphaned subtree (whose parent link has already been replaced) from
@@ -2018,13 +2085,8 @@ async fn remove_orphaned_subtree(
 }
 
 /// Move the directory `child_name` in `parent_cap` into its **own writer
-/// subspace** (Peergos `rotateAllKeys`), so write access to it can be granted to
-/// another user. If it already has its own writer this is a no-op that returns
-/// its writable capability. Otherwise a new writer is created (owned by the
-/// parent writer), the subtree is copied under fresh keys, the parent's child
-/// link is repointed, and the old subtree is deleted.
-///
-/// Returns the writable capability to the (possibly rotated) directory.
+/// subspace**, so write access to it can be granted to another user. Keeps every
+/// key: see [`move_to_new_writing_space`]. Returns its writable capability.
 pub async fn move_dir_to_own_writer(
     parent_cap: &AbsoluteCapability,
     child_name: &str,
@@ -2033,49 +2095,7 @@ pub async fn move_dir_to_own_writer(
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<AbsoluteCapability> {
-    let old = list_directory(parent_cap, store.clone(), mutable)
-        .await?
-        .into_iter()
-        .find(|e| e.name == child_name)
-        .ok_or_else(|| Error::Protocol(format!("no such child: {child_name}")))?;
-    if !old.cap.is_writable() {
-        return Err(Error::Protocol("cannot grant write access without a writable capability".into()));
-    }
-    if old.is_dir != Some(true) {
-        return Err(Error::Protocol(
-            "write-sharing currently supports directories; wrap a file in a directory first".into(),
-        ));
-    }
-    let (_n, old_props) = retrieve_file_metadata(&old.cap, store.clone(), mutable).await?;
-    // Already write-shared: the child is a link node whose target is in its own
-    // writer subspace. Follow it and share the existing keys (no rotation).
-    if old_props.is_link {
-        let target = list_directory(&old.cap, store.clone(), mutable)
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Protocol("link node has no target".into()))?
-            .cap;
-        return Ok(target);
-    }
-    // Already in its own writer subspace without a link node — share existing keys.
-    if old.cap.writer != parent_cap.writer {
-        return Ok(old.cap);
-    }
-    let created = old_props.created_epoch;
-
-    // Create the replacement directory in a fresh writer subspace, copy the old
-    // contents across, then link it into the parent via a link node (which repoints
-    // the parent's child by name and keeps rename authority in the parent writer),
-    // and finally delete the now-orphaned old subtree.
-    let new_dir =
-        create_writable_shared_dir(parent_cap, child_name, entry_signer.clone(), mirror_bat, store.clone(), mutable).await?;
-    let new_signer = recover_signer(&new_dir, store.clone(), mutable).await?;
-    copy_dir_contents(&old.cap, &new_dir, &new_signer, mirror_bat, store.clone(), mutable).await?;
-    create_link_node(parent_cap, child_name, &new_dir, true, None, created, entry_signer.clone(), mirror_bat, store.clone(), mutable)
-        .await?;
-    remove_orphaned_subtree(parent_cap, &old.cap, entry_signer, mirror_bat, &store, mutable).await?;
-    Ok(new_dir)
+    move_to_new_writing_space(parent_cap, child_name, entry_signer, mirror_bat, store, mutable).await
 }
 
 /// Create a **single-chunk file** in a fresh writer subspace owned by the parent
@@ -2205,10 +2225,8 @@ async fn create_writable_shared_file(
 }
 
 /// Move the file `child_name` in `parent_cap` into its **own writer subspace** so
-/// write access to it can be granted (Java `shareWriteAccessWith`/`rotateAllKeys`
-/// for a file). No-op returning the writable cap if it already has its own writer;
-/// otherwise the file is re-encrypted into a fresh writer, linked into the parent
-/// via a link node, and the old chunk removed. Returns the writable capability.
+/// write access to it can be granted. Keeps every key: see
+/// [`move_to_new_writing_space`]. Returns its writable capability.
 pub async fn move_file_to_own_writer(
     parent_cap: &AbsoluteCapability,
     child_name: &str,
@@ -2217,53 +2235,7 @@ pub async fn move_file_to_own_writer(
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<AbsoluteCapability> {
-    let old = list_directory(parent_cap, store.clone(), mutable)
-        .await?
-        .into_iter()
-        .find(|e| e.name == child_name)
-        .ok_or_else(|| Error::Protocol(format!("no such child: {child_name}")))?;
-    if old.is_dir == Some(true) {
-        return Err(Error::Protocol("move_file_to_own_writer is for files; use move_dir_to_own_writer".into()));
-    }
-    if !old.cap.is_writable() {
-        return Err(Error::Protocol("cannot grant write access without a writable capability".into()));
-    }
-    // Already in its own writer subspace — just hand back its writable cap.
-    if old.cap.writer != parent_cap.writer {
-        return Ok(old.cap);
-    }
-    let (_node, old_props) = retrieve_file_metadata(&old.cap, store.clone(), mutable).await?;
-    // Already write-shared: the child is a link node whose target is in its own
-    // writer subspace. Follow it and share the existing keys (no rotation).
-    if old_props.is_link {
-        let target = list_directory(&old.cap, store.clone(), mutable)
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Protocol("link node has no target".into()))?
-            .cap;
-        return Ok(target);
-    }
-    let (_props, content) = read_file(&old.cap, store.clone(), mutable).await?;
-
-    let new_cap =
-        create_writable_shared_file(parent_cap, child_name, &content, &old_props, entry_signer.clone(), mirror_bat, store.clone(), mutable)
-            .await?;
-    create_link_node(
-        parent_cap,
-        child_name,
-        &new_cap,
-        false,
-        Some(old_props.mime_type.clone()),
-        old_props.created_epoch,
-        entry_signer.clone(),
-        mirror_bat,
-        store.clone(),
-        mutable,
-    )
-    .await?;
-    remove_orphaned_subtree(parent_cap, &old.cap, entry_signer, mirror_bat, &store, mutable).await?;
-    Ok(new_cap)
+    move_to_new_writing_space(parent_cap, child_name, entry_signer, mirror_bat, store, mutable).await
 }
 
 /// Remove `writer_to_remove` from `parent_cap`'s writer's owned-key champ
@@ -2388,7 +2360,7 @@ pub async fn force_rotate_child_to_new_writer(
     let new_target = if is_dir {
         let new_dir = create_writable_shared_dir(parent_cap, child_name, entry_signer.clone(), mirror_bat, store.clone(), mutable).await?;
         let new_signer = recover_signer(&new_dir, store.clone(), mutable).await?;
-        copy_dir_contents(&old_target, &new_dir, &new_signer, mirror_bat, store.clone(), mutable).await?;
+        copy_dir_contents(&old_target, &new_dir, &new_signer, Some(&old_writer), mirror_bat, store.clone(), mutable).await?;
         create_link_node(parent_cap, child_name, &new_dir, true, None, created, entry_signer.clone(), mirror_bat, store.clone(), mutable)
             .await?;
         new_dir
@@ -2442,7 +2414,7 @@ pub async fn rotate_child_read_keys(
         // Re-create the directory under fresh keys (replaces the parent's child
         // link by name), then copy the old subtree across.
         let new_dir = create_directory(parent_cap, child_name, Some(signer.clone()), mirror_bat, store.clone(), mutable).await?;
-        copy_dir_contents(&old.cap, &new_dir, &signer, mirror_bat, store.clone(), mutable).await?;
+        copy_dir_contents(&old.cap, &new_dir, &signer, Some(&signer), mirror_bat, store.clone(), mutable).await?;
         new_dir
     } else {
         // Re-upload the file's content under fresh keys (replaces the link).
@@ -2950,7 +2922,7 @@ async fn copy_into(
         .ok_or_else(|| Error::Protocol("no writer signer for target".into()))?;
     if child.is_dir == Some(true) {
         let new_dir = create_directory(target_dir, target_name, Some(signer.clone()), mirror_bat, store.clone(), mutable).await?;
-        copy_dir_contents(&child.cap, &new_dir, &signer, mirror_bat, store.clone(), mutable).await?;
+        copy_dir_contents(&child.cap, &new_dir, &signer, None, mirror_bat, store.clone(), mutable).await?;
         Ok(new_dir)
     } else {
         let (props, bytes) = read_file(&child.cap, store.clone(), mutable).await?;
