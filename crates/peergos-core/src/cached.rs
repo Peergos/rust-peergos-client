@@ -197,6 +197,30 @@ impl ContentAddressedStorage for CachedStorage {
         self.inner.link_host(owner).await
     }
 
+    async fn put_batch(
+        &self,
+        owner: &PublicKeyHash,
+        signer: &crate::keys::SigningPrivateKeyAndPublicHash,
+        blocks: Vec<Vec<u8>>,
+        tid: &TransactionId,
+    ) -> Result<Vec<Cid>> {
+        self.inner.put_batch(owner, signer, blocks, tid).await
+    }
+
+    async fn put_raw_batch(
+        &self,
+        owner: &PublicKeyHash,
+        signer: &crate::keys::SigningPrivateKeyAndPublicHash,
+        blocks: Vec<Vec<u8>>,
+        tid: &TransactionId,
+    ) -> Result<Vec<Cid>> {
+        self.inner.put_raw_batch(owner, signer, blocks, tid).await
+    }
+
+    async fn bulk_commit(&self, owner: &PublicKeyHash, commit: &crate::bulk::BulkCommit) -> Result<Vec<Cid>> {
+        self.inner.bulk_commit(owner, commit).await
+    }
+
     async fn get_champ_lookup(
         &self,
         owner: &PublicKeyHash,

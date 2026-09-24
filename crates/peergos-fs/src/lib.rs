@@ -2005,6 +2005,8 @@ fn copy_dir_contents<'a>(
     mutable: &'a dyn MutablePointers,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
+        let mut batch: Vec<FileUpload> = Vec::new();
+        let mut batch_bytes = 0usize;
         for e in list_directory(old_cap, store.clone(), mutable).await? {
             // a copy takes a nested writing space's contents, reached through its link node
             let mut source = e.cap.clone();
@@ -2022,6 +2024,17 @@ fn copy_dir_contents<'a>(
                 copy_dir_contents(&source, &sub_new, new_signer, keep_nested, mirror_bat, store.clone(), mutable).await?;
             } else {
                 let (props, bytes) = read_file(&source, store.clone(), mutable).await?;
+                // small files go into the directory in batches, one directory write each,
+                // rather than one write per file
+                if bytes.len() as u64 <= retrieve::chunk_size_for_new_files() {
+                    batch_bytes += bytes.len();
+                    batch.push(FileUpload::from_bytes(e.name.clone(), bytes).with_thumbnail(props.thumbnail.clone()));
+                    if batch_bytes >= COPY_BATCH_BYTES {
+                        commit_small_batch(new_cap, new_signer, mirror_bat, std::mem::take(&mut batch), &store, mutable).await?;
+                        batch_bytes = 0;
+                    }
+                    continue;
+                }
                 upload_file(
                     new_cap,
                     &e.name,
@@ -2035,9 +2048,12 @@ fn copy_dir_contents<'a>(
                 .await?;
             }
         }
-        Ok(())
+        commit_small_batch(new_cap, new_signer, mirror_bat, batch, &store, mutable).await
     })
 }
+
+/// How many bytes of small files a directory copy writes per directory update.
+const COPY_BATCH_BYTES: usize = 10 * 1024 * 1024;
 
 /// The writing space `e` (a child of `dir`) is, if it is not in `dir`'s: either a
 /// child with its own writer, or a link node to one.
@@ -4061,6 +4077,8 @@ pub struct FileUpload {
     pub size: u64,
     open: ReaderFactory,
     hash: Option<hashtree::RootHash>,
+    /// An existing thumbnail to keep, e.g. when copying a file.
+    thumbnail: Option<(String, Vec<u8>)>,
 }
 
 impl FileUpload {
@@ -4076,6 +4094,7 @@ impl FileUpload {
             size,
             open: Arc::new(move || open().map(|r| Box::new(r) as Box<dyn std::io::Read + Send>)),
             hash: None,
+            thumbnail: None,
         }
     }
 
@@ -4089,6 +4108,7 @@ impl FileUpload {
             size,
             open: Arc::new(move || std::fs::File::open(&path).map(|f| Box::new(f) as Box<dyn std::io::Read + Send>)),
             hash: None,
+            thumbnail: None,
         })
     }
 
@@ -4103,7 +4123,13 @@ impl FileUpload {
             size,
             open: Arc::new(move || Ok(Box::new(std::io::Cursor::new((*data).clone())) as Box<dyn std::io::Read + Send>)),
             hash,
+            thumbnail: None,
         }
+    }
+
+    pub(crate) fn with_thumbnail(mut self, thumbnail: Option<(String, Vec<u8>)>) -> FileUpload {
+        self.thumbnail = thumbnail;
+        self
     }
 
     /// Attach a precomputed content hash-tree root (from a prior scan) so this file
@@ -4466,7 +4492,7 @@ async fn commit_small_batch(
             &f.name,
             &mime,
             epoch,
-            &None,
+            &f.thumbnail,
             mirror_bat,
             &data,
             store,

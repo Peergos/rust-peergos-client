@@ -198,6 +198,38 @@ pub trait ContentAddressedStorage: Send + Sync {
     ) -> Result<Vec<Vec<u8>>> {
         champ_lookup_local(self, owner, root, caps, committed_root).await
     }
+
+    /// Write dag-cbor blocks, authorised by one signature for the batch where the
+    /// server supports it (`putBatch`). The default signs each block.
+    async fn put_batch(
+        &self,
+        owner: &PublicKeyHash,
+        signer: &SigningPrivateKeyAndPublicHash,
+        blocks: Vec<Vec<u8>>,
+        tid: &TransactionId,
+    ) -> Result<Vec<Cid>> {
+        let sigs = blocks.iter().map(|b| sign_block(signer, b)).collect::<Result<Vec<_>>>()?;
+        self.put(owner, &signer.public_key_hash, sigs, blocks, tid).await
+    }
+
+    /// Write raw blocks, authorised by one signature for the batch where the server
+    /// supports it (`putRawBatch`). The default signs each block.
+    async fn put_raw_batch(
+        &self,
+        owner: &PublicKeyHash,
+        signer: &SigningPrivateKeyAndPublicHash,
+        blocks: Vec<Vec<u8>>,
+        tid: &TransactionId,
+    ) -> Result<Vec<Cid>> {
+        let sigs = blocks.iter().map(|b| sign_block(signer, b)).collect::<Result<Vec<_>>>()?;
+        self.put_raw(owner, &signer.public_key_hash, sigs, blocks, tid).await
+    }
+
+    /// Apply a whole logical write, every block and pointer update in it, in one
+    /// call (`bulkCommit`). Returns the hashes of the inline blocks, in order.
+    async fn bulk_commit(&self, _owner: &PublicKeyHash, _commit: &crate::bulk::BulkCommit) -> Result<Vec<Cid>> {
+        Err(Error::Protocol("Unimplemented call!".into()))
+    }
 }
 
 /// Walk the champ under `root` locally, collecting the blocks on each cap's path
@@ -357,17 +389,67 @@ impl ContentAddressedStorage for FallbackStorage {
     async fn link_host(&self, owner: &PublicKeyHash) -> Result<String> {
         self.secondary.link_host(owner).await
     }
+    async fn put_batch(&self, owner: &PublicKeyHash, signer: &SigningPrivateKeyAndPublicHash, blocks: Vec<Vec<u8>>, tid: &TransactionId) -> Result<Vec<Cid>> {
+        self.secondary.put_batch(owner, signer, blocks, tid).await
+    }
+    async fn put_raw_batch(&self, owner: &PublicKeyHash, signer: &SigningPrivateKeyAndPublicHash, blocks: Vec<Vec<u8>>, tid: &TransactionId) -> Result<Vec<Cid>> {
+        self.secondary.put_raw_batch(owner, signer, blocks, tid).await
+    }
+    async fn bulk_commit(&self, owner: &PublicKeyHash, commit: &crate::bulk::BulkCommit) -> Result<Vec<Cid>> {
+        self.secondary.bulk_commit(owner, commit).await
+    }
 }
 
 /// HTTP-backed content addressed storage (`ContentAddressedStorage.HTTP`).
 pub struct HttpStorage {
     poster: Arc<dyn HttpPoster>,
     is_peergos_server: bool,
+    /// Cleared the first time the server says it has no `block/put/bulk/v2`.
+    batch_signed_put_supported: std::sync::atomic::AtomicBool,
 }
 
 impl HttpStorage {
     pub fn new(poster: Arc<dyn HttpPoster>, is_peergos_server: bool) -> HttpStorage {
-        HttpStorage { poster, is_peergos_server }
+        HttpStorage { poster, is_peergos_server, batch_signed_put_supported: std::sync::atomic::AtomicBool::new(true) }
+    }
+
+    /// Write blocks with one signature per group rather than per block, falling back
+    /// to a signature per block on a server without the v2 call.
+    async fn batch_signed_put(
+        &self,
+        owner: &PublicKeyHash,
+        signer: &SigningPrivateKeyAndPublicHash,
+        blocks: Vec<Vec<u8>>,
+        is_raw: bool,
+        tid: &TransactionId,
+    ) -> Result<Option<Vec<Cid>>> {
+        use std::sync::atomic::Ordering;
+        if !self.is_peergos_server || !self.batch_signed_put_supported.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let mut res = Vec::with_capacity(blocks.len());
+        for group in group_by_size(blocks, MAX_BLOCK_SIZE) {
+            let hashes = group.iter().map(|b| build_cid(sha256(b), is_raw)).collect::<Result<Vec<_>>>()?;
+            let signature = signer.secret.sign_message(&crate::bulk::block_write_payload(owner, &hashes))?;
+            let body = crate::bulk::BlockWriteBatch { blocks: group, signature }.serialize();
+            let url = format!(
+                "{API_PREFIX}block/put/bulk/v2?format={}&owner={}&transaction={}&writer={}",
+                if is_raw { "raw" } else { "dag-cbor" },
+                url_encode(&owner.to_string()),
+                url_encode(&tid.to_string()),
+                url_encode(&signer.public_key_hash.to_string()),
+            );
+            let timeout = crate::poster::write_timeout_ms(30_000, body.len());
+            match self.poster.post(&url, body, false, timeout).await {
+                Ok(raw) => res.extend(parse_link_list(&raw)?),
+                Err(e) if res.is_empty() && crate::bulk::is_unimplemented(&e) => {
+                    self.batch_signed_put_supported.store(false, Ordering::Relaxed);
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(Some(res))
     }
 
     async fn bulk_put(
@@ -483,6 +565,47 @@ impl HttpStorage {
 
 #[async_trait]
 impl ContentAddressedStorage for HttpStorage {
+    async fn put_batch(
+        &self,
+        owner: &PublicKeyHash,
+        signer: &SigningPrivateKeyAndPublicHash,
+        blocks: Vec<Vec<u8>>,
+        tid: &TransactionId,
+    ) -> Result<Vec<Cid>> {
+        if let Some(cids) = self.batch_signed_put(owner, signer, blocks.clone(), false, tid).await? {
+            return Ok(cids);
+        }
+        let sigs = blocks.iter().map(|b| sign_block(signer, b)).collect::<Result<Vec<_>>>()?;
+        self.put(owner, &signer.public_key_hash, sigs, blocks, tid).await
+    }
+
+    async fn put_raw_batch(
+        &self,
+        owner: &PublicKeyHash,
+        signer: &SigningPrivateKeyAndPublicHash,
+        blocks: Vec<Vec<u8>>,
+        tid: &TransactionId,
+    ) -> Result<Vec<Cid>> {
+        if let Some(cids) = self.batch_signed_put(owner, signer, blocks.clone(), true, tid).await? {
+            return Ok(cids);
+        }
+        let sigs = blocks.iter().map(|b| sign_block(signer, b)).collect::<Result<Vec<_>>>()?;
+        self.put_raw(owner, &signer.public_key_hash, sigs, blocks, tid).await
+    }
+
+    async fn bulk_commit(&self, owner: &PublicKeyHash, commit: &crate::bulk::BulkCommit) -> Result<Vec<Cid>> {
+        if !self.is_peergos_server {
+            return Err(Error::Protocol("Cannot bulk commit when not talking to a Peergos server!".into()));
+        }
+        let body = commit.serialize();
+        if body.len() > crate::bulk::MAX_BULK_COMMIT_SIZE {
+            return Err(Error::Protocol(format!("Bulk commit too big: {}", body.len())));
+        }
+        let url = format!("{API_PREFIX}bulk/commit?owner={}", url_encode(&owner.to_string()));
+        let timeout = crate::poster::write_timeout_ms(60_000, body.len());
+        parse_link_list(&self.poster.post(&url, body, false, timeout).await?)
+    }
+
     async fn id(&self) -> Result<Cid> {
         let raw = self.poster.get(&format!("{API_PREFIX}id")).await?;
         let json: serde_json::Value = serde_json::from_slice(&raw)
@@ -654,10 +777,7 @@ pub async fn put_block_signed(
     block: Vec<u8>,
     tid: &TransactionId,
 ) -> Result<Cid> {
-    let sig = sign_block(writer, &block)?;
-    let cids = store
-        .put(owner, &writer.public_key_hash, vec![sig], vec![block], tid)
-        .await?;
+    let cids = store.put_batch(owner, writer, vec![block], tid).await?;
     cids.into_iter()
         .next()
         .ok_or_else(|| Error::Protocol("put returned no cid".into()))
@@ -674,8 +794,7 @@ pub async fn put_raw_blocks_signed(
     if blocks.is_empty() {
         return Ok(Vec::new());
     }
-    let sigs = blocks.iter().map(|b| sign_block(writer, b)).collect::<Result<Vec<_>>>()?;
-    store.put_raw(owner, &writer.public_key_hash, sigs, blocks, tid).await
+    store.put_raw_batch(owner, writer, blocks, tid).await
 }
 
 /// `ContentAddressedStorage.getSigningKey`: resolve a writer's public signing
@@ -697,6 +816,32 @@ pub async fn get_signing_key(
 
 /// Parse the newline/concatenated JSON objects returned by `block/put/bulk`,
 /// extracting the CID from each (`Hash`, or `Key` / `Key./`).
+/// Split blocks into consecutive groups of at most `max` bytes (a block larger
+/// than `max` gets a group of its own).
+pub(crate) fn group_by_size(blocks: Vec<Vec<u8>>, max: usize) -> Vec<Vec<Vec<u8>>> {
+    let mut groups: Vec<Vec<Vec<u8>>> = Vec::new();
+    let mut used = 0;
+    for b in blocks {
+        if groups.is_empty() || used + b.len() > max {
+            groups.push(Vec::new());
+            used = 0;
+        }
+        used += b.len();
+        groups.last_mut().unwrap().push(b);
+    }
+    groups
+}
+
+/// A cbor list of merkle links, as the v2 write calls answer.
+pub(crate) fn parse_link_list(raw: &[u8]) -> Result<Vec<Cid>> {
+    CborObject::from_bytes(raw)?
+        .as_list()
+        .ok_or_else(|| Error::Protocol("expected a list of block hashes".into()))?
+        .iter()
+        .map(|c| Cid::cast(c.as_link().ok_or_else(|| Error::Protocol("expected a block hash".into()))?).map_err(Error::from))
+        .collect()
+}
+
 fn parse_hash_stream(raw: &[u8]) -> Result<Vec<Cid>> {
     let mut out = Vec::new();
     let stream = serde_json::Deserializer::from_slice(raw).into_iter::<serde_json::Value>();

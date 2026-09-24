@@ -38,6 +38,7 @@ const RAW_BLOCK_MAGIC_PREFIX: [u8; 8] = [0x71, 0x1d, 0x10, 0xcf, 0x3d, 0x32, 0x2
 const BLOCKSTORE_PROPERTIES: &str = "blockstore/props";
 const AUTH_READS: &str = "blockstore/auth-reads";
 const AUTH_WRITES: &str = "blockstore/auth";
+const AUTH_WRITES_V2: &str = "blockstore/auth/v2";
 
 /// The S3 key for a block: uppercase RFC-4648 base32 of the CID bytes, no padding
 /// (`DirectS3BlockStore.hashToKey`, IPFS-compatible).
@@ -206,6 +207,8 @@ pub struct DirectS3Storage {
     /// Poster for the raw (absolute) presigned S3 URLs.
     direct: Arc<dyn HttpPoster>,
     fallback: Arc<dyn ContentAddressedStorage>,
+    /// Cleared the first time the server says it has no `blockstore/auth/v2`.
+    auth_v2_supported: std::sync::atomic::AtomicBool,
 }
 
 impl DirectS3Storage {
@@ -218,7 +221,7 @@ impl DirectS3Storage {
         fallback: Arc<dyn ContentAddressedStorage>,
     ) -> DirectS3Storage {
         let props = Self::fetch_properties(server.as_ref()).await.unwrap_or_default();
-        DirectS3Storage { props, server, direct, fallback }
+        DirectS3Storage { props, server, direct, fallback, auth_v2_supported: std::sync::atomic::AtomicBool::new(true) }
     }
 
     /// Construct with already-known properties (e.g. from a cached login).
@@ -228,7 +231,7 @@ impl DirectS3Storage {
         direct: Arc<dyn HttpPoster>,
         fallback: Arc<dyn ContentAddressedStorage>,
     ) -> DirectS3Storage {
-        DirectS3Storage { props, server, direct, fallback }
+        DirectS3Storage { props, server, direct, fallback, auth_v2_supported: std::sync::atomic::AtomicBool::new(true) }
     }
 
     pub fn properties(&self) -> &BlockStoreProperties {
@@ -268,6 +271,36 @@ impl DirectS3Storage {
         );
         let timeout = crate::poster::write_timeout_ms(60_000, body.len());
         parse_presigned_list(&self.server.post_unzip(&url, body, timeout).await?)
+    }
+
+    /// POST `blockstore/auth/v2` → presigned PUT URLs for a batch authorised by one
+    /// signature over the owner and the block hashes (`authWrites` v2).
+    async fn auth_writes_v2(
+        &self,
+        owner: &PublicKeyHash,
+        writer: &PublicKeyHash,
+        auth: &crate::bulk::BlockWriteAuth,
+        is_raw: bool,
+        tid: &TransactionId,
+    ) -> Result<Vec<PresignedUrl>> {
+        let url = format!(
+            "{API_PREFIX}{AUTH_WRITES_V2}?owner={}&writer={}&transaction={}&raw={is_raw}",
+            url_encode(&owner.to_string()),
+            url_encode(&writer.to_string()),
+            url_encode(&tid.to_string()),
+        );
+        parse_presigned_list(&self.server.post_unzip(&url, auth.serialize(), 60_000).await?)
+    }
+
+    async fn upload(&self, blocks: Vec<Vec<u8>>, urls: Vec<PresignedUrl>) -> Result<Vec<Cid>> {
+        let mut cids = Vec::with_capacity(blocks.len());
+        for (block, url) in blocks.into_iter().zip(urls.into_iter()) {
+            let key = url.base.rsplit('/').next().unwrap_or("").to_string();
+            let cid = key_to_hash(&key)?;
+            self.direct.put(&url.base, block, url.header_pairs()).await?;
+            cids.push(cid);
+        }
+        Ok(cids)
     }
 }
 
@@ -388,14 +421,55 @@ impl ContentAddressedStorage for DirectS3Storage {
             _ => return self.fallback.put_raw(owner, writer, signed_hashes, blocks, tid).await,
         };
 
-        let mut cids = Vec::with_capacity(blocks.len());
-        for (block, url) in blocks.into_iter().zip(urls.into_iter()) {
-            let key = url.base.rsplit('/').next().unwrap_or("").to_string();
-            let cid = key_to_hash(&key)?;
-            self.direct.put(&url.base, block, url.header_pairs()).await?;
-            cids.push(cid);
+        self.upload(blocks, urls).await
+    }
+
+    async fn put_batch(
+        &self,
+        owner: &PublicKeyHash,
+        signer: &crate::keys::SigningPrivateKeyAndPublicHash,
+        blocks: Vec<Vec<u8>>,
+        tid: &TransactionId,
+    ) -> Result<Vec<Cid>> {
+        self.fallback.put_batch(owner, signer, blocks, tid).await
+    }
+
+    async fn put_raw_batch(
+        &self,
+        owner: &PublicKeyHash,
+        signer: &crate::keys::SigningPrivateKeyAndPublicHash,
+        blocks: Vec<Vec<u8>>,
+        tid: &TransactionId,
+    ) -> Result<Vec<Cid>> {
+        use std::sync::atomic::Ordering;
+        let all_small = blocks.iter().all(|b| b.len() < MAX_SMALL_BLOCK_SIZE);
+        if all_small || !self.props.direct_writes {
+            return self.fallback.put_raw_batch(owner, signer, blocks, tid).await;
         }
-        Ok(cids)
+        if self.auth_v2_supported.load(Ordering::Relaxed) {
+            let hashes = blocks
+                .iter()
+                .map(|b| crate::storage::hash_to_cid(b, true))
+                .collect::<Result<Vec<_>>>()?;
+            let auth = crate::bulk::BlockWriteAuth {
+                signature: signer.secret.sign_message(&crate::bulk::block_write_payload(owner, &hashes))?,
+                hashes,
+                sizes: blocks.iter().map(|b| b.len() as i64).collect(),
+                bat_ids: blocks.iter().map(|b| raw_block_bats(b)).collect(),
+            };
+            match self.auth_writes_v2(owner, &signer.public_key_hash, &auth, true, tid).await {
+                Ok(urls) if urls.len() == blocks.len() => return self.upload(blocks, urls).await,
+                Err(e) if crate::bulk::is_unimplemented(&e) => self.auth_v2_supported.store(false, Ordering::Relaxed),
+                _ => {}
+            }
+        }
+        // keep writing direct to S3, with a signature per block
+        let sigs = blocks.iter().map(|b| crate::storage::sign_block(signer, b)).collect::<Result<Vec<_>>>()?;
+        self.put_raw(owner, &signer.public_key_hash, sigs, blocks, tid).await
+    }
+
+    async fn bulk_commit(&self, owner: &PublicKeyHash, commit: &crate::bulk::BulkCommit) -> Result<Vec<Cid>> {
+        self.fallback.bulk_commit(owner, commit).await
     }
 }
 

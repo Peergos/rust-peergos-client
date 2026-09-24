@@ -15,13 +15,14 @@
 //! so a caller buffers a batch of operations and calls `commit()` once.
 
 use crate::auth::BatWithId;
+use crate::bulk;
 use crate::champ_merge;
 use crate::error::{Error, Result};
 use crate::keys::{PublicKeyHash, SigningPrivateKeyAndPublicHash};
 use crate::mutable::{MutablePointers, PointerUpdate, SignedPointerUpdate};
 use crate::storage::{build_cid, ContentAddressedStorage, TransactionId};
 use async_trait::async_trait;
-use peergos_cbor::CborObject;
+use peergos_cbor::{CborObject, Cborable};
 use peergos_multiformats::{Cid, Multihash};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -84,11 +85,18 @@ pub struct BufferedStorage {
     target: Arc<dyn ContentAddressedStorage>,
     buffer: Mutex<HashMap<Cid, BufferedBlock>>,
     cache: Mutex<BlockCache>,
+    /// Owners whose server has answered that it has no `bulk/commit`.
+    bulk_unsupported: Mutex<HashSet<PublicKeyHash>>,
 }
 
 impl BufferedStorage {
     pub fn new(target: Arc<dyn ContentAddressedStorage>, read_cache_size: usize) -> BufferedStorage {
-        BufferedStorage { target, buffer: Mutex::new(HashMap::new()), cache: Mutex::new(BlockCache::new(read_cache_size)) }
+        BufferedStorage {
+            target,
+            buffer: Mutex::new(HashMap::new()),
+            cache: Mutex::new(BlockCache::new(read_cache_size)),
+            bulk_unsupported: Mutex::new(HashSet::new()),
+        }
     }
 
     pub fn target(&self) -> Arc<dyn ContentAddressedStorage> {
@@ -110,6 +118,31 @@ impl BufferedStorage {
 
     pub fn clear(&self) {
         self.buffer.lock().unwrap().clear();
+    }
+
+    /// Assign each of `owner`'s buffered blocks to the first of these roots that
+    /// reaches it (`partitionByRoot`): a commit is only accepted if every block in it
+    /// hangs off the root it signs, so the graph decides, not which writer wrote it.
+    fn partition_by_root(&self, owner: &PublicKeyHash, roots: &[Option<Cid>]) -> Vec<Vec<(Cid, BufferedBlock)>> {
+        let mut claimed: HashSet<Cid> = HashSet::new();
+        let mut parts = Vec::with_capacity(roots.len());
+        for root in roots {
+            let reachable = match root {
+                Some(r) => self.reachable(std::slice::from_ref(r)),
+                None => HashSet::new(),
+            };
+            let buf = self.buffer.lock().unwrap();
+            let mut part = Vec::new();
+            for cid in reachable {
+                if let Some(b) = buf.get(&cid) {
+                    if &b.owner == owner && claimed.insert(cid.clone()) {
+                        part.push((cid, b.clone()));
+                    }
+                }
+            }
+            parts.push(part);
+        }
+        parts
     }
 
     fn buffer_put(&self, owner: &PublicKeyHash, writer: &PublicKeyHash, signed: Vec<Vec<u8>>, blocks: Vec<Vec<u8>>, is_raw: bool) -> Result<Vec<Cid>> {
@@ -423,6 +456,14 @@ impl BufferedPointers {
         res
     }
 
+    fn writes_for(&self, owner: &PublicKeyHash) -> Vec<WriterUpdate> {
+        self.updates.lock().unwrap().iter().filter(|w| &w.owner == owner).cloned().collect()
+    }
+
+    fn drop_owner(&self, owner: &PublicKeyHash) {
+        self.updates.lock().unwrap().retain(|w| &w.owner != owner);
+    }
+
     /// Commit `owner`'s buffered pointer updates in order, resolving any CAS conflict
     /// per writer via a 3-way champ merge. Sequential commit preserves the write
     /// order (needed so a parent pointer commits before a dependent child's).
@@ -544,6 +585,21 @@ async fn flush(blocks: &BufferedStorage, pointers: &BufferedPointers, default_ow
         owners.push(default_owner.clone());
     }
     for owner in owners {
+        if !blocks.bulk_unsupported.lock().unwrap().contains(&owner) {
+            match bulk_commit_owner(blocks, pointers, &owner).await {
+                Ok(()) => {
+                    pointers.drop_owner(&owner);
+                    continue;
+                }
+                // a server that predates the call: use the old endpoints for this owner from now on
+                Err(e) if bulk::is_unimplemented(&e) => {
+                    blocks.bulk_unsupported.lock().unwrap().insert(owner.clone());
+                }
+                // nothing was applied; the old path resolves the conflict with a merge
+                Err(e) if bulk::is_pointer_cas_failure(&e) => {}
+                Err(e) => return Err(e),
+            }
+        }
         let roots = pointers.roots_for(&owner);
         let tid = blocks.target().start_transaction(&owner).await?;
         blocks.commit_blocks(&owner, &roots, &tid).await?;
@@ -553,6 +609,260 @@ async fn flush(blocks: &BufferedStorage, pointers: &BufferedPointers, default_ow
     blocks.clear();
     pointers.clear();
     Ok(())
+}
+
+/// Everything a commit carries beyond one server call: blocks-only calls are
+/// signed as block lists bound to the sequence each writer's pointer is heading for.
+struct Signers<'a> {
+    writes: &'a [WriterUpdate],
+}
+
+impl Signers<'_> {
+    fn signer(&self, writer: &PublicKeyHash) -> &SigningPrivateKeyAndPublicHash {
+        &self.writes.iter().find(|w| &w.writer == writer).expect("a signer for every writer in the commit").signer
+    }
+
+    /// The sequence of this writer's first update in the commit, which is what the
+    /// server checks a block list against before any of the commit's pointers land.
+    fn next_sequence(&self, writer: &PublicKeyHash) -> Option<i64> {
+        self.writes.iter().find(|w| &w.writer == writer).and_then(|w| w.update.sequence)
+    }
+}
+
+/// Send `owner`'s buffered writes as one `bulk/commit` (`ServerBulkCommitter`):
+/// blocks too large to travel inline are written first under a transaction, and a
+/// commit too big for one call is split.
+async fn bulk_commit_owner(blocks: &BufferedStorage, pointers: &BufferedPointers, owner: &PublicKeyHash) -> Result<()> {
+    let writes = pointers.writes_for(owner);
+    if writes.is_empty() {
+        return Ok(());
+    }
+    let roots: Vec<Option<Cid>> = writes.iter().map(|w| w.update.updated.clone()).collect();
+    let parts = blocks.partition_by_root(owner, &roots);
+    let target = blocks.target();
+    let needs_tid = parts.iter().flatten().any(|(_, b)| b.is_raw && b.data.len() >= MAX_SMALL_BLOCK_SIZE);
+    let tid = if needs_tid { Some(target.start_transaction(owner).await?) } else { None };
+
+    let result = async {
+        let mut writers = Vec::with_capacity(writes.len());
+        for (w, part) in writes.iter().zip(parts) {
+            let (mut cbor, mut raw, mut large) = (Vec::new(), Vec::new(), Vec::new());
+            for (_, b) in part {
+                if !b.is_raw {
+                    cbor.push(b.data);
+                } else if b.data.len() < MAX_SMALL_BLOCK_SIZE {
+                    raw.push(b.data);
+                } else {
+                    large.push(b.data);
+                }
+            }
+            let pre_written = match &tid {
+                Some(t) => pre_write(&target, owner, &w.signer, large, t).await?,
+                None => Vec::new(),
+            };
+            let signed = w.signer.secret.sign_message(&w.update.serialize())?;
+            writers.push(bulk::WriterCommit {
+                writer: w.writer.clone(),
+                cbor_blocks: cbor,
+                raw_blocks: raw,
+                pre_written,
+                pointer: Some(SignedPointerUpdate::new(w.writer.clone(), signed)),
+                block_list_signature: None,
+            });
+        }
+        let commit = bulk::BulkCommit { tid: tid.clone(), writers };
+        send_bulk_commit(target.as_ref(), owner, commit, &Signers { writes: &writes }, &roots).await
+    }
+    .await;
+    if result.is_err() {
+        if let Some(t) = &tid {
+            let _ = target.close_transaction(owner, t).await;
+        }
+    }
+    result
+}
+
+/// Write blocks too large to travel inline, in batches with bounded concurrency.
+async fn pre_write(
+    target: &Arc<dyn ContentAddressedStorage>,
+    owner: &PublicKeyHash,
+    signer: &SigningPrivateKeyAndPublicHash,
+    large: Vec<Vec<u8>>,
+    tid: &TransactionId,
+) -> Result<Vec<Cid>> {
+    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_BATCH_UPLOADS));
+    let mut handles = Vec::new();
+    for batch in large.chunks(MAX_BLOCK_AUTHS) {
+        let (target, owner, signer, tid, sem, batch) =
+            (target.clone(), owner.clone(), signer.clone(), tid.clone(), sem.clone(), batch.to_vec());
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire_owned().await.unwrap();
+            target.put_raw_batch(&owner, &signer, batch, &tid).await
+        }));
+    }
+    let mut cids = Vec::new();
+    for h in handles {
+        cids.extend(h.await.map_err(|e| Error::Protocol(format!("block write task panicked: {e}")))??);
+    }
+    Ok(cids)
+}
+
+/// The inline bytes a commit may carry, leaving room for its framing.
+const MAX_BULK_INLINE: usize = bulk::MAX_BULK_COMMIT_SIZE - 64 * 1024;
+
+async fn send_bulk_commit(
+    target: &dyn ContentAddressedStorage,
+    owner: &PublicKeyHash,
+    commit: bulk::BulkCommit,
+    signers: &Signers<'_>,
+    roots: &[Option<Cid>],
+) -> Result<()> {
+    if commit.inline_size() <= MAX_BULK_INLINE
+        && commit.block_count() + commit.pre_written_count() <= bulk::MAX_BULK_COMMIT_BLOCKS
+    {
+        target.bulk_commit(owner, &commit).await?;
+        return Ok(());
+    }
+    // A commit too big for one call goes as several, of which only the last carries
+    // the pointer updates; the earlier ones are held by a transaction until it lands.
+    let started = commit.tid.is_none();
+    let tid = match &commit.tid {
+        Some(t) => t.clone(),
+        None => target.start_transaction(owner).await?,
+    };
+    let (blocks_only, last) = split(commit, signers, roots, &tid)?;
+    for call in &blocks_only {
+        target.bulk_commit(owner, call).await?;
+    }
+    target.bulk_commit(owner, &last).await?;
+    if started {
+        target.close_transaction(owner, &tid).await?;
+    }
+    Ok(())
+}
+
+/// One inline block of a writer's commit, with its hash.
+struct InlineBlock {
+    cid: Cid,
+    data: Vec<u8>,
+    is_raw: bool,
+}
+
+/// Breadth first from the root, so a block never comes before the block linking to
+/// it: any prefix of this order is then reachable from the root on its own.
+fn from_root_first(blocks: Vec<InlineBlock>, root: &Option<Cid>) -> Vec<InlineBlock> {
+    let mut by_hash: HashMap<Cid, InlineBlock> = blocks.into_iter().map(|b| (b.cid.clone(), b)).collect();
+    let mut ordered = Vec::with_capacity(by_hash.len());
+    let mut queue: VecDeque<Cid> = root.iter().cloned().collect();
+    while let Some(next) = queue.pop_front() {
+        let block = match by_hash.remove(&next) {
+            Some(b) => b,
+            None => continue,
+        };
+        if !block.is_raw {
+            if let Ok(cbor) = CborObject::from_bytes(&block.data) {
+                for link in cbor.links() {
+                    if let Ok(c) = Cid::cast(&link) {
+                        queue.push_back(c);
+                    }
+                }
+            }
+        }
+        ordered.push(block);
+    }
+    // anything the root doesn't reach can only be deferred; the server rejects it either way
+    ordered.extend(by_hash.into_values());
+    ordered
+}
+
+/// Split an oversized commit: the final call takes the top of each writer's tree
+/// plus the pointer updates, and the rest go ahead in blocks-only calls.
+fn split(
+    commit: bulk::BulkCommit,
+    signers: &Signers<'_>,
+    roots: &[Option<Cid>],
+    tid: &TransactionId,
+) -> Result<(Vec<bulk::BulkCommit>, bulk::BulkCommit)> {
+    let mut budget = MAX_BULK_INLINE;
+    // the pre-written hashes ride along on the final call, and count against it too
+    let mut count_budget = bulk::MAX_BULK_COMMIT_BLOCKS.saturating_sub(commit.pre_written_count());
+    let mut last_writers = Vec::new();
+    let mut deferred: Vec<(PublicKeyHash, Vec<InlineBlock>)> = Vec::new();
+    for (i, w) in commit.writers.into_iter().enumerate() {
+        let mut inline = Vec::with_capacity(w.block_count());
+        for (data, is_raw) in w.cbor_blocks.into_iter().map(|b| (b, false)).chain(w.raw_blocks.into_iter().map(|b| (b, true))) {
+            inline.push(InlineBlock { cid: build_cid(peergos_crypto::hash::sha256(&data), is_raw)?, data, is_raw });
+        }
+        let mut ordered = from_root_first(inline, &roots[i]).into_iter();
+        let (mut cbor, mut raw) = (Vec::new(), Vec::new());
+        let mut rest = Vec::new();
+        for b in ordered.by_ref() {
+            if b.data.len() <= budget && count_budget > 0 {
+                budget -= b.data.len();
+                count_budget -= 1;
+                if b.is_raw { raw.push(b.data) } else { cbor.push(b.data) }
+            } else {
+                rest.push(b);
+                break;
+            }
+        }
+        rest.extend(ordered);
+        last_writers.push(bulk::WriterCommit {
+            writer: w.writer.clone(),
+            cbor_blocks: cbor,
+            raw_blocks: raw,
+            pre_written: w.pre_written,
+            pointer: w.pointer,
+            block_list_signature: None,
+        });
+        if !rest.is_empty() {
+            deferred.push((w.writer, rest));
+        }
+    }
+
+    let mut calls: Vec<Vec<bulk::WriterCommit>> = Vec::new();
+    let (mut used, mut count) = (0usize, 0usize);
+    for (writer, blocks) in deferred {
+        let signer = signers.signer(&writer);
+        let seq = signers.next_sequence(&writer);
+        let mut groups: Vec<Vec<InlineBlock>> = Vec::new();
+        let mut group_size = 0;
+        for b in blocks {
+            if groups.is_empty() || group_size + b.data.len() > MAX_BULK_INLINE || groups.last().unwrap().len() >= bulk::MAX_BULK_COMMIT_BLOCKS {
+                groups.push(Vec::new());
+                group_size = 0;
+            }
+            group_size += b.data.len();
+            groups.last_mut().unwrap().push(b);
+        }
+        for group in groups {
+            let size: usize = group.iter().map(|b| b.data.len()).sum();
+            if calls.is_empty() || (used > 0 && (used + size > MAX_BULK_INLINE || count + group.len() > bulk::MAX_BULK_COMMIT_BLOCKS)) {
+                calls.push(Vec::new());
+                used = 0;
+                count = 0;
+            }
+            used += size;
+            count += group.len();
+            let (cbor, raw): (Vec<InlineBlock>, Vec<InlineBlock>) = group.into_iter().partition(|b| !b.is_raw);
+            let in_order: Vec<Cid> = cbor.iter().chain(raw.iter()).map(|b| b.cid.clone()).collect();
+            let sig = signer.secret.sign_message(&bulk::WriterCommit::block_list_payload(&in_order, seq))?;
+            calls.last_mut().unwrap().push(bulk::WriterCommit {
+                writer: writer.clone(),
+                cbor_blocks: cbor.into_iter().map(|b| b.data).collect(),
+                raw_blocks: raw.into_iter().map(|b| b.data).collect(),
+                pre_written: Vec::new(),
+                pointer: None,
+                block_list_signature: Some(sig),
+            });
+        }
+    }
+    let blocks_only = calls
+        .into_iter()
+        .filter(|c| !c.is_empty())
+        .map(|writers| bulk::BulkCommit { tid: Some(tid.clone()), writers })
+        .collect();
+    Ok((blocks_only, bulk::BulkCommit { tid: commit.tid, writers: last_writers }))
 }
 
 // ---------------------------------------------------------------------------

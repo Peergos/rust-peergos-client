@@ -8,6 +8,7 @@
 
 pub mod auth;
 pub mod boxing;
+pub mod bulk;
 pub mod buffered;
 pub mod cached;
 pub mod champ;

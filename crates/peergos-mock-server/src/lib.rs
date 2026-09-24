@@ -19,7 +19,11 @@ use peergos_core::storage::{
 };
 use peergos_core::{build_cid, hash_to_cid, identity_key_hasher, Champ, ChampWrapper, Payload, RamStorage};
 use peergos_multiformats::Cid;
-use std::collections::HashMap;
+use peergos_core::bulk::{
+    block_write_payload, BlockWriteBatch, BulkCommit, WriterCommit, MAX_BULK_COMMIT_BLOCKS, MAX_BULK_COMMIT_SIZE,
+};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// The in-memory state behind a mock server. Cheap to clone (`Arc`-shared), so a
@@ -37,6 +41,14 @@ pub struct MockServer {
     follow_requests: Arc<Mutex<HashMap<Vec<u8>, Vec<Vec<u8>>>>>,
     /// A stable fake node identity.
     server_id: Cid,
+    /// Whether `bulk/commit` and `block/put/bulk/v2` exist, so a client's fallback
+    /// for an older server can be tested.
+    bulk_endpoints: Arc<AtomicBool>,
+    /// The path of every request, in order.
+    requests: Arc<Mutex<Vec<String>>>,
+    /// How many `bulk/commit` calls carried no pointer update: the early parts of a
+    /// commit split because it was too big for one call.
+    blocks_only_commits: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// A registered user: their identity key hash, login data (encrypted entry
@@ -64,7 +76,30 @@ impl MockServer {
             // A deterministic non-identity CID; its Display round-trips through the
             // client's `Cid::decode_peer_id`.
             server_id: build_cid(vec![7u8; 32], false).expect("server id"),
+            bulk_endpoints: Arc::new(AtomicBool::new(true)),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            blocks_only_commits: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Answer `bulk/commit` and `block/put/bulk/v2` with a 404, as a server that
+    /// predates them does.
+    pub fn disable_bulk_endpoints(&self) {
+        self.bulk_endpoints.store(false, Ordering::SeqCst);
+    }
+
+    /// How many requests have been made to `path` (e.g. `api/v0/bulk/commit`).
+    pub fn request_count(&self, path: &str) -> usize {
+        self.requests.lock().unwrap().iter().filter(|p| p.as_str() == path).count()
+    }
+
+    /// How many blocks-only `bulk/commit` calls have been accepted.
+    pub fn blocks_only_commits(&self) -> usize {
+        self.blocks_only_commits.load(Ordering::SeqCst)
+    }
+
+    fn bulk_enabled(&self) -> bool {
+        self.bulk_endpoints.load(Ordering::SeqCst)
     }
 
     /// A [`HttpPoster`] backed by this server, to hand to the client in place of a
@@ -92,6 +127,7 @@ impl MockServer {
     async fn handle(&self, url: &str, body: Vec<u8>) -> Result<Vec<u8>> {
         let (path, query) = split_url(url);
         let path = path.strip_prefix('/').unwrap_or(path);
+        self.requests.lock().unwrap().push(path.to_string());
 
         // Storage endpoints (api/v0/…).
         if let Some(rest) = path.strip_prefix(API_PREFIX) {
@@ -575,7 +611,172 @@ impl MockServer {
                 Ok(CborObject::List(blocks.into_iter().map(CborObject::ByteString).collect()).to_bytes())
             }
 
+            "bulk/commit" if self.bulk_enabled() => self.bulk_commit(&q.pkh("owner")?, &body).await,
+
+            "block/put/bulk/v2" if self.bulk_enabled() => {
+                let owner = q.pkh("owner")?;
+                let writer = q.pkh("writer")?;
+                let is_raw = q.get("format") == Some("raw");
+                let batch = BlockWriteBatch::from_cbor(&CborObject::from_bytes(&body)?)?;
+                let hashes = batch.blocks.iter().map(|b| hash_to_cid(b, is_raw)).collect::<Result<Vec<_>>>()?;
+                if signed_payload(&batch.signature)? != block_write_payload(&owner, &hashes).as_slice() {
+                    return Err(Error::Http("status 500: Invalid signature for block write batch!".into()));
+                }
+                let tid = TransactionId("1".into());
+                let cids = if is_raw {
+                    self.blocks.put_raw(&owner, &writer, vec![], batch.blocks, &tid).await?
+                } else {
+                    self.blocks.put(&owner, &writer, vec![], batch.blocks, &tid).await?
+                };
+                Ok(link_list(&cids))
+            }
+
             other => Err(Error::Http(format!("status 404: mock storage has no route for {other}"))),
+        }
+    }
+
+    /// `bulk/commit`, with the checks the server makes (`BulkCommitStorage`): every
+    /// inline block hangs off a root the call signs, nothing it links to is
+    /// missing, a blocks-only part is signed as a list and held by a transaction,
+    /// and the pointer updates apply all or nothing.
+    async fn bulk_commit(&self, owner: &PublicKeyHash, body: &[u8]) -> Result<Vec<u8>> {
+        let reject = |msg: String| Err(Error::Http(format!("status 500: {msg}")));
+        if body.len() > MAX_BULK_COMMIT_SIZE {
+            return reject(format!("Bulk commit too big: {}", body.len()));
+        }
+        let commit = BulkCommit::from_cbor(&CborObject::from_bytes(body)?)?;
+        if commit.block_count() + commit.pre_written_count() > MAX_BULK_COMMIT_BLOCKS {
+            return reject("Too many blocks in one commit".into());
+        }
+        let mut hashes = Vec::with_capacity(commit.writers.len());
+        let mut updates = Vec::with_capacity(commit.writers.len());
+        for w in &commit.writers {
+            let cids = w
+                .cbor_blocks
+                .iter()
+                .map(|b| hash_to_cid(b, false))
+                .chain(w.raw_blocks.iter().map(|b| hash_to_cid(b, true)))
+                .collect::<Result<Vec<_>>>()?;
+            match &w.pointer {
+                Some(p) => updates.push(Some(parse_pointer_update(&p.signed)?)),
+                None => {
+                    let sig = match &w.block_list_signature {
+                        Some(s) => s,
+                        None => return reject("A bulk commit with no pointer update is unauthenticated!".into()),
+                    };
+                    if commit.tid.is_none() {
+                        return reject("Blocks committed before the pointer that names them need a transaction!".into());
+                    }
+                    let current = self.current_pointer(owner, &w.writer)?;
+                    let expected = WriterCommit::block_list_payload(&cids, PointerUpdate::increment(current.sequence));
+                    if signed_payload(sig)? != expected.as_slice() {
+                        return reject(format!("Invalid block list signature for {}", w.writer));
+                    }
+                    updates.push(None);
+                }
+            }
+            hashes.push(cids);
+        }
+
+        // Every block in the call must be reachable from a root the call signs, and
+        // every link out of what it makes reachable must resolve.
+        let mut cbor_in_call: HashMap<Cid, Vec<u8>> = HashMap::new();
+        let mut must_reach: HashSet<Cid> = HashSet::new();
+        let mut declared: HashSet<Cid> = HashSet::new();
+        let mut external: Vec<Cid> = Vec::new();
+        for (i, w) in commit.writers.iter().enumerate() {
+            for (j, b) in w.cbor_blocks.iter().enumerate() {
+                cbor_in_call.insert(hashes[i][j].clone(), b.clone());
+            }
+            if w.pointer.is_some() {
+                must_reach.extend(hashes[i].iter().cloned());
+            }
+            declared.extend(hashes[i].iter().cloned());
+            declared.extend(w.pre_written.iter().cloned());
+            external.extend(w.pre_written.iter().cloned());
+        }
+        let mut reachable: HashSet<Cid> = HashSet::new();
+        for root in updates.iter().flatten().filter_map(|u| u.updated.clone()) {
+            if cbor_in_call.contains_key(&root) {
+                let mut stack = vec![root];
+                while let Some(c) = stack.pop() {
+                    if !reachable.insert(c.clone()) {
+                        continue;
+                    }
+                    if let Some(block) = cbor_in_call.get(&c) {
+                        for link in CborObject::from_bytes(block)?.links() {
+                            let l = Cid::cast(&link)?;
+                            if !l.multihash.is_identity() {
+                                stack.push(l);
+                            }
+                        }
+                    }
+                }
+            } else {
+                external.push(root);
+            }
+        }
+        if let Some(orphan) = must_reach.iter().find(|c| !reachable.contains(*c)) {
+            return reject(format!("Block in a bulk commit is not reachable from the new root: {orphan}"));
+        }
+        for (c, block) in &cbor_in_call {
+            if !must_reach.contains(c) {
+                continue;
+            }
+            for link in CborObject::from_bytes(block)?.links() {
+                let l = Cid::cast(&link)?;
+                if !l.multihash.is_identity() && !declared.contains(&l) {
+                    external.push(l);
+                }
+            }
+        }
+        for c in &external {
+            if self.blocks.get_raw(owner, c, None).await?.is_none() {
+                return reject(format!("Bulk commit references a block we don't have: {c}"));
+            }
+        }
+
+        let tid = TransactionId("1".into());
+        let mut written = Vec::new();
+        for w in &commit.writers {
+            written.extend(self.blocks.put(owner, &w.writer, vec![], w.cbor_blocks.clone(), &tid).await?);
+            written.extend(self.blocks.put_raw(owner, &w.writer, vec![], w.raw_blocks.clone(), &tid).await?);
+        }
+
+        if !commit.has_pointer_update() {
+            self.blocks_only_commits.fetch_add(1, Ordering::SeqCst);
+        }
+        let before = self.pointers.lock().unwrap().clone();
+        for w in &commit.writers {
+            let p = match &w.pointer {
+                Some(p) => p,
+                None => continue,
+            };
+            // a writer this call creates is authorised by an earlier writer's update naming it
+            if !self.is_authorized(owner, &w.writer).await? {
+                *self.pointers.lock().unwrap() = before;
+                return reject(format!("Key not allowed to write to this server: {}", w.writer));
+            }
+            let current = self.current_pointer(owner, &w.writer)?;
+            if !self.apply_cas(owner, &w.writer, p.signed.clone())? {
+                *self.pointers.lock().unwrap() = before;
+                let claimed = parse_pointer_update(&p.signed)?.original;
+                let show = |c: &Option<Cid>| c.as_ref().map(|c| c.to_string()).unwrap_or_default();
+                return reject(format!(
+                    "PointerCAS:{},{},{}",
+                    show(&current.updated),
+                    current.sequence.map(|s| s.to_string()).unwrap_or_default(),
+                    show(&claimed)
+                ));
+            }
+        }
+        Ok(link_list(&written))
+    }
+
+    fn current_pointer(&self, owner: &PublicKeyHash, writer: &PublicKeyHash) -> Result<PointerUpdate> {
+        match self.pointers.lock().unwrap().get(&(pkh_key(owner), pkh_key(writer))) {
+            Some(p) => parse_pointer_update(p),
+            None => Ok(PointerUpdate::empty()),
         }
     }
 
@@ -691,6 +892,19 @@ fn parse_pointer_update(signed: &[u8]) -> Result<PointerUpdate> {
         return Err(Error::Protocol("signed pointer payload too short".into()));
     }
     PointerUpdate::from_cbor(&CborObject::from_bytes(&signed[64..])?)
+}
+
+/// The message inside a `sign_message` output (64-byte signature || message). The
+/// mock checks what was signed, not the signature itself.
+fn signed_payload(signed: &[u8]) -> Result<&[u8]> {
+    if signed.len() < 64 {
+        return Err(Error::Protocol("signature too short".into()));
+    }
+    Ok(&signed[64..])
+}
+
+fn link_list(cids: &[Cid]) -> Vec<u8> {
+    CborObject::List(cids.iter().map(|c| CborObject::MerkleLink(c.to_bytes())).collect()).to_bytes()
 }
 
 fn url_decode(s: &str) -> String {

@@ -4233,3 +4233,122 @@ async fn write_shared_item_is_parented_by_its_link_node() {
     let copied = alice.get_by_path("copies/d/f.txt").await.unwrap().unwrap();
     assert_eq!(copied.read().await.unwrap(), b"shared file");
 }
+
+fn subtree_files() -> (Vec<peergos_fs::FileUpload>, Vec<(String, Vec<u8>)>) {
+    // enough small files that one commit's inline blocks overflow a single call, and a
+    // file big enough that its fragments are written ahead of the commit
+    let mut expected = Vec::new();
+    for i in 0..30 {
+        expected.push((format!("s{i}.bin"), vec![(i % 251) as u8; 90 * 1024]));
+    }
+    expected.push(("big.bin".to_string(), (0..6 * 1024 * 1024).map(|i| (i % 249) as u8).collect()));
+    let files = expected.iter().map(|(n, d)| peergos_fs::FileUpload::from_bytes(n.clone(), d.clone())).collect();
+    (files, expected)
+}
+
+/// A buffered upload is sent as bulk commits, split when a commit is too big for
+/// one call, with large blocks written ahead of it; single writes go through the
+/// batch signed put. Nothing uses the old one-signature-per-block put.
+#[tokio::test]
+async fn buffered_writes_use_bulk_commit() {
+    use peergos_fs::FolderUpload;
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = UserContext::sign_up("bulk", "bpw", None, poster, store, mutable).await.unwrap();
+    let dir = ctx.get_home().await.unwrap().mkdir("up").await.unwrap();
+    let (files, expected) = subtree_files();
+    dir.upload_subtree(vec![FolderUpload { rel_path: vec![], files }]).await.unwrap();
+
+    for (name, data) in &expected {
+        let f = ctx.get_by_path(&format!("up/{name}")).await.unwrap().unwrap_or_else(|| panic!("{name} missing"));
+        assert_eq!(&f.read().await.unwrap(), data, "{name}");
+    }
+    assert!(server.blocks_only_commits() > 0, "an oversized commit is split");
+    assert!(server.request_count("api/v0/block/put/bulk/v2") > 0);
+    assert_eq!(server.request_count("api/v0/block/put/bulk"), 0, "no per-block signatures");
+}
+
+/// Against a server without the new calls, the first attempt falls back to the old
+/// endpoints and later commits don't try again.
+#[tokio::test]
+async fn buffered_writes_fall_back_without_bulk_commit() {
+    use peergos_fs::FolderUpload;
+    let server = MockServer::new();
+    server.disable_bulk_endpoints();
+    let (poster, store, mutable) = server.connect();
+    let ctx = UserContext::sign_up("old", "opw", None, poster, store, mutable).await.unwrap();
+    let dir = ctx.get_home().await.unwrap().mkdir("up").await.unwrap();
+    let (files, expected) = subtree_files();
+    dir.upload_subtree(vec![FolderUpload { rel_path: vec![], files }]).await.unwrap();
+
+    for (name, data) in &expected {
+        let f = ctx.get_by_path(&format!("up/{name}")).await.unwrap().unwrap_or_else(|| panic!("{name} missing"));
+        assert_eq!(&f.read().await.unwrap(), data, "{name}");
+    }
+    assert!(server.request_count("api/v0/bulk/commit") <= 1, "unsupported is remembered");
+    assert!(server.request_count("api/v0/block/put/bulk") > 0);
+}
+
+/// A buffered write built on a writing space another write has since changed: the
+/// bulk commit is rejected by the compare-and-swap, and the fallback merges both.
+#[tokio::test]
+async fn stale_buffered_write_is_merged() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = UserContext::sign_up("cc", "cpw", None, poster, store.clone(), mutable.clone()).await.unwrap();
+    let dir = ctx.get_home().await.unwrap().mkdir("shared").await.unwrap();
+    let other = ctx.get_home().await.unwrap().mkdir("other").await.unwrap();
+    let signer = peergos_fs::recover_signer(ctx.user().unwrap().home().unwrap(), store.clone(), mutable.as_ref()).await.unwrap();
+    let owner = dir.capability().owner.clone();
+
+    let net = peergos_core::BufferedNetwork::with_defaults(store.clone(), mutable.clone());
+    let buffered_store: Store = net.storage();
+    peergos_fs::upload_file(dir.capability(), "buffered.txt", b"from the buffer", None, Some(signer.clone()), None, buffered_store, net.pointers().as_ref())
+        .await
+        .unwrap();
+    // meanwhile another write to the same writing space lands directly
+    peergos_fs::upload_file(other.capability(), "direct.txt", b"direct", None, Some(signer), None, store.clone(), mutable.as_ref())
+        .await
+        .unwrap();
+    let merges_before = server.request_count("peergos/v0/mutable/setPointer");
+    net.commit(&owner).await.unwrap();
+    assert!(server.request_count("peergos/v0/mutable/setPointer") > merges_before, "the fallback merged");
+
+    assert_eq!(ctx.get_by_path("other/direct.txt").await.unwrap().unwrap().read().await.unwrap(), b"direct");
+    assert_eq!(ctx.get_by_path("shared/buffered.txt").await.unwrap().unwrap().read().await.unwrap(), b"from the buffer");
+}
+
+/// Copying a folder writes its small files in batches, a directory update per
+/// batch rather than per file, keeping contents and thumbnails.
+#[tokio::test]
+async fn copy_folder_batches_small_files() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = UserContext::sign_up("cp", "cpw", None, poster, store.clone(), mutable.clone()).await.unwrap();
+    let home = ctx.get_home().await.unwrap();
+    let src = home.mkdir("src").await.unwrap();
+    let signer = peergos_fs::recover_signer(ctx.user().unwrap().home().unwrap(), store.clone(), mutable.as_ref()).await.unwrap();
+    for i in 0..25 {
+        peergos_fs::upload_file(src.capability(), &format!("f{i}.txt"), format!("file {i}").as_bytes(), None, Some(signer.clone()), None, store.clone(), mutable.as_ref())
+            .await
+            .unwrap();
+    }
+    let thumb = ("image/webp".to_string(), vec![1, 2, 3, 4]);
+    peergos_fs::upload_file(src.capability(), "t.txt", b"with a thumbnail", Some(thumb.clone()), Some(signer), None, store.clone(), mutable.as_ref())
+        .await
+        .unwrap();
+
+    let home = home.get_latest().await.unwrap();
+    let dest = home.mkdir("dest").await.unwrap();
+    let before = server.request_count("peergos/v0/mutable/setPointer");
+    home.get_latest().await.unwrap().copy_child("src", &dest).await.unwrap();
+    let writes = server.request_count("peergos/v0/mutable/setPointer") - before;
+    assert!(writes < 10, "{writes} pointer updates to copy 26 files");
+
+    for i in 0..25 {
+        let f = ctx.get_by_path(&format!("dest/src/f{i}.txt")).await.unwrap().unwrap();
+        assert_eq!(f.read().await.unwrap(), format!("file {i}").as_bytes());
+    }
+    let t = ctx.get_by_path("dest/src/t.txt").await.unwrap().unwrap();
+    assert_eq!(t.properties().thumbnail.as_ref(), Some(&thumb));
+}
