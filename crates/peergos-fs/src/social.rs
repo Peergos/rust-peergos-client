@@ -396,6 +396,25 @@ pub async fn get_pending_outgoing(
     }
 }
 
+/// The root of this user's shared-with records, `.capabilitycache/outbound/<user>`,
+/// under which each directory's record sits at its home-relative path. The
+/// username component is there because Java keys the records by absolute path.
+async fn outbound_root(
+    user: &LoggedInUser,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<Option<AbsoluteCapability>> {
+    let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
+    let mut cur = home.clone();
+    for name in [CAP_CACHE_DIR, OUTBOUND_DIR, user.username.as_str()] {
+        cur = match list_directory(&cur, store.clone(), mutable).await?.into_iter().find(|e| e.name == name) {
+            Some(e) => e.cap,
+            None => return Ok(None),
+        };
+    }
+    Ok(Some(cur))
+}
+
 /// Every file shared with `username`, as `(home-relative dir path, child name,
 /// access)`, by walking the outbound shared-with cache. Used by `removeFollower` to
 /// revoke each one.
@@ -405,13 +424,8 @@ pub async fn collect_shares_for_user(
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<Vec<(String, String, Access)>> {
-    let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
-    let cap_cache = match list_directory(home, store.clone(), mutable).await?.into_iter().find(|e| e.name == CAP_CACHE_DIR) {
-        Some(e) => e.cap,
-        None => return Ok(Vec::new()),
-    };
-    let outbound = match list_directory(&cap_cache, store.clone(), mutable).await?.into_iter().find(|e| e.name == OUTBOUND_DIR) {
-        Some(e) => e.cap,
+    let outbound = match outbound_root(user, store.clone(), mutable).await? {
+        Some(cap) => cap,
         None => return Ok(Vec::new()),
     };
     let mut out = Vec::new();
@@ -1352,7 +1366,7 @@ fn join_path(dir: &str, name: &str) -> String {
     }
 }
 
-/// Navigate (creating if needed) `.capabilitycache/outbound/<dir_path>/` — the
+/// Navigate (creating if needed) `.capabilitycache/outbound/<user>/<dir_path>/` — the
 /// per-directory cache tree mirroring the filesystem (`SharedWithCache`
 /// `CACHE_BASE`). Returns its cap + the home writer's signer.
 async fn cache_dir_for(
@@ -1370,6 +1384,7 @@ async fn cache_dir_for(
         .ok_or_else(|| Error::Protocol("no capability cache directory".into()))?
         .cap;
     let mut cur = get_or_mkdir(&cap_cache, OUTBOUND_DIR, &signer, user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
+    cur = get_or_mkdir(&cur, &user.username, &signer, user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
     for comp in dir_path {
         cur = get_or_mkdir(&cur, comp, &signer, user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
     }
@@ -1413,7 +1428,7 @@ pub async fn get_directory_sharing_state(
         Some(e) => e.cap,
         None => return Ok(SharedWithState::default()),
     };
-    let mut components = vec![OUTBOUND_DIR.to_string()];
+    let mut components = vec![OUTBOUND_DIR.to_string(), user.username.clone()];
     components.extend(dir_path.trim_matches('/').split('/').filter(|s| !s.is_empty()).map(|s| s.to_string()));
     for comp in &components {
         cur = match list_directory(&cur, store.clone(), mutable).await?.into_iter().find(|e| &e.name == comp) {
@@ -1504,13 +1519,8 @@ pub async fn get_all_shares(
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<Vec<(String, SharedWithState)>> {
-    let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
-    let cap_cache = match list_directory(home, store.clone(), mutable).await?.into_iter().find(|e| e.name == CAP_CACHE_DIR) {
-        Some(e) => e.cap,
-        None => return Ok(Vec::new()),
-    };
-    let outbound = match list_directory(&cap_cache, store.clone(), mutable).await?.into_iter().find(|e| e.name == OUTBOUND_DIR) {
-        Some(e) => e.cap,
+    let outbound = match outbound_root(user, store.clone(), mutable).await? {
+        Some(cap) => cap,
         None => return Ok(Vec::new()),
     };
     let mut res = Vec::new();

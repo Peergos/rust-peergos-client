@@ -179,12 +179,23 @@ impl FileWrapper {
     /// anchor, so uploads stay atomic — Java's `fromSecretLink` context).
     pub(crate) async fn from_link_cap(
         cap: AbsoluteCapability,
-        signer: Option<SigningPrivateKeyAndPublicHash>,
         store: Arc<dyn ContentAddressedStorage>,
         mutable: Arc<dyn MutablePointers>,
     ) -> Result<FileWrapper> {
         let cache = CryptreeCache::new();
-        let props = crate::retrieve_file_metadata_cached(&cap, store.clone(), mutable.as_ref(), &cache).await?.1;
+        let mut props = crate::retrieve_file_metadata_cached(&cap, store.clone(), mutable.as_ref(), &cache).await?.1;
+        let mut cap = cap;
+        // A writable link member is the link node (Java `getLinkPointer`); the signer is on its target.
+        if props.is_link {
+            cap = crate::list_directory_cached(&cap, store.clone(), mutable.as_ref(), &cache)
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::Protocol("link node has no target".into()))?
+                .cap;
+            props = crate::retrieve_file_metadata_cached(&cap, store.clone(), mutable.as_ref(), &cache).await?.1;
+        }
+        let signer = crate::recover_signer(&cap, store.clone(), mutable.as_ref()).await.ok();
         let name = props.name.clone();
         Ok(FileWrapper { name, cap, props, signer, path: String::new(), home_cap: None, mirror_bat: None, store, mutable, cache })
     }

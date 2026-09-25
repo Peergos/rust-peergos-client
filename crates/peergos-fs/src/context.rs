@@ -419,10 +419,8 @@ impl UserContext {
             }
         } else {
             for cap in &self.link_caps {
-                let signer =
-                    crate::recover_signer(cap, self.store.clone(), self.mutable.as_ref()).await.ok();
                 out.push(
-                    FileWrapper::from_link_cap(cap.clone(), signer, self.store.clone(), self.mutable.clone())
+                    FileWrapper::from_link_cap(cap.clone(), self.store.clone(), self.mutable.clone())
                         .await?
                         .with_cache(self.cache.clone()),
                 );
@@ -568,8 +566,7 @@ impl UserContext {
             Some(b) => b,
             None => return Ok(None),
         };
-        let signer = crate::recover_signer(cap, self.store.clone(), self.mutable.as_ref()).await.ok();
-        let root = FileWrapper::from_link_cap(cap.clone(), signer, self.store.clone(), self.mutable.clone())
+        let root = FileWrapper::from_link_cap(cap.clone(), self.store.clone(), self.mutable.clone())
             .await?
             .with_cache(self.cache.clone());
         root.get_by_path(&comps[matched..].join("/")).await
