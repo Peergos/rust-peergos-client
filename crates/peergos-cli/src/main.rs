@@ -30,6 +30,10 @@ use std::process::Command as ProcCommand;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod archives;
+
+use archives::Target;
+
 type BoxErr = Box<dyn std::error::Error>;
 
 struct Shell {
@@ -263,6 +267,9 @@ impl Shell {
             "pwd" => Ok(format!("Remote working directory: {}", self.pwd)),
             "lpwd" => Ok(format!("Local working directory: {}", self.lpwd.display())),
             "mkdir" => self.mkdir(args).await,
+            "cat" => self.cat(args).await,
+            "mv" => self.mv(args).await,
+            "make_public" => self.make_public(args).await,
             "rm" => self.rm(args).await,
             "get" => self.get(args).await,
             "put" => self.put(args).await,
@@ -280,27 +287,6 @@ impl Shell {
     }
 
     // ---- remote/local listing + navigation ---------------------------------
-
-    async fn ls(&self, args: &[String]) -> Result<String, BoxErr> {
-        let path = self.resolve_remote(args.first().map(|s| s.as_str()).unwrap_or(""));
-        if let Some(node) = self.ctx.get_by_path(&path).await? {
-            if !node.is_directory() {
-                return Ok(path);
-            }
-            let mut names: Vec<String> = node.children().await?.iter().map(|c| c.name().to_string()).collect();
-            names.sort();
-            return Ok(names.join("\n"));
-        }
-        // In a secret-link session a path can be a virtual directory: an ancestor of
-        // the mounted links that has no capability of its own. List its next segments.
-        if self.link_mode {
-            let kids = self.virtual_children(&path);
-            if !kids.is_empty() {
-                return Ok(kids.into_iter().map(|k| format!("{k}/")).collect::<Vec<_>>().join("\n"));
-            }
-        }
-        Err(format!("no such path: {path}").into())
-    }
 
     /// The immediate child segments of `path` implied by the mounted link paths —
     /// i.e. the contents of a virtual intermediate directory in a `--links` session.
@@ -331,27 +317,6 @@ impl Shell {
         Ok(names.join("\n"))
     }
 
-    async fn cd(&mut self, args: &[String]) -> Result<String, BoxErr> {
-        let path = match args.first() {
-            None if self.link_mode => "/".to_string(),
-            None => format!("/{}", self.username),
-            Some(a) => self.resolve_remote(a),
-        };
-        if let Some(node) = self.ctx.get_by_path(&path).await? {
-            if !node.is_directory() {
-                return Err(format!("not a directory: {path}").into());
-            }
-            self.pwd = path.clone();
-            return Ok(format!("Current directory: {path}"));
-        }
-        // A virtual directory (root or an intermediate ancestor of the mounted links).
-        if self.link_mode && (path == "/" || !self.virtual_children(&path).is_empty()) {
-            self.pwd = normalize_remote(&path);
-            return Ok(format!("Current directory: {}", self.pwd));
-        }
-        Err(format!("no such path: {path}").into())
-    }
-
     fn lcd(&mut self, args: &[String]) -> Result<String, BoxErr> {
         let dir = self.resolve_local(args.first().map(|s| s.as_str()).unwrap_or("."));
         if !dir.is_dir() {
@@ -366,6 +331,9 @@ impl Shell {
     async fn mkdir(&self, args: &[String]) -> Result<String, BoxErr> {
         let arg = args.first().ok_or("usage: mkdir <dir>")?;
         let path = self.resolve_remote(arg);
+        if let Some(Target::InArchive { .. }) = self.resolve_target(&path).await? {
+            return Ok("Directories in an archive are implied by the paths of the files in it, so there is nothing to create.".into());
+        }
         let rel = self.home_relative(&path)?;
         self.ctx.get_home().await?.get_or_mkdirs(&rel).await?;
         Ok(format!("Created {path}"))
@@ -374,7 +342,10 @@ impl Shell {
     async fn rm(&self, args: &[String]) -> Result<String, BoxErr> {
         let arg = args.first().ok_or("usage: rm <remote-path>")?;
         let path = self.resolve_remote(arg);
-        let node = self.ctx.get_by_path(&path).await?.ok_or_else(|| format!("no such path: {path}"))?;
+        let node = match self.resolve_target(&path).await?.ok_or_else(|| format!("no such path: {path}"))? {
+            Target::InArchive { archive, entry } => return self.rm_in_archive(&archive, &entry, &path).await,
+            Target::Node(node) => node,
+        };
         if node.is_directory() {
             let ans = prompt(&format!("Delete directory and all contents of {path}? (y/N) "))?;
             if ans.trim().to_lowercase() != "y" {
@@ -394,7 +365,10 @@ impl Shell {
         let skip_existing = flags.contains(&"--skip-existing".to_string());
         let remote_arg = pos.first().ok_or("usage: get <remote-path> [local-path]")?;
         let remote = self.resolve_remote(remote_arg);
-        let node = self.ctx.get_by_path(&remote).await?.ok_or_else(|| format!("no such path: {remote}"))?;
+        let node = match self.resolve_target(&remote).await?.ok_or_else(|| format!("no such path: {remote}"))? {
+            Target::InArchive { archive, entry } => return self.get_from_archive(&archive, &entry, pos.get(1), skip_existing).await,
+            Target::Node(node) => node,
+        };
         let base_name = remote.rsplit('/').next().unwrap_or("download").to_string();
         let local_target = match pos.get(1) {
             Some(l) => self.resolve_local(l),
@@ -439,6 +413,11 @@ impl Shell {
             Some(r) => self.resolve_remote(r),
             None => self.pwd.clone(),
         };
+        match self.resolve_target(&dest_dir).await? {
+            Some(Target::InArchive { archive, entry }) => return self.put_in_archive(&archive, &entry, &local, skip_existing).await,
+            Some(Target::Node(node)) if archives::is_archive(&node) => return self.put_in_archive(&node, "", &local, skip_existing).await,
+            _ => {}
+        }
         let n = self.upload(&local, &dest_dir, &base_name, skip_existing).await?;
         Ok(format!("Uploaded {n} file(s) to {dest_dir}/{base_name}"))
     }
@@ -723,9 +702,9 @@ fn split_remote(path: &str) -> (String, String) {
     }
 }
 
-/// Partition `args` into (flags starting with `--`, positional args).
+/// Partition `args` into (flags, which start with `-`, and positional args).
 fn split_flags(args: &[String]) -> (Vec<String>, Vec<String>) {
-    args.iter().cloned().partition(|a| a.starts_with("--"))
+    args.iter().cloned().partition(|a| a.starts_with('-') && a.len() > 1)
 }
 
 fn arg_value(name: &str) -> Option<String> {
@@ -879,15 +858,18 @@ fn parse_duration_secs(s: &str) -> Result<i64, BoxErr> {
 fn help_text() -> String {
     [
         "Commands:",
-        "  ls [path]                              list a remote directory",
+        "  ls [-l] [path]                         list a remote directory, or a zip archive",
         "  lls [path]                             list a local directory",
-        "  cd [path]                              change remote directory (no arg = home)",
+        "  cd [path]                              change remote directory, which may be in a zip (no arg = home)",
         "  lcd <path>                             change local directory",
         "  pwd | lpwd                             print remote/local working directory",
         "  mkdir <dir>                            create a remote directory",
-        "  get [--skip-existing] <remote> [local] download a file or folder",
-        "  put [--skip-existing] <local> [remote] upload a file or folder",
-        "  rm <remote>                            remove a remote file/folder",
+        "  cat <remote>                           print a remote file, or an entry in a zip",
+        "  get [--skip-existing] <remote> [local] download a file or folder, or extract from a zip",
+        "  put [--skip-existing] <local> [remote] upload a file or folder, into a zip if remote is one",
+        "  rm <remote>                            remove a remote file/folder, or an entry in a zip",
+        "  mv <remote> <new-name-or-path>         rename or move, including within a zip",
+        "  make_public <remote>                   make a file or folder readable by anyone",
         "  space                                  show used remote space",
         "  follow <user>                          send a follow request",
         "  get_follow_requests                    list pending follow requests",

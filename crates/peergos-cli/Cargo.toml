@@ -13,5 +13,6 @@ path = "src/main.rs"
 peergos-fs = { workspace = true }
 peergos-core = { workspace = true }
 peergos-cbor = { workspace = true }
+chrono.workspace = true
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 rustyline = "14"

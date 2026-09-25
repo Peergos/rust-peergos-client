@@ -5,6 +5,7 @@
 //! cryptree node decryption and file-content retrieval are the next increments.
 
 pub mod admin;
+pub mod archive;
 pub mod account;
 pub mod cache;
 pub mod capability;
@@ -606,25 +607,6 @@ fn advance_map_key(
         bt = nbt;
     }
     Ok((mk, bt))
-}
-
-/// The map-keys of a file's first `n_chunks` chunks (chunk 0 is `cap.map_key`,
-/// the rest follow the stream secret). Used to invalidate every chunk of a file in
-/// the cryptree cache after a whole-file rewrite, since only chunk 0 lives at the
-/// capability's map-key.
-pub(crate) fn file_chunk_map_keys(cap: &AbsoluteCapability, stream_secret: &[u8], n_chunks: u64) -> Result<Vec<Vec<u8>>> {
-    let mut keys = Vec::with_capacity(n_chunks as usize);
-    let mut mk = cap.map_key.clone();
-    let mut bat = cap.bat.clone();
-    for i in 0..n_chunks.max(1) {
-        if i > 0 {
-            let (nmk, nbat) = retrieve::calculate_next_map_key(stream_secret, &mk, &bat)?;
-            mk = nmk;
-            bat = nbat;
-        }
-        keys.push(mk.clone());
-    }
-    Ok(keys)
 }
 
 /// Read only the byte range `[offset, offset+length)` of a file, fetching just the
@@ -1302,7 +1284,9 @@ where
     R: std::io::Read,
     F: Fn() -> std::io::Result<R>,
 {
-    retrieve::chunk_size_from_log2(retrieve::chunk_size_log2(chunk_size))?;
+    if chunk_size != retrieve::LEGACY_CHUNK_SIZE && chunk_size != retrieve::DEFAULT_CHUNK_SIZE {
+        return Err(Error::Protocol(format!("Unsupported chunk size: {chunk_size}")));
+    }
     upload_file_streaming_inner(dir_cap, name, size, false, chunk_size, None, entry_signer, mirror_bat, open, store, mutable).await
 }
 
@@ -2721,15 +2705,56 @@ pub async fn overwrite_file(
 }
 
 /// Overwrite the bytes `[offset, offset+data.len())` of a file **in place**, fetching
-/// and re-encrypting only the chunk(s) that overlap the range — not the whole file.
-/// The write must stay within the current file size (it does not grow the file); the
-/// capability, keys, size and per-chunk links are all preserved, only the affected
-/// chunks' data blocks change. Mirrors Java's `overwriteSection` for a partial range
-/// (which, like this, leaves the content hash-tree untouched — `updateTreeHash` is
-/// false unless the whole file is rewritten).
-/// Returns the map-keys of the chunks that were rewritten (so a caller can update a
-/// cryptree-node cache — those specific nodes changed, everything else is unchanged).
+/// and re-encrypting only the chunk(s) that overlap the range. See
+/// [`write_file_section`], which this is, for a range that may also grow the file.
+/// Returns the map-keys of the chunks that were rewritten.
 pub async fn overwrite_file_section(
+    cap: &AbsoluteCapability,
+    offset: u64,
+    data: &[u8],
+    signer: &SigningPrivateKeyAndPublicHash,
+    mirror_bat: Option<&BatId>,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<Vec<Vec<u8>>> {
+    write_file_section(cap, offset, data, signer, mirror_bat, store, mutable).await
+}
+
+/// A file's first chunk, its properties and the writer root it was read under.
+async fn open_file_for_write(
+    cap: &AbsoluteCapability,
+    store: &Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<(Cid, CryptreeCache, CryptreeNode, FileProperties)> {
+    let root = open_writer_root(cap, store, mutable).await?;
+    let cache = CryptreeCache::new();
+    let first = fetch_chunk_node_verified(cap, &root, &cap.map_key, &cap.bat, store, &cache)
+        .await?
+        .ok_or_else(|| Error::Protocol("map key not found in tree".into()))?;
+    if first.is_directory() {
+        return Err(Error::Protocol("cannot write to a directory".into()));
+    }
+    let props = first.get_properties(&cap.r_base_key)?;
+    Ok((root, cache, first, props))
+}
+
+/// What a write that changes a file's size does to its first chunk's properties,
+/// which is where readers take the size from. The hash tree no longer describes the
+/// content, so it goes, as for any partial write.
+fn resized_props(props: &FileProperties, new_size: u64) -> FileProperties {
+    let mut p = props.clone();
+    p.size = new_size;
+    p.tree_hash = None;
+    p.modified_epoch = now_epoch();
+    p
+}
+
+/// Write `data` at `offset` in a file, in place (`overwriteSection`): only the chunks
+/// the range overlaps are re-encrypted, and a range past the end grows the file
+/// with new chunks, so appending to a large file doesn't rewrite it. `offset` may
+/// be at most the current size. Keys, capability and chunk locations are kept.
+/// Returns the map-keys of the chunks written.
+pub async fn write_file_section(
     cap: &AbsoluteCapability,
     offset: u64,
     data: &[u8],
@@ -2741,95 +2766,164 @@ pub async fn overwrite_file_section(
     if data.is_empty() {
         return Ok(Vec::new());
     }
-    let root = open_writer_root(cap, &store, mutable).await?;
-    let cache = CryptreeCache::new();
-    let first = fetch_chunk_node_verified(cap, &root, &cap.map_key, &cap.bat, &store, &cache)
-        .await?
-        .ok_or_else(|| Error::Protocol("map key not found in tree".into()))?;
-    if first.is_directory() {
-        return Err(Error::Protocol("cannot overwrite a directory".into()));
+    let (root, cache, first, props) = open_file_for_write(cap, &store, mutable).await?;
+    if offset > props.size {
+        return Err(Error::Protocol(format!("cannot write at {offset}, past the end of a {} byte file", props.size)));
     }
-    let props = first.get_properties(&cap.r_base_key)?;
     let end = offset + data.len() as u64;
-    if end > props.size {
-        return Err(Error::Protocol(
-            "overwrite_file_section cannot grow the file; the range must lie within the current size".into(),
-        ));
-    }
+    let new_size = props.size.max(end);
     let chunk_size = props.chunk_size;
+    let existing = chunk_count(props.size, chunk_size);
     let start_chunk = offset / chunk_size;
     let end_chunk = (end - 1) / chunk_size;
+    let stream_secret = props
+        .stream_secret
+        .clone()
+        .ok_or_else(|| Error::Protocol("file without a stream secret".into()))?;
+    let data_key = first.get_data_key(&cap.r_base_key)?;
+    let first_props = if new_size != props.size { Some(resized_props(&props, new_size)) } else { None };
 
-    let (mut map_key, mut bat, mut node) = if start_chunk == 0 {
-        (cap.map_key.clone(), cap.bat.clone(), first)
-    } else {
-        let ss = props
-            .stream_secret
-            .as_ref()
-            .ok_or_else(|| Error::Protocol("multi-chunk file without a stream secret".into()))?;
-        let (mk, bt) = advance_map_key(ss, &cap.map_key, &cap.bat, start_chunk)?;
-        let node = fetch_chunk_node_verified(cap, &root, &mk, &bt, &store, &cache)
-            .await?
-            .ok_or_else(|| Error::Protocol("chunk not found".into()))?;
-        (mk, bt, node)
-    };
-
-    // Splice the new bytes into each overlapping chunk, re-encrypting with that
-    // chunk's own (unchanged) data key and keeping its base/parent blocks.
+    let (mut map_key, mut bat) = advance_map_key(&stream_secret, &cap.map_key, &cap.bat, start_chunk)?;
     let mut updates: Vec<(Vec<u8>, CryptreeNode, Vec<Vec<u8>>)> = Vec::new();
-    let mut chunk_index = start_chunk;
-    loop {
-        let data_key = node.get_data_key(&cap.r_base_key)?;
-        let mut chunk_data = FragmentedPaddedCipherText::from_cbor(&node.children_or_data)?
-            .get_and_decrypt_bytes(&cap.owner, &data_key, store.as_ref())
-            .await?;
-        let chunk_start = chunk_index * chunk_size;
-        let avail_end = chunk_start + chunk_data.len() as u64;
-        let ov_start = offset.max(chunk_start);
-        let ov_end = end.min(avail_end);
-        if ov_end > ov_start {
-            let ls = (ov_start - chunk_start) as usize;
-            let src = (ov_start - offset) as usize;
-            let n = (ov_end - ov_start) as usize;
-            chunk_data[ls..ls + n].copy_from_slice(&data[src..src + n]);
+    for index in start_chunk..=end_chunk {
+        let chunk_start = index * chunk_size;
+        let (mut chunk_data, node) = if index < existing {
+            let node = if index == 0 {
+                first.clone()
+            } else {
+                fetch_chunk_node_verified(cap, &root, &map_key, &bat, &store, &cache)
+                    .await?
+                    .ok_or_else(|| Error::Protocol("chunk not found".into()))?
+            };
+            let bytes = FragmentedPaddedCipherText::from_cbor(&node.children_or_data)?
+                .get_and_decrypt_bytes(&cap.owner, &data_key, store.as_ref())
+                .await?;
+            (bytes, Some(node))
+        } else {
+            (Vec::new(), None)
+        };
+        let from = offset.max(chunk_start);
+        let to = end.min(chunk_start + chunk_size);
+        let local_end = (to - chunk_start) as usize;
+        if chunk_data.len() < local_end {
+            chunk_data.resize(local_end, 0);
         }
-        let (fpct, fragments) = FragmentedPaddedCipherText::build(
-            &data_key,
-            &CborObject::ByteString(chunk_data),
-            MIN_FRAGMENT_SIZE,
-            mirror_bat,
-        )?;
-        // Rebuild the chunk clearing the content hash-tree branch (Java removes the
-        // hash on a partial write) and bumping the modified time; the base block
-        // (data key + writer link + next-chunk) is preserved.
-        let new_node = node.overwrite_chunk_data(&cap.r_base_key, fpct.to_cbor(), now_epoch())?;
+        chunk_data[(from - chunk_start) as usize..local_end].copy_from_slice(&data[(from - offset) as usize..(to - offset) as usize]);
+        let (fpct, fragments) =
+            FragmentedPaddedCipherText::build(&data_key, &CborObject::ByteString(chunk_data), MIN_FRAGMENT_SIZE, mirror_bat)?;
+        let (next_map_key, next_bat) = retrieve::calculate_next_map_key(&stream_secret, &map_key, &bat)?;
+        let new_node = match node {
+            Some(node) => {
+                let node = node.overwrite_chunk_data(&cap.r_base_key, fpct.to_cbor(), now_epoch())?;
+                match (&first_props, index) {
+                    (Some(p), 0) => node.update_properties(&cap.r_base_key, p.clone())?,
+                    _ => node,
+                }
+            }
+            None => {
+                // a chunk past the old end: laid out as upload lays out every chunk after the first
+                let to_parent = first
+                    .parent_link(&cap.r_base_key)?
+                    .ok_or_else(|| Error::Protocol("file has no parent link".into()))?;
+                let from_base = CborObject::map()
+                    .put("k", data_key.to_cbor())
+                    .put("n", RelCap::subsequent_chunk(next_map_key.clone(), next_bat.clone(), cap.r_base_key.clone()).to_cbor())
+                    .build();
+                let mut chunk_props = first_props.clone().unwrap_or_else(|| props.clone());
+                chunk_props.thumbnail = None;
+                let from_parent = CborObject::map().put("p", to_parent.to_cbor()).put("s", chunk_props.to_cbor()).build();
+                CryptreeNode::new(
+                    false,
+                    node_bats_opt(bat.as_ref(), mirror_bat)?,
+                    PaddedCipherText::build(&cap.r_base_key, &from_base, BASE_BLOCK_PADDING_BLOCKSIZE)?,
+                    PaddedCipherText::build(&cap.r_base_key, &from_parent, META_DATA_PADDING_BLOCKSIZE)?,
+                    fpct.to_cbor(),
+                )
+            }
+        };
         updates.push((map_key.clone(), new_node, fragments));
-        if chunk_index == end_chunk {
-            break;
-        }
-        let ss = props
-            .stream_secret
-            .as_ref()
-            .ok_or_else(|| Error::Protocol("multi-chunk file without a stream secret".into()))?;
-        let (nmk, nbt) = retrieve::calculate_next_map_key(ss, &map_key, &bat)?;
-        map_key = nmk;
-        bat = nbt;
-        node = fetch_chunk_node_verified(cap, &root, &map_key, &bat, &store, &cache)
-            .await?
-            .ok_or_else(|| Error::Protocol("chunk not found".into()))?;
-        chunk_index += 1;
+        map_key = next_map_key;
+        bat = next_bat;
     }
-
+    if start_chunk > 0 {
+        if let Some(p) = first_props {
+            updates.push((cap.map_key.clone(), first.update_properties(&cap.r_base_key, p)?, Vec::new()));
+        }
+    }
     let changed: Vec<Vec<u8>> = updates.iter().map(|(k, _, _)| k.clone()).collect();
-    reupload_nodes(cap, updates, signer, &store, mutable).await?;
+    reupload_nodes(cap, updates, &[], signer, &store, mutable).await?;
     Ok(changed)
 }
 
-/// Re-put several `(map_key, node)` pairs into the writer's champ in a single
-/// pointer update (a multi-node [`reupload_node`]), uploading each node's fragments.
+/// Shrink a file to `new_size` bytes in place: the last chunk kept is cut short and
+/// every chunk after it removed, rather than the file being rewritten. No-op if it
+/// is already that small. Returns the map-keys of the chunks changed or removed.
+pub async fn truncate_file(
+    cap: &AbsoluteCapability,
+    new_size: u64,
+    signer: &SigningPrivateKeyAndPublicHash,
+    mirror_bat: Option<&BatId>,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<Vec<Vec<u8>>> {
+    let (root, cache, first, props) = open_file_for_write(cap, &store, mutable).await?;
+    if new_size >= props.size {
+        return Ok(Vec::new());
+    }
+    let chunk_size = props.chunk_size;
+    let old_n = chunk_count(props.size, chunk_size);
+    let keep = chunk_count(new_size, chunk_size);
+    let last = keep - 1;
+    let stream_secret = props
+        .stream_secret
+        .clone()
+        .ok_or_else(|| Error::Protocol("file without a stream secret".into()))?;
+    let data_key = first.get_data_key(&cap.r_base_key)?;
+    let first_props = resized_props(&props, new_size);
+
+    let (last_key, last_bat) = advance_map_key(&stream_secret, &cap.map_key, &cap.bat, last)?;
+    let last_node = if last == 0 {
+        first.clone()
+    } else {
+        fetch_chunk_node_verified(cap, &root, &last_key, &last_bat, &store, &cache)
+            .await?
+            .ok_or_else(|| Error::Protocol("chunk not found".into()))?
+    };
+    let mut bytes = FragmentedPaddedCipherText::from_cbor(&last_node.children_or_data)?
+        .get_and_decrypt_bytes(&cap.owner, &data_key, store.as_ref())
+        .await?;
+    bytes.truncate((new_size - last * chunk_size) as usize);
+    let (fpct, fragments) =
+        FragmentedPaddedCipherText::build(&data_key, &CborObject::ByteString(bytes), MIN_FRAGMENT_SIZE, mirror_bat)?;
+    let mut last_new = last_node.overwrite_chunk_data(&cap.r_base_key, fpct.to_cbor(), now_epoch())?;
+    let mut updates = Vec::new();
+    if last == 0 {
+        last_new = last_new.update_properties(&cap.r_base_key, first_props)?;
+    } else {
+        updates.push((cap.map_key.clone(), first.update_properties(&cap.r_base_key, first_props)?, Vec::new()));
+    }
+    updates.push((last_key.clone(), last_new, fragments));
+
+    let mut removed = Vec::new();
+    let (mut mk, mut bt) = retrieve::calculate_next_map_key(&stream_secret, &last_key, &last_bat)?;
+    for _ in keep..old_n {
+        removed.push(mk.clone());
+        let (nmk, nbt) = retrieve::calculate_next_map_key(&stream_secret, &mk, &bt)?;
+        mk = nmk;
+        bt = nbt;
+    }
+    let mut changed: Vec<Vec<u8>> = updates.iter().map(|(k, _, _)| k.clone()).collect();
+    reupload_nodes(cap, updates, &removed, signer, &store, mutable).await?;
+    changed.extend(removed);
+    Ok(changed)
+}
+
+/// Re-put several `(map_key, node)` pairs into the writer's champ, and remove the
+/// `removals`, in a single pointer update, uploading each node's fragments.
 async fn reupload_nodes(
     cap: &AbsoluteCapability,
     updates: Vec<(Vec<u8>, CryptreeNode, Vec<Vec<u8>>)>,
+    removals: &[Vec<u8>],
     signer: &SigningPrivateKeyAndPublicHash,
     store: &Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
@@ -2848,6 +2942,9 @@ async fn reupload_nodes(
         let expected = champ.get(&map_key).await?;
         let new_cid = put_block_signed(store.as_ref(), owner, signer, node.to_cbor().to_bytes(), &tid).await?;
         champ.put(signer, &map_key, &expected, Some(CborObject::MerkleLink(new_cid.to_bytes())), &tid).await?;
+    }
+    for map_key in removals {
+        champ_remove_entry(&mut champ, signer, map_key, &tid).await?;
     }
     let new_wd = writer_data_with_tree(&base_wd, champ.root_hash())?;
     let new_wd_cid = put_block_signed(store.as_ref(), owner, signer, new_wd.to_bytes(), &tid).await?;

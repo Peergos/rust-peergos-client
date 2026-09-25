@@ -51,7 +51,7 @@ impl Cborable for LabelledSignedSpaceRequest {
 }
 
 /// Server version info, mirroring `VersionInfo`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VersionInfo {
     pub version: String,
     pub source_version: String,

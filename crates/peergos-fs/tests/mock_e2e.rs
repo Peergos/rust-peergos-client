@@ -4352,3 +4352,113 @@ async fn copy_folder_batches_small_files() {
     let t = ctx.get_by_path("dest/src/t.txt").await.unwrap().unwrap();
     assert_eq!(t.properties().thumbnail.as_ref(), Some(&thumb));
 }
+
+/// Writes that grow a file, section writes and truncates all land in place, across
+/// chunk boundaries and at both chunk sizes, matching a model of the bytes.
+#[tokio::test]
+async fn in_place_writes_match_a_model() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = UserContext::sign_up("ip", "ipw", None, poster, store.clone(), mutable.clone()).await.unwrap();
+    let home = ctx.get_home().await.unwrap();
+    for chunk in [peergos_fs::LEGACY_CHUNK_SIZE as usize, peergos_fs::DEFAULT_CHUNK_SIZE as usize] {
+        let name = format!("model{chunk}.bin");
+        let start: Vec<u8> = vec![7u8; 1000];
+        let bytes = start.clone();
+        peergos_fs::upload_file_streaming_at_chunk_size(
+            home.capability(), &name, 1000, chunk as u64, home.signer().cloned(), None,
+            move || Ok(std::io::Cursor::new(bytes.clone())), store.clone(), mutable.as_ref(),
+        ).await.unwrap();
+        let mut model = start;
+        let fill = |n: usize, seed: u8| -> Vec<u8> { (0..n).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect() };
+        let ops: Vec<(&str, usize, usize)> = vec![
+            ("append", 0, chunk),            // grows across the first boundary
+            ("write", chunk - 10, 30),       // straddles it
+            ("append", 0, 2 * chunk + 5),    // adds two whole chunks and a bit
+            ("write_end", 0, 50),            // grows from the current end
+            ("truncate", chunk + 3, 0),      // back into the second chunk
+            ("truncate", 10, 0),             // into the first chunk
+            ("append", 0, 100),
+        ];
+        for (i, (op, at, n)) in ops.into_iter().enumerate() {
+            let f = ctx.get_by_path(&name).await.unwrap().unwrap();
+            let data = fill(n, i as u8);
+            match op {
+                "append" => {
+                    f.append(&data).await.unwrap();
+                    model.extend_from_slice(&data);
+                }
+                "write" | "write_end" => {
+                    let at = if op == "write_end" { model.len() } else { at };
+                    f.write_section(at as u64, &data).await.unwrap();
+                    if model.len() < at + n {
+                        model.resize(at + n, 0);
+                    }
+                    model[at..at + n].copy_from_slice(&data);
+                }
+                _ => {
+                    f.truncate(at as u64).await.unwrap();
+                    model.truncate(at);
+                }
+            }
+            let f = ctx.get_by_path(&name).await.unwrap().unwrap();
+            assert_eq!(f.size(), model.len() as u64, "size after {op} (chunk {chunk})");
+            assert_eq!(f.properties().chunk_size, chunk as u64);
+            assert!(f.read().await.unwrap() == model, "content after {op} (chunk {chunk})");
+        }
+    }
+}
+
+/// A zip written by another tool is listed and read without reading the whole
+/// file, and adding, replacing, removing, renaming and moving entries all leave an
+/// archive that reads back as expected.
+#[tokio::test]
+async fn zip_archive_read_and_edit() {
+    use peergos_fs::archive::{append, move_entry, remove, rename, EntrySource, NewEntry, ZipReader};
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = UserContext::sign_up("zz", "zpw", None, poster, store, mutable).await.unwrap();
+    let fixture = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sample.zip")).unwrap();
+    ctx.get_home().await.unwrap().upload("sample.zip", &fixture).await.unwrap();
+    let archive = || async { ctx.get_by_path("sample.zip").await.unwrap().unwrap() };
+
+    let zip = ZipReader::open(&archive().await).await.unwrap();
+    let root: Vec<(String, bool)> = zip.list_directory("").unwrap().iter().map(|e| (e.name().to_string(), e.is_directory)).collect();
+    assert_eq!(root, vec![("docs".into(), true), ("empty".into(), true), ("readme.txt".into(), false)]);
+    assert_eq!(zip.read_path("readme.txt").await.unwrap(), b"hello zip\n".repeat(50));
+    assert_eq!(zip.read_path("docs/a.txt").await.unwrap(), b"alpha");
+    let b_bin: Vec<u8> = (0..256u32).map(|i| i as u8).collect::<Vec<_>>().repeat(400);
+    assert_eq!(zip.read_path("docs/sub/b.bin").await.unwrap(), b_bin);
+    assert!(zip.list_directory("empty").unwrap().is_empty());
+
+    // add one entry and replace another in one rewrite of the tail
+    let big: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    append(
+        &archive().await,
+        vec![
+            NewEntry::file("new/big.bin", big.len() as u64, 0, EntrySource::Bytes(std::sync::Arc::new(big.clone()))).unwrap(),
+            NewEntry::file("docs/a.txt", 5, 0, EntrySource::Bytes(std::sync::Arc::new(b"ALPHA".to_vec()))).unwrap(),
+        ],
+    )
+    .await
+    .unwrap();
+    let zip = ZipReader::open(&archive().await).await.unwrap();
+    assert_eq!(zip.read_path("new/big.bin").await.unwrap(), big);
+    assert_eq!(zip.read_path("docs/a.txt").await.unwrap(), b"ALPHA");
+    assert_eq!(zip.read_path("readme.txt").await.unwrap(), b"hello zip\n".repeat(50), "untouched entries survive");
+
+    // a same length rename is patched in place; a different length one is rewritten
+    rename(&archive().await, "readme.txt", "README.txt").await.unwrap();
+    rename(&archive().await, "docs/a.txt", "a-longer-name.txt").await.unwrap();
+    move_entry(&archive().await, "docs/sub", "moved").await.unwrap();
+    remove(&archive().await, &["empty".to_string()], true).await.unwrap();
+
+    let zip = ZipReader::open(&archive().await).await.unwrap();
+    assert_eq!(zip.read_path("README.txt").await.unwrap(), b"hello zip\n".repeat(50));
+    assert_eq!(zip.read_path("docs/a-longer-name.txt").await.unwrap(), b"ALPHA");
+    assert_eq!(zip.read_path("moved/b.bin").await.unwrap(), b_bin);
+    assert!(zip.index().get("readme.txt").is_none());
+    assert!(zip.index().get("docs/a.txt").is_none());
+    assert!(zip.index().get("docs/sub/b.bin").is_none());
+    assert!(zip.index().get("empty").is_none());
+}

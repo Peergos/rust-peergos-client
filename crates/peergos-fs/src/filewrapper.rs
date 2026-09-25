@@ -333,7 +333,8 @@ impl FileWrapper {
             self.mutable.clone(),
         )
         .await?
-        .with_cache(self.cache.clone()))
+        .with_cache(self.cache.clone())
+        .with_mirror_bat(self.mirror_bat.clone()))
     }
 
     // ---- mutation ----------------------------------------------------------
@@ -395,9 +396,8 @@ impl FileWrapper {
         if data.is_empty() {
             return Ok(());
         }
-        let mut content = self.read().await?;
-        content.extend_from_slice(data);
-        self.rewrite(&content).await
+        let size = crate::retrieve_file_metadata(&self.cap, self.store.clone(), self.mutable.as_ref()).await?.1.size;
+        self.write_section(size, data).await
     }
 
     /// Shrink this file to `new_size` bytes (`truncate`), any file size. No-op if
@@ -406,47 +406,37 @@ impl FileWrapper {
         if self.is_directory() {
             return Err(Error::Protocol("cannot truncate a directory".into()));
         }
-        if new_size >= self.size() {
-            return Ok(());
-        }
-        let content = self.read().await?;
-        self.rewrite(&content[..new_size as usize]).await
-    }
-
-    /// Replace the file's whole content (any size), keeping its capability.
-    async fn rewrite(&self, content: &[u8]) -> Result<()> {
-        let signer = crate::recover_signer(&self.cap, self.store.clone(), self.mutable.as_ref())
-            .await
-            .ok()
-            .or_else(|| self.signer.clone())
-            .ok_or_else(|| Error::Protocol("no writer available to modify this file".into()))?;
+        // no size check here: this handle's size may be stale, and truncating to at
+        // least the current size is a no-op anyway
+        let signer = self.write_signer().await?;
         let prior = self.writer_root().await;
-        // Every chunk of the file may change, and only chunk 0 lives at cap.map_key,
-        // so gather all chunk map-keys (old + new span) to drop from the cache —
-        // otherwise a later read serves a stale cached tail chunk.
-        let chunk_keys = self.rewrite_chunk_keys(content.len() as u64).await;
-        crate::rewrite_file_content(&self.cap, content, &signer, self.mirror_bat.as_ref(), self.store.clone(), self.mutable.as_ref()).await?;
-        let refs: Vec<&[u8]> = chunk_keys.iter().map(|k| k.as_slice()).collect();
+        let changed = crate::truncate_file(&self.cap, new_size, &signer, self.mirror_bat.as_ref(), self.store.clone(), self.mutable.as_ref()).await?;
+        let refs: Vec<&[u8]> = changed.iter().map(|k| k.as_slice()).collect();
         self.migrate_cache(prior, &refs).await;
         Ok(())
     }
 
-    /// The map-keys of every chunk the file has before and after a rewrite to
-    /// `new_size` bytes (best-effort: falls back to just chunk 0 if metadata can't
-    /// be read).
-    async fn rewrite_chunk_keys(&self, new_size: u64) -> Vec<Vec<u8>> {
-        match crate::retrieve_file_metadata(&self.cap, self.store.clone(), self.mutable.as_ref()).await {
-            Ok((_, props)) => {
-                let new_n = new_size.div_ceil(props.chunk_size).max(1);
-                let old_n = props.size.div_ceil(props.chunk_size).max(1);
-                let n = new_n.max(old_n);
-                match &props.stream_secret {
-                    Some(ss) => crate::file_chunk_map_keys(&self.cap, ss, n).unwrap_or_else(|_| vec![self.cap.map_key.clone()]),
-                    None => vec![self.cap.map_key.clone()],
-                }
-            }
-            Err(_) => vec![self.cap.map_key.clone()],
+    async fn write_signer(&self) -> Result<SigningPrivateKeyAndPublicHash> {
+        crate::recover_signer(&self.cap, self.store.clone(), self.mutable.as_ref())
+            .await
+            .ok()
+            .or_else(|| self.signer.clone())
+            .ok_or_else(|| Error::Protocol("no writer available to modify this file".into()))
+    }
+
+    /// Write `data` at `offset` in this file, in place, growing it if the range runs
+    /// past the end (`overwriteSection`). Only the chunks the range touches are
+    /// rewritten. `offset` may be at most the current size. Requires write access.
+    pub async fn write_section(&self, offset: u64, data: &[u8]) -> Result<()> {
+        if self.is_directory() {
+            return Err(Error::Protocol("cannot write to a directory".into()));
         }
+        let signer = self.write_signer().await?;
+        let prior = self.writer_root().await;
+        let changed = crate::write_file_section(&self.cap, offset, data, &signer, self.mirror_bat.as_ref(), self.store.clone(), self.mutable.as_ref()).await?;
+        let refs: Vec<&[u8]> = changed.iter().map(|k| k.as_slice()).collect();
+        self.migrate_cache(prior, &refs).await;
+        Ok(())
     }
 
     /// Upload a file into this directory and return its wrapper (`uploadFile`).
