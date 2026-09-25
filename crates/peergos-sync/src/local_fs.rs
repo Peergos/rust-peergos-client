@@ -51,8 +51,20 @@ impl SyncFilesystem for LocalFileSystem {
 
     async fn delete(&self, p: &Path) -> Result<()> {
         let target = self.resolve(p);
-        if target.is_dir() && target.read_dir().map_err(|e| Error::Protocol(e.to_string()))?.next().is_some() {
-            return Err(Error::Protocol(format!("Dir not empty: {}", target.display())));
+        if target.is_dir() {
+            let children: Vec<PathBuf> = fs::read_dir(&target)
+                .map_err(|e| Error::Protocol(e.to_string()))?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .collect();
+            // a dir synced as empty can still hold files we never sync, like the .DS_Store
+            // the Finder creates in any dir it shows, so delete those rather than failing
+            let ignored = |c: &PathBuf| c.file_name().is_some_and(|n| crate::sync::is_ignored(&n.to_string_lossy()));
+            if !children.iter().all(ignored) {
+                return Err(Error::Protocol(format!("Dir not empty: {}", target.display())));
+            }
+            for c in children {
+                fs::remove_file(&c).map_err(|e| Error::Protocol(format!("delete failed: {e}")))?;
+            }
         }
         fs::remove_file(&target).or_else(|_| fs::remove_dir(&target))
             .map_err(|e| Error::Protocol(format!("delete failed: {e}")))

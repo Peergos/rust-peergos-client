@@ -639,3 +639,25 @@ fn tree_state_store() {
 
     assert_eq!(synced.all_file_paths().len(), 1);
 }
+
+/// A dir synced as empty that the Finder has since put a .DS_Store in is still
+/// deleted when the other side deletes it.
+#[test]
+fn delete_dir_holding_only_ignored_files() {
+    let tmp1 = tempfile::tempdir().unwrap();
+    let tmp2 = tempfile::tempdir().unwrap();
+    let local_fs = LocalFileSystem::new(tmp1.path().to_path_buf()).unwrap();
+    let remote_fs = LocalFileSystem::new(tmp2.path().to_path_buf()).unwrap();
+    let mut synced = RamTreeState::new();
+    let log = &|_msg: &str| {};
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        std::fs::create_dir(tmp1.path().join("empty")).unwrap();
+        sync_dir(&local_fs, &remote_fs, true, true, &mut synced, log).await.unwrap();
+        assert!(tmp2.path().join("empty").is_dir());
+
+        create_file(&tmp1.path().join("empty"), ".DS_Store", b"finder");
+        std::fs::remove_dir(tmp2.path().join("empty")).unwrap();
+        sync_dir(&local_fs, &remote_fs, true, true, &mut synced, log).await.unwrap();
+        assert!(!tmp1.path().join("empty").exists(), "the dir and its .DS_Store are gone");
+    });
+}

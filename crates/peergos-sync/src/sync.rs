@@ -75,7 +75,7 @@ pub async fn build_dir_state(
     Ok(())
 }
 
-fn is_ignored(name: &str) -> bool {
+pub(crate) fn is_ignored(name: &str) -> bool {
     matches!(name, ".DS_Store")
 }
 
