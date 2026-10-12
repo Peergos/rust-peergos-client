@@ -29,14 +29,16 @@ in Rust with no plaintext or key material ever leaving the process unencrypted.
 
 ## What it does
 
-- **Accounts** — post-quantum sign-up, sign-in, and MFA/TOTP second factors.
+- **Accounts** — post-quantum sign-up, sign-in, MFA/TOTP second factors and backup
+  codes, and device tokens that keep logins working under password-guess rate limits.
 - **Files & directories** — create, read, write, delete, move, rename; multi-chunk
   files streamed with bounded memory; directory listing with chunked children.
 - **Capabilities & sharing** — read and write sharing of files and directories with
   other users, capability caches, nested sharing, and access revocation via key
-  rotation.
+  rotation. Owners can cap the space a write-shared folder may use.
 - **Secret links** — create and resolve password-protected shareable links.
-- **Social** — follow requests, friends/followers groups, a social feed with posts,
+- **Social** — follow requests, friends/followers groups and custom sharing groups,
+  unfollowing versus blocking, resumable follower removal, a social feed with posts,
   comments and media, and per-user profiles.
 - **Email** — an end-to-end encrypted email bridge: encrypt, outbox, inbox and sent
   folders over the Peergos email protocol.
@@ -44,7 +46,8 @@ in Rust with no plaintext or key material ever leaving the process unencrypted.
   detection, batched transfers, and optional deletion propagation.
 - **Interactive shell** — `peergos-shell`, a login or secret-link session with paired
   remote/local working directories and the same commands as the Java CLI.
-- **Publishing** — make files public and serve a website through the Peergos gateway.
+- **Publishing** — make files public, each through a read-only secret link that the
+  gateway redirects to, and serve a website through the Peergos gateway.
 - **Efficient reads** — the server-side `champ/get` lookup returns a whole tree path
   in one round-trip, and every returned block is re-hashed and re-resolved locally so
   a malicious or faulty server cannot forge results.

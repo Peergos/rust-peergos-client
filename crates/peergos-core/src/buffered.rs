@@ -384,6 +384,17 @@ pub struct BufferedPointers {
     target: Arc<dyn MutablePointers>,
     updates: Mutex<Vec<WriterUpdate>>,
     auto: Option<AutoCommit>,
+    /// Bumped whenever buffered updates are committed or dropped, so a
+    /// [`Checkpoint`] taken before then knows the buffer it describes is gone.
+    generation: std::sync::atomic::AtomicU64,
+}
+
+/// The buffered pointer updates at a moment, to discard any made after it.
+#[derive(Clone)]
+pub struct Checkpoint {
+    generation: u64,
+    len: usize,
+    last_target: Option<Option<Cid>>,
 }
 
 struct AutoCommit {
@@ -394,7 +405,7 @@ struct AutoCommit {
 
 impl BufferedPointers {
     pub fn new(target: Arc<dyn MutablePointers>) -> BufferedPointers {
-        BufferedPointers { target, updates: Mutex::new(Vec::new()), auto: None }
+        BufferedPointers { target, updates: Mutex::new(Vec::new()), auto: None, generation: Default::default() }
     }
 
     /// A buffered-pointers that auto-flushes the shared block buffer once it reaches
@@ -405,7 +416,12 @@ impl BufferedPointers {
         buffer_size: usize,
         safe: Arc<AtomicBool>,
     ) -> BufferedPointers {
-        BufferedPointers { target, updates: Mutex::new(Vec::new()), auto: Some(AutoCommit { blocks, buffer_size, safe }) }
+        BufferedPointers {
+            target,
+            updates: Mutex::new(Vec::new()),
+            auto: Some(AutoCommit { blocks, buffer_size, safe }),
+            generation: Default::default(),
+        }
     }
 
     /// Flush the buffer (GC to roots, write blocks, commit pointers) if an
@@ -431,6 +447,31 @@ impl BufferedPointers {
 
     pub fn clear(&self) {
         self.updates.lock().unwrap().clear();
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn checkpoint(&self) -> Checkpoint {
+        let list = self.updates.lock().unwrap();
+        Checkpoint {
+            generation: self.generation.load(Ordering::SeqCst),
+            len: list.len(),
+            last_target: list.last().map(|w| w.update.updated.clone()),
+        }
+    }
+
+    /// Discard the updates buffered since `cp`. If they were committed part way, by
+    /// an automatic flush, only what is still buffered can be discarded.
+    pub fn rollback(&self, cp: &Checkpoint) {
+        let mut list = self.updates.lock().unwrap();
+        if self.generation.load(Ordering::SeqCst) != cp.generation {
+            list.clear();
+            return;
+        }
+        list.truncate(cp.len);
+        // the last entry may have been advanced in place by a later write to its writer
+        if let (Some(last), Some(target)) = (list.last_mut(), &cp.last_target) {
+            last.update.updated = target.clone();
+        }
     }
 
     /// The new WriterData roots pointed at by the buffered updates, in order (for GC).
@@ -462,6 +503,7 @@ impl BufferedPointers {
 
     fn drop_owner(&self, owner: &PublicKeyHash) {
         self.updates.lock().unwrap().retain(|w| &w.owner != owner);
+        self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Commit `owner`'s buffered pointer updates in order, resolving any CAS conflict
@@ -956,6 +998,18 @@ impl BufferedNetwork {
     pub fn force_clear(&self) {
         self.blocks.clear();
         self.pointers.clear();
+    }
+
+    /// Mark the start of an update, to discard its buffered writes if it fails.
+    pub fn checkpoint(&self) -> Checkpoint {
+        self.pointers.checkpoint()
+    }
+
+    /// Discard the pointer updates buffered since `cp`, e.g. after the update that
+    /// made them failed part way, so a later commit doesn't send half of it. Blocks
+    /// they alone reference are dropped when the buffer is next committed.
+    pub fn rollback(&self, cp: &Checkpoint) {
+        self.pointers.rollback(cp);
     }
 }
 

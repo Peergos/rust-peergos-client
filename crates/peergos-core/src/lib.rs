@@ -24,7 +24,7 @@ pub mod symmetric;
 
 pub use auth::{Bat, BatId, BatWithId, BlockAuth};
 pub use boxing::{BoxingKeyPair, PublicBoxingKey, SecretBoxingKey};
-pub use buffered::{BufferedNetwork, BufferedPointers, BufferedStorage};
+pub use buffered::{BufferedNetwork, BufferedPointers, BufferedStorage, Checkpoint};
 pub use champ::{identity_key_hasher, Champ, ChampWrapper, KeyElement, Payload};
 pub use direct_s3::{hash_to_key, BlockStoreProperties, DirectS3Storage, PresignedUrl};
 pub use symmetric::{CipherText, SymmetricKey};

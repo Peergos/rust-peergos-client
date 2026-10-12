@@ -3345,39 +3345,24 @@ async fn unfollow() {
     let alice_social = alice.social_state().await.unwrap();
     assert!(alice_social.following.contains(&"bob".to_string()), "Alice follows Bob");
 
-    // Alice unfollows Bob (calls block internally in Rust)
+    // Alice unfollows Bob: she stops seeing him, but he isn't blocked and still follows her
     alice.unfollow("bob").await.unwrap();
 
     let alice = login("alice", "apw", &poster, &store, &mutable).await;
     let bob = login("bob", "bpw", &poster, &store, &mutable).await;
 
-    // Bob is now blocked
-    let alice_blocked = alice.get_blocked().await.unwrap();
-    assert!(alice_blocked.contains(&"bob".to_string()), "Bob is blocked");
-    // Rust doesn't remove the entry point on unfollow, so following still contains Bob
+    let alice_social = alice.social_state().await.unwrap();
+    assert!(alice_social.unfollowed.contains(&"bob".to_string()), "Bob is unfollowed");
+    assert!(!alice_social.blocked.contains(&"bob".to_string()), "Bob is not blocked");
+    assert!(!alice_social.following.contains(&"bob".to_string()), "Alice no longer follows Bob");
 
     // Bob can still see Alice's root (Bob didn't change)
-    assert!(bob.social_state().await.unwrap().friends.iter().any(|e| e.owner_name == "alice"), "Bob can still see Alice's root");
+    assert!(bob.social_state().await.unwrap().following.contains(&"alice".to_string()), "Bob can still see Alice's root");
 
-    // Re-follow to become friends again
-    let alice_li = peergos_fs::login("alice", "apw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
-    peergos_fs::send_follow_request(&alice_li, "bob", true, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
-
-    // Unblock then allow Bob to process the follow request
+    // Following again undoes the unfollow
+    alice.follow_again("bob").await.unwrap();
     let alice = login("alice", "apw", &poster, &store, &mutable).await;
-    alice.unblock("bob").await.unwrap();
-
-    let bob_li = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
-    for r in peergos_fs::get_follow_requests(&bob_li, poster.as_ref()).await.unwrap() {
-        if r.sender() == Some("alice") {
-            peergos_fs::process_follow_reply(&bob_li, &r, poster.as_ref(), store.clone(), mutable.as_ref()).await.unwrap();
-        }
-    }
-
-    let alice = login("alice", "apw", &poster, &store, &mutable).await;
-    let bob = login("bob", "bpw", &poster, &store, &mutable).await;
-
-    assert!(alice.social_state().await.unwrap().friends.iter().any(|e| e.owner_name == "bob"), "Alice can see Bob's root again");
+    assert!(alice.social_state().await.unwrap().following.contains(&"bob".to_string()), "Alice can see Bob again");
 }
 
 /// Java `MultiUserTests.removeFollower`
@@ -3494,22 +3479,20 @@ async fn friendship_restoration() {
     assert!(alice_social.friends.iter().any(|e| e.owner_name == "bob-bpw"), "Alice is friends with Bob");
     assert!(bob_social.friends.iter().any(|e| e.owner_name == "alice-apw"), "Bob is friends with Alice");
 
-    // Alice unfollows Bob (calls block in Rust). Rust doesn't remove the entry
-    // point from `.from-friends.cborstream`, so friends/following still include Bob.
+    // Alice unfollows Bob: local, so he still follows her
     alice.unfollow("bob-bpw").await.unwrap();
 
     let alice = login("alice-apw", "apw", &poster, &store, &mutable).await;
     let bob = login("bob-bpw", "bpw", &poster, &store, &mutable).await;
 
-    // Bob is now blocked, but friends/following still contain Bob (Rust)
-    assert!(alice.get_blocked().await.unwrap().contains(&"bob-bpw".to_string()), "Bob is blocked");
+    assert!(alice.get_unfollowed().await.unwrap().contains(&"bob-bpw".to_string()), "Bob is unfollowed");
+    assert!(!alice.get_blocked().await.unwrap().contains(&"bob-bpw".to_string()), "Bob is not blocked");
     assert!(alice.social_state().await.unwrap().followers.contains(&"bob-bpw".to_string()), "Alice still has Bob as follower");
 
     // Bob still thinks they're friends (unfollow is local)
     assert!(bob.social_state().await.unwrap().friends.iter().any(|e| e.owner_name == "alice-apw"), "Bob still thinks he's friends with Alice");
 
-    // Alice unblocks Bob
-    alice.unblock("bob-bpw").await.unwrap();
+    alice.follow_again("bob-bpw").await.unwrap();
 
     // Now remove as follower
     alice.remove_follower("bob-bpw").await.unwrap();

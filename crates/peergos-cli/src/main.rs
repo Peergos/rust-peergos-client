@@ -51,7 +51,15 @@ struct Shell {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), BoxErr> {
+async fn main() {
+    // a one line message rather than a debug dump of the error
+    if let Err(e) = run().await {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), BoxErr> {
     let session_path = session_file_path();
 
     // `--logout` clears any saved session and exits.
@@ -131,7 +139,8 @@ async fn main() -> Result<(), BoxErr> {
             None => prompt("Enter username > ")?.trim().to_string(),
         };
         let password = read_password("Enter password > ")?;
-        let (poster, store, mutable) = build_transport(&server).await?;
+        let (poster, store, mutable) =
+            build_transport(&server).await.map_err(|e| format!("Could not reach {server}: {e}"))?;
 
         // A code prompt for second-factor accounts (only invoked if the server asks):
         // a 6 digit TOTP code, or a single use backup code.
@@ -160,7 +169,8 @@ async fn main() -> Result<(), BoxErr> {
             }
         };
         let ctx = UserContext::sign_in(&username, &password, Some(&responder), poster, store, mutable)
-            .await?
+            .await
+            .map_err(|e| format!("Login failed: {e}"))?
             .with_session_caches();
         if stay {
             match save_session(&session_path, &server, ctx.user().expect("logged in")) {
@@ -468,7 +478,7 @@ impl Shell {
 
     async fn get_follow_requests(&self) -> Result<String, BoxErr> {
         let user = self.ctx.user().ok_or("not signed in")?;
-        let reqs = peergos_fs::get_follow_requests(user, self.ctx.poster().as_ref()).await?;
+        let reqs = peergos_fs::process_follow_requests(user, self.ctx.poster().as_ref(), self.ctx.store(), self.ctx.mutable().as_ref()).await?;
         let names: Vec<String> = reqs.iter().filter_map(|r| r.sender().map(|s| s.to_string())).collect();
         if names.is_empty() {
             return Ok("No pending follow requests.".to_string());
@@ -480,7 +490,7 @@ impl Shell {
         let target = args.first().ok_or("usage: process_follow_request <user> <accept|accept-and-reciprocate|reject>")?;
         let action = args.get(1).map(|s| s.as_str()).ok_or("please specify accept | accept-and-reciprocate | reject")?;
         let user = self.ctx.user().ok_or("not signed in")?;
-        let reqs = peergos_fs::get_follow_requests(user, self.ctx.poster().as_ref()).await?;
+        let reqs = peergos_fs::process_follow_requests(user, self.ctx.poster().as_ref(), self.ctx.store(), self.ctx.mutable().as_ref()).await?;
         let req = reqs.into_iter().find(|r| r.sender() == Some(target.as_str()))
             .ok_or_else(|| format!("no pending follow request from '{target}'"))?;
         match action {

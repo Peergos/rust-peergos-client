@@ -27,6 +27,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const SPACE_USAGE_URL: &str = "peergos/v0/storage/";
 
+fn split_home_path(path: &str) -> (&str, &str) {
+    let trimmed = path.trim_matches('/');
+    trimmed.rsplit_once('/').unwrap_or(("", trimmed))
+}
+
 /// A link can hold this many items; the real limit is that the serialised link fits
 /// in one block, which [`crate::put_secret_link`] enforces.
 pub const MAX_LINK_MEMBERS: usize = 100;
@@ -820,6 +825,53 @@ impl UserContext {
         crate::share_write_access(user, parent_path, parent.capability(), name, friend, self.store.clone(), self.mutable.as_ref()).await
     }
 
+    /// Revoke read access to the item at home-relative `path` from `users`, which
+    /// may include group uids (`unShareReadAccessWith`).
+    pub async fn unshare_read_access(&self, path: &str, users: &[String]) -> Result<()> {
+        let user = self.require_user()?;
+        let (parent_path, name) = split_home_path(path);
+        let parent = self
+            .get_by_path(parent_path)
+            .await?
+            .ok_or_else(|| Error::Protocol(format!("no parent directory for {path}")))?;
+        crate::unshare_read_access(user, parent_path, parent.capability(), name, users, self.store.clone(), self.mutable.as_ref())
+            .await
+    }
+
+    /// Revoke write access to the item at home-relative `path` from `users`, which
+    /// may include group uids (`unShareWriteAccessWith`). This moves the item to a
+    /// new writing space, which keeps any cap on the space the old one could use.
+    pub async fn unshare_write_access(&self, path: &str, users: &[String]) -> Result<()> {
+        let user = self.require_user()?;
+        let (parent_path, name) = split_home_path(path);
+        let parent = self
+            .get_by_path(parent_path)
+            .await?
+            .ok_or_else(|| Error::Protocol(format!("no parent directory for {path}")))?;
+        let old_writer = self
+            .get_by_path(path)
+            .await?
+            .ok_or_else(|| Error::Protocol(format!("Specified un-shareWith path {path} does not exist")))?
+            .capability()
+            .writer
+            .clone();
+        let quotas = self.writer_quota_map().await.unwrap_or_default();
+        crate::unshare_write_access(user, parent_path, parent.capability(), name, users, self.store.clone(), self.mutable.as_ref())
+            .await?;
+        if let Some(quota) = quotas.get(&old_writer) {
+            if let Some(moved) = self.get_by_path(path).await? {
+                crate::writer_quota::set_writer_quota(&user.signer, &moved.capability().writer, Some(*quota), self.poster.as_ref())
+                    .await?;
+                // the old signer is only de-authorised, not emptied, so the server can't
+                // tell it has gone and its cap is removed here
+                if let Err(e) = crate::writer_quota::set_writer_quota(&user.signer, &old_writer, None, self.poster.as_ref()).await {
+                    log::warn!("Couldn't remove the cap of rotated signer {old_writer}: {e}");
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Remove every writer this user's writers own that has no pointer
     /// (`removeOrphanedWriters`): left behind by a grant of write access that was
     /// interrupted before the new writer's first commit. Returns how many.
@@ -961,32 +1013,58 @@ impl UserContext {
         }
     }
 
-    /// A snapshot of the user's social state (`getSocialState`): pending incoming
-    /// follow requests + friend/following roots. See [`crate::SocialState`] for the
-    /// fields Java includes that this subset does not yet populate.
+    /// The user's social state (`getSocialState`). This first acts on follow
+    /// requests that don't need the user (see [`crate::process_follow_requests`]),
+    /// finishes any interrupted block, and reconciles the built-in groups with who
+    /// our followers and friends are; failures of the last two are only logged.
     pub async fn social_state(&self) -> Result<crate::SocialState> {
         let user = self.require_user()?;
         let (store, mutable) = (self.store.clone(), self.mutable.as_ref());
-        let pending_incoming_requests = crate::get_follow_requests(user, self.poster.as_ref()).await?;
-        let pending_outgoing = crate::get_pending_outgoing(user, store.clone(), mutable).await?;
+        let pending_incoming_requests =
+            crate::process_follow_requests(user, self.poster.as_ref(), store.clone(), mutable).await?;
+        if let Err(e) = crate::complete_blocks(user, store.clone(), mutable).await {
+            log::warn!("Couldn't complete blocks: {e}");
+        }
         let following = crate::get_following(user, store.clone(), mutable).await?;
+        let following_set = following.iter().cloned().collect();
+        if let Err(e) = crate::reconcile_groups(user, &following_set, store.clone(), mutable).await {
+            log::warn!("Couldn't reconcile social groups: {e}");
+        }
+        let pending_outgoing = crate::get_pending_outgoing(user, store.clone(), mutable).await?;
         let followers = crate::get_follower_names(user, store.clone(), mutable).await?;
         let blocked = crate::get_blocked(user, store.clone(), mutable).await?;
-        let friends = crate::get_friends(user, store, mutable).await?;
+        let unfollowed = crate::get_unfollowed(user, store.clone(), mutable).await?;
+        let friends = crate::get_friends(user, store.clone(), mutable).await?;
+        let groups = crate::get_or_create_groups(user, store, mutable).await?.uid_to_name;
         Ok(crate::SocialState {
             pending_incoming_requests,
             pending_outgoing,
             following,
             followers,
             blocked,
+            unfollowed,
             friends,
+            groups,
         })
     }
 
-    /// Block/unfollow `username` (`unfollow`): adds them to the blocked list.
+    /// Stop seeing what `username` shares with us directly (`unfollow`). They may
+    /// still follow us; see [`UserContext::block`] to stop that too.
     pub async fn unfollow(&self, username: &str) -> Result<()> {
         let user = self.require_user()?;
         crate::unfollow(user, username, self.store.clone(), self.mutable.as_ref()).await
+    }
+
+    /// Start seeing what an unfollowed user shares with us directly again (`followAgain`).
+    pub async fn follow_again(&self, username: &str) -> Result<()> {
+        let user = self.require_user()?;
+        crate::follow_again(user, username, self.store.clone(), self.mutable.as_ref()).await
+    }
+
+    /// The users we have unfollowed (`getUnfollowed`).
+    pub async fn get_unfollowed(&self) -> Result<Vec<String>> {
+        let user = self.require_user()?;
+        crate::get_unfollowed(user, self.store.clone(), self.mutable.as_ref()).await
     }
 
     /// The sharing state of every child of the directory at home-relative `dir_path`
@@ -996,19 +1074,20 @@ impl UserContext {
         crate::get_directory_sharing_state(user, dir_path, self.store.clone(), self.mutable.as_ref()).await
     }
 
-    /// The usernames the user has blocked (`getBlocked`).
+    /// The users we have blocked (`getBlocked`).
     pub async fn get_blocked(&self) -> Result<Vec<String>> {
         let user = self.require_user()?;
         crate::get_blocked(user, self.store.clone(), self.mutable.as_ref()).await
     }
 
-    /// Block `username` so their shared entry points are no longer honoured.
+    /// Never see anything from `username`, even via someone else, and stop them
+    /// following us (`block`).
     pub async fn block(&self, username: &str) -> Result<()> {
         let user = self.require_user()?;
         crate::block(user, username, self.store.clone(), self.mutable.as_ref()).await
     }
 
-    /// Unblock `username` (`unblock`): remove them from the blocked list.
+    /// Unblock `username` (`unblock`). They stay unfollowed until [`UserContext::follow_again`].
     pub async fn unblock(&self, username: &str) -> Result<()> {
         let user = self.require_user()?;
         crate::unblock(user, username, self.store.clone(), self.mutable.as_ref()).await
@@ -1026,36 +1105,53 @@ impl UserContext {
         crate::add_friend_annotation(user, annotation, self.store.clone(), self.mutable.as_ref()).await
     }
 
-    /// Remove `username` as a follower (`removeFollower`): revoke every file ever
-    /// shared with them (rotating each file's keys and re-sharing to the remaining
-    /// recipients) and delete their `/shared/<username>` folder.
+    /// Remove `username` as a follower (`removeFollower`): remove them from every
+    /// group, revoke everything ever shared with them (rotating keys and re-sharing
+    /// with the remaining recipients) and delete their `/shared/<username>` folder.
+    /// Resumable: an interrupted removal is completed by [`UserContext::social_state`].
     pub async fn remove_follower(&self, username: &str) -> Result<()> {
         let user = self.require_user()?;
-        let (store, mutable) = (self.store.clone(), self.mutable.as_ref());
-        // Revoke everything shared with them.
-        for (dir_path, child, access) in crate::collect_shares_for_user(user, username, store.clone(), mutable).await? {
-            let parent = self
-                .get_by_path(&dir_path)
-                .await?
-                .ok_or_else(|| Error::Protocol(format!("shared dir {dir_path} not found")))?;
-            let parent_cap = parent.capability().clone();
-            let revoked = [username.to_string()];
-            match access {
-                crate::Access::Read => {
-                    crate::unshare_read_access(user, &dir_path, &parent_cap, &child, &revoked, store.clone(), mutable).await?;
-                }
-                crate::Access::Write => {
-                    crate::unshare_write_access(user, &dir_path, &parent_cap, &child, &revoked, store.clone(), mutable).await?;
-                }
-            }
-        }
-        // Delete their sharing folder /<us>/shared/<username>.
-        if let Some(shared) = self.get_home().await?.child("shared").await? {
-            if shared.child(username).await?.is_some() {
-                shared.remove_child(username).await?;
-            }
-        }
-        Ok(())
+        crate::revoke_follower(user, username, self.store.clone(), self.mutable.as_ref()).await
+    }
+
+    // ---- sharing groups ---------------------------------------------------
+
+    /// Create a custom sharing group of followers (`createGroup`), returning its uid.
+    pub async fn create_group(&self, name: &str, members: &[String]) -> Result<String> {
+        crate::create_group(self.require_user()?, name, members, self.store.clone(), self.mutable.as_ref()).await
+    }
+
+    /// Change our label for a custom group (`renameGroup`).
+    pub async fn rename_group(&self, group_uid: &str, new_name: &str) -> Result<()> {
+        crate::rename_group(self.require_user()?, group_uid, new_name, self.store.clone(), self.mutable.as_ref()).await
+    }
+
+    /// Who is in a group (`getGroupMembers`).
+    pub async fn get_group_members(&self, group_uid: &str) -> Result<std::collections::BTreeSet<String>> {
+        crate::get_group_members(self.require_user()?, group_uid, self.store.clone(), self.mutable.as_ref()).await
+    }
+
+    /// Add followers to a custom group (`addGroupMembers`).
+    pub async fn add_group_members(&self, group_uid: &str, members: &[String]) -> Result<()> {
+        crate::add_group_members(self.require_user()?, group_uid, members, self.store.clone(), self.mutable.as_ref()).await
+    }
+
+    /// Remove a member from a custom group (`removeGroupMember`); see
+    /// [`crate::remove_group_member`] for what `revoke_shared` does.
+    pub async fn remove_group_member(&self, group_uid: &str, member: &str, revoke_shared: bool) -> Result<()> {
+        crate::remove_group_member(self.require_user()?, group_uid, member, revoke_shared, self.store.clone(), self.mutable.as_ref())
+            .await
+    }
+
+    /// Delete a custom group (`deleteGroup`); see [`crate::delete_group`].
+    pub async fn delete_group(&self, group_uid: &str, revoke_shared: bool, progress: impl FnMut()) -> Result<()> {
+        crate::delete_group(self.require_user()?, group_uid, revoke_shared, progress, self.store.clone(), self.mutable.as_ref())
+            .await
+    }
+
+    /// How many files and folders are shared with a group (`countSharedWithGroup`).
+    pub async fn count_shared_with_group(&self, group_uid: &str) -> Result<usize> {
+        crate::count_shared_with_group(self.require_user()?, group_uid, self.store.clone(), self.mutable.as_ref()).await
     }
 
     /// Change this account's password (`changePassword`). Re-derives the login key
@@ -1296,6 +1392,44 @@ impl UserContext {
     pub async fn approve_space_request(&self, instance: &peergos_multiformats::Cid, request: &crate::admin::LabelledSignedSpaceRequest) -> Result<bool> {
         let user = self.require_user()?;
         crate::admin::approve_space_request(user, instance, request, self.poster.as_ref()).await
+    }
+
+    /// Whether the signed-in user is an admin on the server we are connected to (`isAdmin`).
+    pub async fn is_admin(&self) -> Result<bool> {
+        crate::admin::is_admin(self.require_user()?, self.poster.as_ref()).await
+    }
+
+    /// Create `count` single use signup tokens (`createSignupTokens`), each of
+    /// which lets one new user sign up. Requires admin.
+    pub async fn create_signup_tokens(&self, count: u32) -> Result<Vec<String>> {
+        let user = self.require_user()?;
+        let instance = self.store.id().await?;
+        crate::admin::create_signup_tokens(user, &instance, count, self.poster.as_ref()).await
+    }
+
+    /// The signup tokens nobody has used yet (`listSignupTokens`). Requires admin.
+    pub async fn list_signup_tokens(&self) -> Result<Vec<String>> {
+        crate::admin::list_signup_tokens(self.require_user()?, self.poster.as_ref()).await
+    }
+
+    /// Withdraw an unused signup token (`revokeSignupToken`); whether there was one.
+    pub async fn revoke_signup_token(&self, token: &str) -> Result<bool> {
+        crate::admin::revoke_signup_token(self.require_user()?, token, self.poster.as_ref()).await
+    }
+
+    /// The latest release published under `/peergos/releases` if it is newer than
+    /// this server (`newerRelease`). Any failure is treated as no newer release.
+    pub async fn newer_release(&self) -> Option<crate::admin::Version> {
+        let current = crate::admin::Version::parse(&self.get_version_info().await.ok()?.version)?;
+        let releases = self.get_public_capability("/peergos/releases").await.ok()?;
+        let latest = crate::list_directory(&releases, self.store.clone(), self.mutable.as_ref())
+            .await
+            .ok()?
+            .into_iter()
+            .filter(|e| e.is_dir != Some(false))
+            .filter_map(|e| e.name.strip_prefix('v').and_then(crate::admin::Version::parse))
+            .max()?;
+        (current < latest).then_some(latest)
     }
 
     // ---- second-factor (MFA) management -----------------------------------

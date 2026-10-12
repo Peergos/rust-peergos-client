@@ -157,21 +157,38 @@ pub struct ProcessedCaps {
     pub read_cap_bytes: u64,
     pub write_cap_bytes: u64,
     pub groups: std::collections::BTreeMap<String, ProcessedCaps>,
+    /// The map key of the friend's sharing dir the byte offsets are into. They are
+    /// meaningless in any other, e.g. if they removed us and we became friends
+    /// again. Absent in state saved before this was recorded.
+    pub shared_dir: Option<Vec<u8>>,
 }
 
 impl ProcessedCaps {
+    fn is_for(&self, dir: &[u8]) -> bool {
+        self.shared_dir.as_deref() == Some(dir)
+    }
+
+    /// Start reading a new sharing dir from the beginning. Group offsets are into
+    /// the groups' own dirs so are kept.
+    fn restarted_for(&self, dir: &[u8]) -> ProcessedCaps {
+        ProcessedCaps { groups: self.groups.clone(), shared_dir: Some(dir.to_vec()), ..ProcessedCaps::default() }
+    }
+
     pub(crate) fn to_cbor(&self) -> CborObject {
         let mut g = CborObject::map();
         for (name, pc) in &self.groups {
             g = g.put(name, pc.to_cbor());
         }
-        CborObject::map()
+        let m = CborObject::map()
             .put("rc", CborObject::Long(self.read_caps as i64))
             .put("wc", CborObject::Long(self.write_caps as i64))
             .put("rb", CborObject::Long(self.read_cap_bytes as i64))
             .put("wb", CborObject::Long(self.write_cap_bytes as i64))
-            .put("g", g.build())
-            .build()
+            .put("g", g.build());
+        match &self.shared_dir {
+            Some(d) => m.put("d", CborObject::ByteString(d.clone())).build(),
+            None => m.build(),
+        }
     }
 
     pub(crate) fn from_cbor(cbor: &CborObject) -> Result<ProcessedCaps> {
@@ -188,6 +205,7 @@ impl ProcessedCaps {
             read_cap_bytes: get("rb"),
             write_cap_bytes: get("wb"),
             groups,
+            shared_dir: cbor.get("d").and_then(|c| c.as_bytes()).map(|b| b.to_vec()),
         })
     }
 }
@@ -292,15 +310,50 @@ impl IncomingCapCache {
         Ok(())
     }
 
-    async fn read_processed(&self, friend: &str) -> Result<ProcessedCaps> {
+    /// Our progress through a friend's sharing dirs, and when we last recorded it.
+    async fn read_processed(&self, friend: &str) -> Result<(ProcessedCaps, Option<i64>)> {
         let name = format!("{friend}{FRIEND_STATE_SUFFIX}");
         match self.find_child(&self.cache_root, &name).await? {
             Some(cap) => {
-                let bytes = crate::read_file(&cap, self.store.clone(), self.mutable.as_ref()).await?.1;
-                ProcessedCaps::from_cbor(&CborObject::from_bytes(&bytes)?)
+                let (props, bytes) = crate::read_file(&cap, self.store.clone(), self.mutable.as_ref()).await?;
+                Ok((ProcessedCaps::from_cbor(&CborObject::from_bytes(&bytes)?)?, Some(props.modified_epoch)))
             }
-            None => Ok(ProcessedCaps::default()),
+            None => Ok((ProcessedCaps::default(), None)),
         }
+    }
+
+    /// Where to continue reading a friend's sharing dir from. If it has been
+    /// replaced, e.g. they removed us and we became friends again, our offsets into
+    /// the old one are meaningless, so start again.
+    async fn start_for(
+        &self,
+        current: &ProcessedCaps,
+        shared_dir: &AbsoluteCapability,
+        last_progress: Option<i64>,
+    ) -> Result<ProcessedCaps> {
+        let dir_id = &shared_dir.map_key;
+        if current.shared_dir.is_some() {
+            return Ok(if current.is_for(dir_id) { current.clone() } else { current.restarted_for(dir_id) });
+        }
+        // Saved before we recorded which dir. It was replaced if it was created after
+        // we last made progress, or we've read past its end. Starting again
+        // unnecessarily, e.g. from clock skew, only costs re-reading it.
+        let created = crate::retrieve_file_metadata(shared_dir, self.store.clone(), self.mutable.as_ref()).await?.1.created_epoch;
+        if last_progress.is_some_and(|t| t < created) {
+            return Ok(current.restarted_for(dir_id));
+        }
+        let entries = crate::list_directory(shared_dir, self.store.clone(), self.mutable.as_ref()).await?;
+        let size_of = |name: &str| entries.iter().find(|e| e.name == name).map(|e| e.cap.clone());
+        let mut sizes = [0u64; 2];
+        for (i, name) in ["sharing.r", "sharing.w"].iter().enumerate() {
+            if let Some(cap) = size_of(name) {
+                sizes[i] = crate::retrieve_file_metadata(&cap, self.store.clone(), self.mutable.as_ref()).await?.1.size;
+            }
+        }
+        if current.read_cap_bytes > sizes[0] || current.write_cap_bytes > sizes[1] {
+            return Ok(current.restarted_for(dir_id));
+        }
+        Ok(ProcessedCaps { shared_dir: Some(dir_id.clone()), ..current.clone() })
     }
 
     async fn write_processed(&self, friend: &str, state: &ProcessedCaps) -> Result<()> {
@@ -366,7 +419,8 @@ impl IncomingCapCache {
             }
         }
 
-        let current = self.read_processed(friend).await?;
+        let (saved, last_progress) = self.read_processed(friend).await?;
+        let current = self.start_for(&saved, friend_shared_dir, last_progress).await?;
         let mut updated = current.clone();
         let mut content = Vec::new();
         // Known group directories: persisted + explicitly supplied.
@@ -404,6 +458,7 @@ impl IncomingCapCache {
                     read_cap_bytes: g_read_bytes,
                     write_cap_bytes: g_write_bytes,
                     groups: g_current.groups,
+                    shared_dir: g_current.shared_dir,
                 },
             );
             content.append(&mut g_caps);

@@ -23,6 +23,30 @@ fn signed_now(secret: &peergos_core::keys::SecretSigningKey) -> Result<String> {
     Ok(to_hex(&secret.sign_message(&CborObject::Long(now_millis()).to_bytes())?))
 }
 
+/// A `TimeLimitedClient.SignedRequest` for `ADMIN_URL + endpoint`.
+fn signed_request(secret: &peergos_core::keys::SecretSigningKey, endpoint: &str) -> Result<String> {
+    let req = CborObject::map()
+        .put("p", CborObject::Str(format!("{ADMIN_URL}{endpoint}")))
+        .put("t", CborObject::Long(now_millis()))
+        .build();
+    Ok(to_hex(&secret.sign_message(&req.to_bytes())?))
+}
+
+fn parse_bool(res: &[u8]) -> Result<bool> {
+    CborObject::from_bytes(res)?
+        .as_bool()
+        .ok_or_else(|| Error::Protocol("expected a boolean response".into()))
+}
+
+fn parse_strings(res: &[u8]) -> Result<Vec<String>> {
+    CborObject::from_bytes(res)?
+        .as_list()
+        .ok_or_else(|| Error::Protocol("expected a CBOR list".into()))?
+        .iter()
+        .map(|c| c.as_string().map(str::to_string).ok_or_else(|| Error::Protocol("expected a string".into())))
+        .collect()
+}
+
 // ---- types ----------------------------------------------------------------
 
 /// A pending space request from a user, mirroring `LabelledSignedSpaceRequest`.
@@ -148,4 +172,113 @@ pub async fn approve_space_request(
     CborObject::from_bytes(&res)?
         .as_bool()
         .ok_or_else(|| Error::Protocol("expected a boolean response".into()))
+}
+
+/// Whether the signed-in user is an admin on this server (`isadmin`). Only its
+/// owner may ask, so who the admins are stays hidden.
+pub async fn is_admin(user: &LoggedInUser, poster: &dyn HttpPoster) -> Result<bool> {
+    let auth = signed_request(&user.signer.secret, "isadmin")?;
+    let url = format!("{ADMIN_URL}isadmin?admin={}&auth={auth}", url_encode(&user.identity.to_string()));
+    parse_bool(&poster.get(&url).await?)
+}
+
+/// Create `count` single use signup tokens (`tokens`): each lets one new user sign
+/// up, even when the instance is not otherwise accepting signups.
+pub async fn create_signup_tokens(
+    admin: &LoggedInUser,
+    instance: &Cid,
+    count: u32,
+    poster: &dyn HttpPoster,
+) -> Result<Vec<String>> {
+    let auth = signed_request(&admin.signer.secret, "tokens")?;
+    let url = format!(
+        "{ADMIN_URL}tokens?admin={}&instance={}&auth={auth}&count={count}",
+        url_encode(&admin.identity.to_string()),
+        url_encode(&instance.to_string()),
+    );
+    parse_strings(&poster.get(&url).await?)
+}
+
+/// The signup tokens nobody has used yet (`listtokens`).
+pub async fn list_signup_tokens(admin: &LoggedInUser, poster: &dyn HttpPoster) -> Result<Vec<String>> {
+    let auth = signed_request(&admin.signer.secret, "listtokens")?;
+    let url = format!("{ADMIN_URL}listtokens?admin={}&auth={auth}", url_encode(&admin.identity.to_string()));
+    parse_strings(&poster.get(&url).await?)
+}
+
+/// Withdraw a signup token nobody has used yet (`revoketoken`). Returns whether
+/// there was such a token.
+pub async fn revoke_signup_token(admin: &LoggedInUser, token: &str, poster: &dyn HttpPoster) -> Result<bool> {
+    let auth = signed_request(&admin.signer.secret, &format!("revoketoken/{token}"))?;
+    let url = format!(
+        "{ADMIN_URL}revoketoken?admin={}&token={}&auth={auth}",
+        url_encode(&admin.identity.to_string()),
+        url_encode(token),
+    );
+    parse_bool(&poster.get(&url).await?)
+}
+
+/// A release version `major.minor.patch[-suffix]` (`Version`). A version with a
+/// suffix sorts before the same version without one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Version {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+    pub suffix: String,
+}
+
+impl Version {
+    pub fn parse(s: &str) -> Option<Version> {
+        let (core, suffix) = s.split_once('-').unwrap_or((s, ""));
+        let mut parts = core.split('.').map(|p| p.parse::<u32>().ok());
+        let (major, minor, patch) = (parts.next()??, parts.next()??, parts.next()??);
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(Version { major, minor, patch, suffix: suffix.to_string() })
+    }
+}
+
+impl Ord for Version {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.major, self.minor, self.patch).cmp(&(other.major, other.minor, other.patch)).then_with(|| {
+            if self.suffix.is_empty() || other.suffix.is_empty() {
+                other.suffix.len().cmp(&self.suffix.len())
+            } else {
+                self.suffix.cmp(&other.suffix)
+            }
+        })
+    }
+}
+
+impl PartialOrd for Version {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
+        if !self.suffix.is_empty() {
+            write!(f, "-{}", self.suffix)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Version;
+
+    #[test]
+    fn versions_order_numerically_with_suffixes_first() {
+        let v = |s| Version::parse(s).unwrap();
+        assert!(v("1.9.0") < v("1.10.0"));
+        assert!(v("1.38.0-rc1") < v("1.38.0"));
+        assert!(v("1.38.0-a") < v("1.38.0-b"));
+        assert_eq!(v("1.2.3-x").to_string(), "1.2.3-x");
+        assert!(Version::parse("1.2").is_none());
+    }
 }

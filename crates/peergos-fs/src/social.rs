@@ -126,6 +126,10 @@ fn url_encode(s: &str) -> String {
 /// `sendFollowRequest`: grant `target_username` read access to our sharing folder
 /// for them and post an (encrypted) follow request. `reciprocate` includes a
 /// random key inviting them to also share with us (like `sendInitialFollowRequest`).
+///
+/// The request is recorded as pending before it is sent, otherwise their reply
+/// can't be recognised. If anything fails, what this call added is rolled back so
+/// the request can be tried again.
 pub async fn send_follow_request(
     user: &LoggedInUser,
     target_username: &str,
@@ -134,29 +138,111 @@ pub async fn send_follow_request(
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<bool> {
+    if target_username == user.username {
+        return Ok(false);
+    }
+    // following someone who doesn't follow us, e.g. after they removed us, is when a
+    // request asks them to follow back
+    let following = get_following(user, store.clone(), mutable).await?;
+    let followers = get_follower_names(user, store.clone(), mutable).await?;
+    if following.iter().any(|f| f == target_username) && followers.iter().any(|f| f == target_username) {
+        return Err(Error::Protocol(format!("You are already friends with {target_username}")));
+    }
+    // asking to follow someone we have unfollowed means we want to follow them
+    // again, but a block has to be undone explicitly
+    follow_again(user, target_username, store.clone(), mutable).await?;
     let (target_identity, target_boxer) =
         get_public_keys(poster, store.as_ref(), mutable, target_username).await?;
 
-    // Create /username/shared/<target> and take a read-only cap to it. The signer
-    // comes from the home entry point (subdirs share its writer, holding no link
-    // of their own).
     let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
     let signer = recover_signer(home, store.clone(), mutable).await?;
     let sharing = sharing_folder(user, store.clone(), mutable).await?;
-    let friend_root = get_or_mkdir(&sharing, target_username, &signer, user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
+    let dir_existed = has_child(&sharing, target_username, store.clone(), mutable).await?;
+    let pending: BTreeSet<String> = get_pending_outgoing(user, store.clone(), mutable).await?.into_iter().collect();
+    let was_pending = pending.contains(target_username);
 
-    let entry = EntryPoint { pointer: friend_root.read_only(), owner_name: user.username.clone() };
-    let requested_key =
-        if reciprocate { Some(SymmetricKey::new(peergos_crypto::random_bytes(32), false)?) } else { None };
-
-    // FollowRequest cbor: {e: entry, k: requestedKey?}
-    let mut fr = CborObject::map().put("e", entry.to_cbor());
-    if let Some(k) = &requested_key {
-        fr = fr.put("k", k.to_cbor());
+    let attempt = async {
+        let friend_root =
+            get_or_mkdir(&sharing, target_username, &signer, user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
+        let entry = EntryPoint { pointer: friend_root.read_only(), owner_name: user.username.clone() };
+        let requested_key =
+            if reciprocate { Some(SymmetricKey::new(peergos_crypto::random_bytes(32), false)?) } else { None };
+        // FollowRequest cbor: {e: entry, k: requestedKey?}
+        let mut fr = CborObject::map().put("e", entry.to_cbor());
+        if let Some(k) = &requested_key {
+            fr = fr.put("k", k.to_cbor());
+        }
+        let follow_request = fr.build();
+        let mut updated = pending.clone();
+        updated.insert(target_username.to_string());
+        write_pending_outgoing(user, &updated, store.clone(), mutable).await?;
+        // a request that reached them but whose response was lost is harmless to
+        // resend, whereas rolling back our pending state would leave their reply
+        // unrecognised
+        let mut attempts = 3;
+        loop {
+            match blind_and_send(&target_identity, &target_boxer, &follow_request, poster).await {
+                Ok(sent) => return Ok(sent),
+                Err(e) if attempts <= 1 => return Err(e),
+                Err(_) => attempts -= 1,
+            }
+        }
     }
-    let follow_request = fr.build();
+    .await;
+    match attempt {
+        Ok(sent) => Ok(sent),
+        Err(e) => {
+            // an earlier request to them may still be answered, so leave its state alone
+            if !was_pending {
+                if let Err(re) = rollback_follow_request(user, target_username, !dir_existed, store, mutable).await {
+                    log::warn!("Couldn't roll back follow request to {target_username}: {re}");
+                }
+            }
+            Err(e)
+        }
+    }
+}
 
-    blind_and_send(&target_identity, &target_boxer, &follow_request, poster).await
+/// Pending is cleared before the dir is removed, so a failure in between leaves
+/// them looking like a follower until the request is resent, rather than pending
+/// with no dir.
+async fn rollback_follow_request(
+    user: &LoggedInUser,
+    target_username: &str,
+    remove_dir: bool,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    remove_from_pending_outgoing(user, target_username, store.clone(), mutable).await?;
+    if remove_dir {
+        delete_shared_child(user, target_username, store, mutable).await?;
+    }
+    Ok(())
+}
+
+async fn has_child(
+    dir: &AbsoluteCapability,
+    name: &str,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<bool> {
+    Ok(list_directory(dir, store, mutable).await?.iter().any(|e| e.name == name))
+}
+
+/// Delete `/username/shared/<name>` if present.
+async fn delete_shared_child(
+    user: &LoggedInUser,
+    name: &str,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let sharing = sharing_folder(user, store.clone(), mutable).await?;
+    if !has_child(&sharing, name, store.clone(), mutable).await? {
+        return Ok(());
+    }
+    let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
+    let signer = recover_signer(home, store.clone(), mutable).await?;
+    crate::delete_child(&sharing, name, Some(signer), user.mirror_bat_id().as_ref(), store, mutable).await
 }
 
 /// `blindAndSendFollowRequest`: wrap + encrypt a follow request to the target and
@@ -286,7 +372,11 @@ async fn persist_friend_entry_point(
         Some(e) => crate::read_file(&e.cap, store.clone(), mutable).await?.1,
         None => Vec::new(),
     };
-    contents.extend_from_slice(&entry.to_cbor().to_bytes());
+    let raw = entry.to_cbor().to_bytes();
+    if get_friends(user, store.clone(), mutable).await?.iter().any(|e| e.to_cbor().to_bytes() == raw) {
+        return Ok(());
+    }
+    contents.extend_from_slice(&raw);
     crate::upload_file_hidden(home, FROM_FRIENDS_FILE, &contents, None, Some(signer), user.mirror_bat_id().as_ref(), store, mutable).await?;
     Ok(())
 }
@@ -295,22 +385,55 @@ async fn persist_friend_entry_point(
 /// a read cap to a friend's `/friend/shared/<us>` folder. Persisted across logins.
 const SHARED_DIR: &str = "shared";
 const SOCIAL_STATE_FILE: &str = ".social-state.cbor";
-const BLOCKED_USERNAMES_FILE: &str = ".blocked-usernames.txt";
+/// Who we have unfollowed. The name predates blocking, when this was all a block was.
+const UNFOLLOWED_USERNAMES_FILE: &str = ".blocked-usernames.txt";
+const BLOCKED_USERS_FILE: &str = ".blocked-users.cbor";
+/// A follower's sharing dir is renamed to this prefix + their name while removing them.
+const REMOVING_FOLLOWER_PREFIX: &str = ".removing-";
 const FRIEND_ANNOTATIONS_FILE: &str = ".annotations";
 
-/// A snapshot of the user's social state (`getSocialState`). Populated from the
-/// pieces the Rust client tracks; Java additionally carries follower/following
-/// FileWrapper roots, friend annotations and group-name mappings, which this does
-/// not.
+/// A snapshot of the user's social state (`getSocialState`).
 #[derive(Debug, Clone)]
 pub struct SocialState {
+    /// Follow requests still to be answered; replies to ours are already processed.
     pub pending_incoming_requests: Vec<ReceivedFollowRequest>,
     pub pending_outgoing: Vec<String>,
     pub following: Vec<String>,
     pub followers: Vec<String>,
+    /// Who we never see anything from, even via someone else.
     pub blocked: Vec<String>,
+    /// Who we don't see directly, though they may still follow us.
+    pub unfollowed: Vec<String>,
     /// The friend/following entry-point roots (kept for navigation).
     pub friends: Vec<EntryPoint>,
+    /// Group uid → name, built-in and custom.
+    pub groups: BTreeMap<String, String>,
+}
+
+impl SocialState {
+    /// Mutual friends: those we follow who also follow us.
+    pub fn friend_names(&self) -> Vec<String> {
+        self.following.iter().filter(|f| self.followers.contains(f)).cloned().collect()
+    }
+
+    pub fn group_uid(&self, name: &str) -> Option<String> {
+        group_name_to_uid(&self.groups, name)
+    }
+
+    /// The built-in groups first, then custom groups ordered by name (`getGroupUids`).
+    pub fn group_uids(&self) -> Vec<String> {
+        let builtin: Vec<String> = [FRIENDS_GROUP, FOLLOWERS_GROUP].iter().filter_map(|n| self.group_uid(n)).collect();
+        let mut custom: Vec<(&String, &String)> =
+            self.groups.iter().filter(|(uid, _)| !builtin.contains(uid)).collect();
+        custom.sort_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(b.0)));
+        builtin.into_iter().chain(custom.into_iter().map(|(uid, _)| uid.clone())).collect()
+    }
+}
+
+/// Names of custom groups need not be unique, so the smallest uid wins, and the
+/// built-in names are reserved for the built-in groups.
+fn group_name_to_uid(groups: &BTreeMap<String, String>, name: &str) -> Option<String> {
+    groups.iter().find(|(_, n)| n.as_str() == name).map(|(u, _)| u.clone())
 }
 
 /// Read a file named `name` in the user's home directory, if present.
@@ -327,14 +450,30 @@ async fn read_home_child(
     }
 }
 
-/// The usernames of the people the user follows (`getFollowing`) — the owner names
-/// of their friend roots.
+/// The usernames of the people the user follows (`getFollowing`) — the owners of
+/// the friend roots we can still retrieve, excluding anyone unfollowed or blocked.
 pub async fn get_following(
     user: &LoggedInUser,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<Vec<String>> {
-    Ok(get_friends(user, store, mutable).await?.into_iter().map(|e| e.owner_name).collect())
+    let hidden: BTreeSet<String> = get_unfollowed(user, store.clone(), mutable)
+        .await?
+        .into_iter()
+        .chain(get_blocked(user, store.clone(), mutable).await?)
+        .collect();
+    let mut names: Vec<String> = Vec::new();
+    for e in get_friends(user, store.clone(), mutable).await? {
+        if hidden.contains(&e.owner_name) || names.contains(&e.owner_name) {
+            continue;
+        }
+        // only a friend whose sharing dir for us can still be retrieved is followed
+        if crate::retrieve_file_metadata(&e.pointer, store.clone(), mutable).await.is_ok() {
+            names.push(e.owner_name);
+        }
+    }
+    names.sort();
+    Ok(names)
 }
 
 /// The usernames of the user's followers (`getFollowerNames`): the sub-directories
@@ -359,19 +498,39 @@ pub async fn get_follower_names(
         .collect())
 }
 
-/// The usernames the user has blocked (`getBlocked`) — the newline-separated
-/// `.blocked-usernames.txt` in home.
+/// The usernames we have unfollowed (`getUnfollowed`) — the newline-separated
+/// `.blocked-usernames.txt` in home. We don't see what they share with us
+/// directly, though they may still follow us.
+pub async fn get_unfollowed(
+    user: &LoggedInUser,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<Vec<String>> {
+    match read_home_child(user, UNFOLLOWED_USERNAMES_FILE, store, mutable).await? {
+        Some(bytes) => {
+            let mut names: Vec<String> =
+                String::from_utf8_lossy(&bytes).split('\n').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+            names.sort();
+            names.dedup();
+            Ok(names)
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The usernames we have blocked (`getBlocked`), from whom we never see anything,
+/// even via someone else — `.blocked-users.cbor` in home, `{v: 1, u: [names]}`.
 pub async fn get_blocked(
     user: &LoggedInUser,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<Vec<String>> {
-    match read_home_child(user, BLOCKED_USERNAMES_FILE, store, mutable).await? {
-        Some(bytes) => Ok(String::from_utf8_lossy(&bytes)
-            .split('\n')
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect()),
+    match read_home_child(user, BLOCKED_USERS_FILE, store, mutable).await? {
+        Some(bytes) => Ok(CborObject::from_bytes(&bytes)?
+            .get("u")
+            .and_then(|c| c.as_list())
+            .map(|l| l.iter().filter_map(|u| u.as_string().map(str::to_string)).collect())
+            .unwrap_or_default()),
         None => Ok(Vec::new()),
     }
 }
@@ -394,6 +553,31 @@ pub async fn get_pending_outgoing(
         }
         None => Ok(Vec::new()),
     }
+}
+
+async fn write_pending_outgoing(
+    user: &LoggedInUser,
+    pending: &BTreeSet<String>,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let cbor = CborObject::map()
+        .put("pendingOutgoing", CborObject::List(pending.iter().map(|u| CborObject::Str(u.clone())).collect()))
+        .build();
+    write_home_file(user, SOCIAL_STATE_FILE, &cbor.to_bytes(), store, mutable).await
+}
+
+async fn remove_from_pending_outgoing(
+    user: &LoggedInUser,
+    username: &str,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let mut pending: BTreeSet<String> = get_pending_outgoing(user, store.clone(), mutable).await?.into_iter().collect();
+    if !pending.remove(username) {
+        return Ok(());
+    }
+    write_pending_outgoing(user, &pending, store, mutable).await
 }
 
 /// The root of this user's shared-with records, `.capabilitycache/outbound/<user>`,
@@ -467,37 +651,137 @@ fn walk_outbound<'a>(
     })
 }
 
-/// Overwrite the blocked-usernames file with `blocked` (sorted, one per line).
-async fn write_blocked(
+async fn write_home_file(
+    user: &LoggedInUser,
+    name: &str,
+    content: &[u8],
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
+    let signer = recover_signer(home, store.clone(), mutable).await?;
+    crate::upload_file_hidden(home, name, content, None, Some(signer), user.mirror_bat_id().as_ref(), store, mutable).await?;
+    Ok(())
+}
+
+async fn write_unfollowed(
+    user: &LoggedInUser,
+    unfollowed: &BTreeSet<String>,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let content: String = unfollowed.iter().map(|u| format!("{u}\n")).collect();
+    write_home_file(user, UNFOLLOWED_USERNAMES_FILE, content.as_bytes(), store, mutable).await
+}
+
+async fn set_blocked(
     user: &LoggedInUser,
     blocked: &BTreeSet<String>,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<()> {
-    let content: String = blocked.iter().map(|u| format!("{u}\n")).collect();
-    let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
-    let signer = recover_signer(home, store.clone(), mutable).await?;
-    crate::upload_file_hidden(home, BLOCKED_USERNAMES_FILE, content.as_bytes(), None, Some(signer), user.mirror_bat_id().as_ref(), store, mutable).await?;
-    Ok(())
+    let cbor = CborObject::map()
+        .put("v", CborObject::Long(1))
+        .put("u", CborObject::List(blocked.iter().map(|u| CborObject::Str(u.clone())).collect()))
+        .build();
+    write_home_file(user, BLOCKED_USERS_FILE, &cbor.to_bytes(), store, mutable).await
 }
 
-/// Block `username`: add them to `.blocked-usernames.txt` in home so their shared
-/// entry points are no longer honoured. Idempotent.
+/// Stop seeing what `username` shares with us directly (`unfollow`). They may
+/// still follow us. Idempotent.
+pub async fn unfollow(
+    user: &LoggedInUser,
+    username: &str,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let mut unfollowed: BTreeSet<String> = get_unfollowed(user, store.clone(), mutable).await?.into_iter().collect();
+    if !unfollowed.insert(username.to_string()) {
+        return Ok(());
+    }
+    write_unfollowed(user, &unfollowed, store, mutable).await
+}
+
+async fn remove_from_unfollowed(
+    user: &LoggedInUser,
+    username: &str,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let mut unfollowed: BTreeSet<String> = get_unfollowed(user, store.clone(), mutable).await?.into_iter().collect();
+    if !unfollowed.remove(username) {
+        return Ok(());
+    }
+    write_unfollowed(user, &unfollowed, store, mutable).await
+}
+
+/// Start seeing what an unfollowed user shares with us directly again
+/// (`followAgain`). A blocked user has to be unblocked first.
+pub async fn follow_again(
+    user: &LoggedInUser,
+    username: &str,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    if get_blocked(user, store.clone(), mutable).await?.iter().any(|b| b == username) {
+        return Err(Error::Protocol(format!("User {username} is blocked, unblock them first")));
+    }
+    remove_from_unfollowed(user, username, store, mutable).await
+}
+
+/// Never see anything from `username`, even via someone else, and stop them
+/// following us (`block`). They are also unfollowed, so clients which predate
+/// blocking still stop showing what they share with us directly. The block is
+/// recorded first, so we stop seeing them even if the rest fails, and
+/// [`complete_blocks`] finishes the rest.
 pub async fn block(
     user: &LoggedInUser,
     username: &str,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<()> {
-    let mut blocked: BTreeSet<String> = get_blocked(user, store.clone(), mutable).await?.into_iter().collect();
-    if !blocked.insert(username.to_string()) {
-        return Ok(()); // already blocked
+    if username == user.username {
+        return Err(Error::Protocol("You can't block yourself".into()));
     }
-    write_blocked(user, &blocked, store, mutable).await
+    let mut blocked: BTreeSet<String> = get_blocked(user, store.clone(), mutable).await?.into_iter().collect();
+    if blocked.insert(username.to_string()) {
+        set_blocked(user, &blocked, store.clone(), mutable).await?;
+    }
+    unfollow(user, username, store.clone(), mutable).await?;
+    remove_from_pending_outgoing(user, username, store.clone(), mutable).await?;
+    revoke_follower(user, username, store, mutable).await
 }
 
-/// Unblock `username` (`unblock`): remove them from `.blocked-usernames.txt`. No-op
-/// if they weren't blocked (or there is no blocked file yet).
+/// Blocking takes several writes after the block itself is recorded, so finish
+/// any which were interrupted (`completeBlocks`).
+pub async fn complete_blocks(
+    user: &LoggedInUser,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let blocked = get_blocked(user, store.clone(), mutable).await?;
+    if blocked.is_empty() {
+        return Ok(());
+    }
+    let unfollowed = get_unfollowed(user, store.clone(), mutable).await?;
+    let dirs = follower_dirs(user, store.clone(), mutable).await?;
+    let pending = get_pending_outgoing(user, store.clone(), mutable).await?;
+    for u in &blocked {
+        if !unfollowed.contains(u) {
+            unfollow(user, u, store.clone(), mutable).await?;
+        }
+        if pending.contains(u) {
+            remove_from_pending_outgoing(user, u, store.clone(), mutable).await?;
+        }
+        if dirs.contains(u) {
+            revoke_follower(user, u, store.clone(), mutable).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Unblock `username` (`unblock`). They stay unfollowed, so we see what they
+/// share with us directly again only after [`follow_again`].
 pub async fn unblock(
     user: &LoggedInUser,
     username: &str,
@@ -506,21 +790,9 @@ pub async fn unblock(
 ) -> Result<()> {
     let mut blocked: BTreeSet<String> = get_blocked(user, store.clone(), mutable).await?.into_iter().collect();
     if !blocked.remove(username) {
-        return Ok(()); // not blocked
+        return Ok(());
     }
-    write_blocked(user, &blocked, store, mutable).await
-}
-
-/// Block `username` (`unfollow`): add them to `.blocked-usernames.txt` in home. This
-/// stops honouring their follow of us. (Java also removes their local entry-point
-/// mirror; that cleanup is not done here.)
-pub async fn unfollow(
-    user: &LoggedInUser,
-    username: &str,
-    store: Arc<dyn ContentAddressedStorage>,
-    mutable: &dyn MutablePointers,
-) -> Result<()> {
-    block(user, username, store, mutable).await
+    set_blocked(user, &blocked, store, mutable).await
 }
 
 /// A local annotation about a friend (`FriendAnnotation`): whether we have verified
@@ -632,10 +904,25 @@ pub async fn get_friends(
     Ok(entries)
 }
 
+fn is_null_cap(cap: &AbsoluteCapability) -> bool {
+    cap.map_key.iter().all(|b| *b == 0)
+}
+
+fn null_capability() -> Result<AbsoluteCapability> {
+    Ok(AbsoluteCapability {
+        owner: PublicKeyHash::identity(vec![0u8; 32])?,
+        writer: PublicKeyHash::identity(vec![0u8; 32])?,
+        map_key: vec![0u8; 32],
+        bat: None,
+        r_base_key: SymmetricKey::new(vec![0u8; 32], false)?,
+        w_base_key: None,
+    })
+}
+
 /// `sendReplyFollowRequest` (accept branch): accept an incoming follow request.
-/// Creates our sharing folder for them, sends back our entry point, persists
-/// their entry point (so we can read what they share with us) and removes the
-/// processed request. With `reciprocate`, the reply signals mutual friendship.
+/// Creates (or reuses) our sharing folder for them, adds them to our followers
+/// group, and sends back our entry point. With `reciprocate` we also follow them:
+/// they join our friends group and their entry point is persisted.
 pub async fn accept_follow_request(
     user: &LoggedInUser,
     request: &ReceivedFollowRequest,
@@ -644,53 +931,12 @@ pub async fn accept_follow_request(
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<()> {
-    let entry = request
-        .entry
-        .as_ref()
-        .ok_or_else(|| Error::Protocol("follow request has no entry point".into()))?;
-    let their_name = entry.owner_name.clone();
-    let (their_identity, their_boxer) =
-        get_public_keys(poster, store.as_ref(), mutable, &their_name).await?;
-
-    // Create /username/shared/<them> and grant them read access to it.
-    let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
-    let signer = recover_signer(home, store.clone(), mutable).await?;
-    let sharing = sharing_folder(user, store.clone(), mutable).await?;
-    let friend_root = get_or_mkdir(&sharing, &their_name, &signer, user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
-
-    // Reply with our entry point; if reciprocating, echo their read key.
-    let our_entry = EntryPoint { pointer: friend_root.read_only(), owner_name: user.username.clone() };
-    let mut reply = CborObject::map().put("e", our_entry.to_cbor());
-    if reciprocate {
-        reply = reply.put("k", entry.pointer.r_base_key.to_cbor());
-    }
-    blind_and_send(&their_identity, &their_boxer, &reply.build(), poster).await?;
-
-    // Persist their entry point only when reciprocating (mutual friendship), so we
-    // get read access to their shared files — matching Java's `sendReplyFollowRequest`
-    // which skips `addExternalEntryPoint` when `accept=true, reciprocate=false`.
-    if reciprocate {
-        persist_friend_entry_point(user, entry, store.clone(), mutable).await?;
-    }
-
-    // Add them to our followers group, and — if reciprocating (mutual friends) —
-    // our friends group, matching Java's accept flow. This shares each group's
-    // sharing directory with them, so anything we later share with those groups
-    // reaches them automatically (their cap cache auto-discovers the group dir).
-    add_member_to_group(user, FOLLOWERS_GROUP, &their_name, store.clone(), mutable).await?;
-    if reciprocate {
-        add_member_to_group(user, FRIENDS_GROUP, &their_name, store.clone(), mutable).await?;
-    }
-
-    // Remove the processed request from our inbox.
-    remove_follow_request(user, &request.raw_cipher, poster).await?;
-    Ok(())
+    reply_to_follow_request(user, request, true, reciprocate, poster, store, mutable).await
 }
 
-/// `sendReplyFollowRequest` with `accept=false`: send a rejection reply (null
-/// entry point) back to the requester.  If `reciprocate` is true the requester's
-/// read base key is echoed so they become a follower even though we didn't accept
-/// their request (Java's `accept=false, reciprocate=true` path).
+/// `sendReplyFollowRequest` with `accept=false`: they don't get to follow us. Any
+/// sharing dir we already have for them, e.g. from an earlier accept which failed
+/// part way, is revoked first. With `reciprocate` we still follow them.
 pub async fn reject_follow_request(
     user: &LoggedInUser,
     request: &ReceivedFollowRequest,
@@ -703,42 +949,84 @@ pub async fn reject_follow_request(
         .entry
         .as_ref()
         .ok_or_else(|| Error::Protocol("follow request has no entry point".into()))?;
+    revoke_follower(user, &entry.owner_name, store.clone(), mutable).await?;
+    reply_to_follow_request(user, request, false, reciprocate, poster, store, mutable).await
+}
+
+async fn reply_to_follow_request(
+    user: &LoggedInUser,
+    request: &ReceivedFollowRequest,
+    accept: bool,
+    reciprocate: bool,
+    poster: &dyn HttpPoster,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let entry = request
+        .entry
+        .as_ref()
+        .ok_or_else(|| Error::Protocol("follow request has no entry point".into()))?;
     let their_name = entry.owner_name.clone();
     let (their_identity, their_boxer) =
         get_public_keys(poster, store.as_ref(), mutable, &their_name).await?;
 
-    // Null capability: all-zero identity, map_key, and r_base_key.
-    let null_hash = PublicKeyHash::identity(vec![0u8; 32])?;
-    let null_key = SymmetricKey::new(vec![0u8; 32], false)?;
-    let null_cap = AbsoluteCapability {
-        owner: null_hash,
-        writer: PublicKeyHash::identity(vec![0u8; 32])?,
-        map_key: vec![0u8; 32],
-        bat: None,
-        r_base_key: null_key,
-        w_base_key: None,
+    let our_cap = if accept {
+        let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
+        let signer = recover_signer(home, store.clone(), mutable).await?;
+        let sharing = sharing_folder(user, store.clone(), mutable).await?;
+        // an existing sharing dir for them keeps its keys
+        let friend_root =
+            get_or_mkdir(&sharing, &their_name, &signer, user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
+        add_member_to_group(user, FOLLOWERS_GROUP, &their_name, store.clone(), mutable).await?;
+        friend_root.read_only()
+    } else {
+        null_capability()?
     };
-    let null_entry = EntryPoint { pointer: null_cap.clone(), owner_name: user.username.clone() };
-
-    let mut reply = CborObject::map().put("e", null_entry.to_cbor());
+    let our_entry = EntryPoint { pointer: our_cap, owner_name: user.username.clone() };
+    let mut reply = CborObject::map().put("e", our_entry.to_cbor());
     if reciprocate {
         reply = reply.put("k", entry.pointer.r_base_key.to_cbor());
     }
+    if accept && reciprocate {
+        add_member_to_group(user, FRIENDS_GROUP, &their_name, store.clone(), mutable).await?;
+    }
     blind_and_send(&their_identity, &their_boxer, &reply.build(), poster).await?;
 
-    // If reciprocating, persist the requester's entry point so we can see their
-    // shared files (Java's `addExternalEntryPoint` + `retrieveAndAddEntryPointToTrie`).
     if reciprocate {
+        // following them back undoes having unfollowed them, otherwise we still
+        // wouldn't see them
+        remove_from_unfollowed(user, &their_name, store.clone(), mutable).await?;
         persist_friend_entry_point(user, entry, store.clone(), mutable).await?;
-        add_member_to_group(user, FOLLOWERS_GROUP, &their_name, store.clone(), mutable).await?;
     }
-
     remove_follow_request(user, &request.raw_cipher, poster).await?;
     Ok(())
 }
 
-/// Process a reply to one of our outgoing follow requests: persist the sender's
-/// entry point and remove the request. (The reply needs no further response.)
+/// Answer a request from an existing mutual friend (`reaffirmFollowRequest`). They
+/// already have everything an accept would give them, so only send the reply,
+/// which also means nothing accumulates if it has to be retried.
+async fn reaffirm_follow_request(
+    user: &LoggedInUser,
+    request: &ReceivedFollowRequest,
+    our_dir_for_them: &AbsoluteCapability,
+    poster: &dyn HttpPoster,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let theirs = request.entry.as_ref().ok_or_else(|| Error::Protocol("follow request has no entry point".into()))?;
+    let ours = EntryPoint { pointer: our_dir_for_them.read_only(), owner_name: user.username.clone() };
+    let reply = CborObject::map().put("e", ours.to_cbor()).put("k", theirs.pointer.r_base_key.to_cbor()).build();
+    let (their_identity, their_boxer) = get_public_keys(poster, store.as_ref(), mutable, &theirs.owner_name).await?;
+    blind_and_send(&their_identity, &their_boxer, &reply, poster).await?;
+    remove_follow_request(user, &request.raw_cipher, poster).await?;
+    Ok(())
+}
+
+/// Process a reply to one of our outgoing follow requests. If they don't follow
+/// us back (no key) they are fully revoked as a follower; if they follow us but
+/// didn't let us follow them (null entry point) they join our followers group;
+/// otherwise they join our followers and friends groups. Any entry point they
+/// gave us is persisted, and the reply is removed.
 pub async fn process_follow_reply(
     user: &LoggedInUser,
     request: &ReceivedFollowRequest,
@@ -746,27 +1034,133 @@ pub async fn process_follow_reply(
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<()> {
-    if let Some(entry) = &request.entry {
-        let their_name = entry.owner_name.clone();
-        let is_self = their_name == user.username;
-        // A rejection sends a null capability.
-        let accepted = !entry.pointer.map_key.iter().all(|b| *b == 0);
-        if !is_self && accepted {
-            persist_friend_entry_point(user, entry, store.clone(), mutable).await?;
+    let entry = match &request.entry {
+        Some(e) if e.owner_name != user.username => e,
+        // ignore responses claiming to be owned by us
+        _ => {
+            remove_follow_request(user, &request.raw_cipher, poster).await?;
+            return Ok(());
         }
-        // If they reciprocated (they now follow us — the reply carries a key), add
-        // them to our followers group, and to our friends group too if they also
-        // accepted (mutual). Matches Java's reply handling, so anything we share
-        // with those groups reaches them.
-        if !is_self && request.key.is_some() {
-            add_member_to_group(user, FOLLOWERS_GROUP, &their_name, store.clone(), mutable).await?;
-            if accepted {
-                add_member_to_group(user, FRIENDS_GROUP, &their_name, store.clone(), mutable).await?;
-            }
-        }
+    };
+    let their_name = entry.owner_name.clone();
+    if request.key.is_none() {
+        // They don't follow us. They may already have been a follower, using the same
+        // dir, so revoke them fully rather than only removing the dir.
+        revoke_follower(user, &their_name, store.clone(), mutable).await?;
+        remove_from_pending_outgoing(user, &their_name, store.clone(), mutable).await?;
+    } else if is_null_cap(&entry.pointer) {
+        // they follow us, but we can't follow them
+        add_member_to_group(user, FOLLOWERS_GROUP, &their_name, store.clone(), mutable).await?;
+        remove_follow_request(user, &request.raw_cipher, poster).await?;
+        return Ok(());
+    } else {
+        add_member_to_group(user, FOLLOWERS_GROUP, &their_name, store.clone(), mutable).await?;
+        add_member_to_group(user, FRIENDS_GROUP, &their_name, store.clone(), mutable).await?;
+    }
+    if !is_null_cap(&entry.pointer) {
+        persist_friend_entry_point(user, entry, store.clone(), mutable).await?;
+        remove_from_pending_outgoing(user, &their_name, store.clone(), mutable).await?;
     }
     remove_follow_request(user, &request.raw_cipher, poster).await?;
     Ok(())
+}
+
+/// Fetch our follow requests and act on everything that doesn't need the user
+/// (`processFollowRequests`), returning the initial requests still to be answered.
+///
+/// Requests are classified by message content where possible rather than by our
+/// local state alone, because a failure part way through sending or replying
+/// leaves that state half updated: replies to our pending requests are processed
+/// (only the latest from each sender), requests from blocked users are denied,
+/// requests from existing mutual friends are answered, and duplicates and replies
+/// we are no longer waiting for are removed from the server.
+pub async fn process_follow_requests(
+    user: &LoggedInUser,
+    poster: &dyn HttpPoster,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<Vec<ReceivedFollowRequest>> {
+    let all = get_follow_requests(user, poster).await?;
+    if all.is_empty() {
+        return Ok(all);
+    }
+    let sharing = sharing_folder(user, store.clone(), mutable).await?;
+    let follower_roots: BTreeMap<String, AbsoluteCapability> = list_directory(&sharing, store.clone(), mutable)
+        .await?
+        .into_iter()
+        .filter(|e| !e.name.starts_with('.'))
+        .map(|e| (e.name, e.cap))
+        .collect();
+    let pending: BTreeSet<String> = get_pending_outgoing(user, store.clone(), mutable).await?.into_iter().collect();
+    let blocked: BTreeSet<String> = get_blocked(user, store.clone(), mutable).await?.into_iter().collect();
+    let following: BTreeSet<String> = get_following(user, store.clone(), mutable).await?.into_iter().collect();
+
+    let mut latest_replies: Vec<(String, ReceivedFollowRequest)> = Vec::new();
+    let mut initial: Vec<(String, ReceivedFollowRequest)> = Vec::new();
+    let mut to_discard = Vec::new();
+    let mut to_reaffirm = Vec::new();
+    let mut to_reject = Vec::new();
+    for p in all {
+        let Some(entry) = &p.entry else {
+            to_discard.push(p);
+            continue;
+        };
+        let from = entry.owner_name.clone();
+        let reply_shaped = p.key.is_none() || is_null_cap(&entry.pointer);
+        if blocked.contains(&from) {
+            // Deny a request, like any other, so they aren't left waiting. A reply to an
+            // earlier request of ours has nothing to answer.
+            if reply_shaped { to_discard.push(p) } else { to_reject.push(p) }
+            continue;
+        }
+        if pending.contains(&from) {
+            // they may have replied more than once, e.g. rejecting after an accept failed part way
+            match latest_replies.iter_mut().find(|(n, _)| *n == from) {
+                Some((_, earlier)) => to_discard.push(std::mem::replace(earlier, p)),
+                None => latest_replies.push((from, p)),
+            }
+            continue;
+        }
+        // an initial request always has a key and an entry point, so this is an
+        // unauthenticated reply to a request we are no longer waiting on
+        if reply_shaped {
+            to_discard.push(p);
+            continue;
+        }
+        // They are waiting on a reply, e.g. after unfollowing and asking again.
+        if follower_roots.contains_key(&from) && following.contains(&from) {
+            to_reaffirm.push(p);
+            continue;
+        }
+        // A request from someone we already have a sharing dir for is still surfaced,
+        // so that a reply which failed part way can be completed.
+        match initial.iter_mut().find(|(n, _)| *n == from) {
+            Some((_, earlier)) => to_discard.push(std::mem::replace(earlier, p)),
+            None => initial.push((from, p)),
+        }
+    }
+    for p in to_discard {
+        if let Err(e) = remove_follow_request(user, &p.raw_cipher, poster).await {
+            log::warn!("Couldn't remove follow request: {e}");
+        }
+    }
+    for p in to_reject {
+        if let Err(e) = reply_to_follow_request(user, &p, false, false, poster, store.clone(), mutable).await {
+            log::warn!("Couldn't deny follow request: {e}");
+        }
+    }
+    for p in to_reaffirm {
+        let from = p.sender().unwrap_or_default().to_string();
+        if let Err(e) = reaffirm_follow_request(user, &p, &follower_roots[&from], poster, store.clone(), mutable).await {
+            log::warn!("Couldn't answer follow request from {from}: {e}");
+        }
+    }
+    for (from, p) in latest_replies {
+        if let Err(e) = process_follow_reply(user, &p, poster, store.clone(), mutable).await {
+            log::warn!("Couldn't process follow reply from {from}: {e}");
+        }
+    }
+    Ok(initial.into_iter().map(|(_, p)| p).collect())
 }
 
 /// The capability-store file holding read shares (`CapabilityStore.READ_SHARING_FILE_NAME`).
@@ -1569,7 +1963,25 @@ pub async fn get_shared_with(
 /// from `revoked_users`. Rotates the child's symmetric keys (invalidating the
 /// revoked users' cached capabilities and deleting the old content), updates the
 /// shared-with cache, and reshares the new capability to the remaining readers.
+///
+/// Revoking a group also revokes its members who were shared with individually.
 pub async fn unshare_read_access(
+    user: &LoggedInUser,
+    parent_path: &str,
+    parent_cap: &AbsoluteCapability,
+    child_name: &str,
+    revoked_users: &[String],
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let file_path = join_path(parent_path, child_name);
+    let current: BTreeSet<String> =
+        get_shared_with(user, &file_path, Access::Read, store.clone(), mutable).await?.into_iter().collect();
+    let revoked = expand_groups_to_unshare(user, &current, revoked_users, store.clone(), mutable).await?;
+    unshare_read_exactly(user, parent_path, parent_cap, child_name, &revoked, store, mutable).await
+}
+
+async fn unshare_read_exactly(
     user: &LoggedInUser,
     parent_path: &str,
     parent_cap: &AbsoluteCapability,
@@ -1622,7 +2034,25 @@ pub async fn unshare_read_access(
 /// subspace (deleting the old one and deauthorising the old writer), updates the
 /// shared-with cache, and reshares the new writable capability to the remaining
 /// writers (and the readable capability to any remaining readers).
+///
+/// Revoking a group also revokes its members who were shared with individually.
 pub async fn unshare_write_access(
+    user: &LoggedInUser,
+    parent_path: &str,
+    parent_cap: &AbsoluteCapability,
+    child_name: &str,
+    revoked_users: &[String],
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let file_path = join_path(parent_path, child_name);
+    let current: BTreeSet<String> =
+        get_shared_with(user, &file_path, Access::Write, store.clone(), mutable).await?.into_iter().collect();
+    let revoked = expand_groups_to_unshare(user, &current, revoked_users, store.clone(), mutable).await?;
+    unshare_write_exactly(user, parent_path, parent_cap, child_name, &revoked, store, mutable).await
+}
+
+async fn unshare_write_exactly(
     user: &LoggedInUser,
     parent_path: &str,
     parent_cap: &AbsoluteCapability,
@@ -1767,21 +2197,6 @@ pub async fn group_uid(
     Ok(get_or_create_groups(user, store, mutable).await?.uid_for(group_name))
 }
 
-/// Resolve a group's sharing-directory capability (`/username/shared/<uid>`).
-async fn group_dir(
-    user: &LoggedInUser,
-    group_name: &str,
-    store: Arc<dyn ContentAddressedStorage>,
-    mutable: &dyn MutablePointers,
-) -> Result<AbsoluteCapability> {
-    let groups = get_or_create_groups(user, store.clone(), mutable).await?;
-    let uid = groups.uid_for(group_name).ok_or_else(|| Error::Protocol(format!("no such group: {group_name}")))?;
-    let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
-    let signer = recover_signer(home, store.clone(), mutable).await?;
-    let sharing = sharing_folder(user, store.clone(), mutable).await?;
-    get_or_mkdir(&sharing, &uid, &signer, user.mirror_bat_id().as_ref(), store, mutable).await
-}
-
 /// Add `member` to the named group: grant them read access to the group's sharing
 /// directory, so they receive everything shared with the group (the group half of
 /// accepting a follower/friend, and Java's `addToGroup`).
@@ -1792,9 +2207,10 @@ pub async fn add_member_to_group(
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<()> {
-    let dir = group_dir(user, group_name, store.clone(), mutable).await?;
-    // The member must have an accepted follow (a sharing folder) with us already.
-    append_cap_to_friend(user, member, READ_SHARING_FILE, &dir.read_only(), store, mutable).await
+    let uid = group_uid(user, group_name, store.clone(), mutable)
+        .await?
+        .ok_or_else(|| Error::Protocol(format!("no such group: {group_name}")))?;
+    add_members_to_group(user, &uid, &[member.to_string()], store, mutable).await
 }
 
 /// Share read access to the item at home-relative `item_path` with everyone in the
@@ -1834,6 +2250,539 @@ pub async fn share_write_with_group(
         .await?
         .ok_or_else(|| Error::Protocol(format!("no such group: {group_name}")))?;
     share_write_access(user, parent_path, parent_cap, child_name, &uid, store, mutable).await
+}
+
+// ---------------------------------------------------------------------------
+// Group membership, custom groups and follower revocation
+// ---------------------------------------------------------------------------
+
+fn group_path(uid: &str) -> String {
+    format!("{SHARED_DIR}/{uid}")
+}
+
+/// Whether `name` is reserved for a built-in group (`Groups.isBuiltInName`).
+pub fn is_built_in_group_name(name: &str) -> bool {
+    name == FRIENDS_GROUP || name == FOLLOWERS_GROUP
+}
+
+async fn set_groups(
+    user: &LoggedInUser,
+    groups: &Groups,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
+    let signer = recover_signer(home, store.clone(), mutable).await?;
+    let sharing = sharing_folder(user, store.clone(), mutable).await?;
+    crate::upload_file(&sharing, GROUPS_FILE, &groups.to_cbor().to_bytes(), None, Some(signer), user.mirror_bat_id().as_ref(), store, mutable)
+        .await?;
+    Ok(())
+}
+
+/// The capability for the home-relative `path`, following link nodes to their
+/// targets, as navigating the filesystem does.
+async fn resolve_home_path(
+    user: &LoggedInUser,
+    path: &str,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<Option<AbsoluteCapability>> {
+    let mut cur = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?.clone();
+    for comp in path.split('/').filter(|c| !c.is_empty()) {
+        let Some(e) = list_directory(&cur, store.clone(), mutable).await?.into_iter().find(|e| e.name == comp) else {
+            return Ok(None);
+        };
+        let props = crate::retrieve_file_metadata(&e.cap, store.clone(), mutable).await?.1;
+        cur = if props.is_link {
+            list_directory(&e.cap, store.clone(), mutable)
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::Protocol("link node has no target".into()))?
+                .cap
+        } else {
+            e.cap
+        };
+    }
+    Ok(Some(cur))
+}
+
+fn parent_and_name(path: &str) -> (String, String) {
+    let trimmed = path.trim_matches('/');
+    match trimmed.rsplit_once('/') {
+        Some((p, n)) => (p.to_string(), n.to_string()),
+        None => (String::new(), trimmed.to_string()),
+    }
+}
+
+/// Revoke read access to the home-relative `path` from exactly `revoked`, which
+/// may include group uids, without expanding groups.
+async fn unshare_read_path(
+    user: &LoggedInUser,
+    path: &str,
+    revoked: &[String],
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let (parent_path, name) = parent_and_name(path);
+    let parent = resolve_home_path(user, &parent_path, store.clone(), mutable)
+        .await?
+        .ok_or_else(|| Error::Protocol(format!("Specified un-shareWith path {path} does not exist")))?;
+    unshare_read_exactly(user, &parent_path, &parent, &name, revoked, store, mutable).await
+}
+
+async fn unshare_write_path(
+    user: &LoggedInUser,
+    path: &str,
+    revoked: &[String],
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let (parent_path, name) = parent_and_name(path);
+    let parent = resolve_home_path(user, &parent_path, store.clone(), mutable)
+        .await?
+        .ok_or_else(|| Error::Protocol(format!("Specified un-shareWith path {path} does not exist")))?;
+    unshare_write_exactly(user, &parent_path, &parent, &name, revoked, store, mutable).await
+}
+
+/// Who is in a group: whoever its directory is shared with (`getGroupMembers`).
+pub async fn get_group_members(
+    user: &LoggedInUser,
+    group_uid: &str,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<BTreeSet<String>> {
+    Ok(get_shared_with(user, &group_path(group_uid), Access::Read, store, mutable).await?.into_iter().collect())
+}
+
+/// Share the group's directory with each of `usernames`, so they receive
+/// everything shared with the group. Each must already follow us.
+pub async fn add_members_to_group(
+    user: &LoggedInUser,
+    group_uid: &str,
+    usernames: &[String],
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    if usernames.is_empty() {
+        return Ok(());
+    }
+    log::info!("Adding {usernames:?} to group {group_uid}");
+    let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
+    let signer = recover_signer(home, store.clone(), mutable).await?;
+    let sharing = sharing_folder(user, store.clone(), mutable).await?;
+    let dir = get_or_mkdir(&sharing, group_uid, &signer, user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
+    for u in usernames {
+        share_read_access(user, &group_path(group_uid), &dir, u, store.clone(), mutable).await?;
+    }
+    Ok(())
+}
+
+/// Remove members from a group (`removeMembersFromGroup`): rotate the group
+/// directory's keys, re-sharing with the remaining members, then revoke each
+/// removed member's access to everything ever shared with the group. Only actual
+/// members are removed, all at once, so keys aren't rotated needlessly.
+pub async fn remove_members_from_group(
+    user: &LoggedInUser,
+    group_uid: &str,
+    usernames: &BTreeSet<String>,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    if usernames.is_empty() {
+        return Ok(());
+    }
+    let members = get_group_members(user, group_uid, store.clone(), mutable).await?;
+    let to_remove: Vec<String> = usernames.intersection(&members).cloned().collect();
+    if to_remove.is_empty() {
+        return Ok(());
+    }
+    log::info!("Removing {to_remove:?} from group {group_uid}");
+    unshare_read_path(user, &group_path(group_uid), &to_remove, store.clone(), mutable).await?;
+    for u in &to_remove {
+        unshare_items_in_sharing_folder(user, group_uid, u, store.clone(), mutable).await?;
+    }
+    Ok(())
+}
+
+/// Revoke `username`'s access to every capability in `/username/shared/<folder>`
+/// (`unshareItemsInSharingFolder`), rotating the keys of each.
+pub async fn unshare_items_in_sharing_folder(
+    user: &LoggedInUser,
+    folder: &str,
+    username: &str,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let sharing = sharing_folder(user, store.clone(), mutable).await?;
+    let Some(dir) = list_directory(&sharing, store.clone(), mutable).await?.into_iter().find(|e| e.name == folder) else {
+        return Ok(());
+    };
+    let revoked = [username.to_string()];
+    let prefix = format!("/{}/", user.username);
+    let reads = load_read_access_sharing_links(&dir.cap, 0, store.clone(), mutable).await?;
+    for c in &reads.capabilities {
+        if let Some(path) = c.path.strip_prefix(&prefix) {
+            unshare_read_path(user, path, &revoked, store.clone(), mutable).await?;
+        }
+    }
+    let writes = load_write_access_sharing_links(&dir.cap, 0, store.clone(), mutable).await?;
+    for c in &writes.capabilities {
+        if let Some(path) = c.path.strip_prefix(&prefix) {
+            unshare_write_path(user, path, &revoked, store.clone(), mutable).await?;
+        }
+    }
+    Ok(())
+}
+
+/// The names of our followers' sharing dirs, including any still pending.
+async fn follower_dirs(
+    user: &LoggedInUser,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<BTreeSet<String>> {
+    let sharing = sharing_folder(user, store.clone(), mutable).await?;
+    Ok(list_directory(&sharing, store, mutable)
+        .await?
+        .into_iter()
+        .map(|e| e.name)
+        .filter(|n| !n.starts_with('.'))
+        .collect())
+}
+
+/// Stop `username` following us (`revokeFollower`). Their sharing dir is first
+/// hidden, by renaming it, so they stop being listed as a follower in one step and
+/// the rest of the removal can be completed by [`reconcile_groups`] if this fails
+/// part way.
+pub async fn revoke_follower(
+    user: &LoggedInUser,
+    username: &str,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    // revoking their access re-shares with everyone else, which fails for a stale group member
+    let dirs = follower_dirs(user, store.clone(), mutable).await?;
+    remove_group_members_without_sharing_dirs(user, &dirs, store.clone(), mutable).await?;
+    // in case an earlier removal was interrupted
+    complete_follower_removal(user, username, store.clone(), mutable).await?;
+    if dirs.contains(username) {
+        let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
+        let signer = recover_signer(home, store.clone(), mutable).await?;
+        let sharing = sharing_folder(user, store.clone(), mutable).await?;
+        let hidden = format!("{REMOVING_FOLLOWER_PREFIX}{username}");
+        crate::rename_child(&sharing, username, &hidden, Some(signer), user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
+    }
+    complete_follower_removal(user, username, store, mutable).await
+}
+
+async fn complete_follower_removal(
+    user: &LoggedInUser,
+    username: &str,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let hidden = format!("{REMOVING_FOLLOWER_PREFIX}{username}");
+    let sharing = sharing_folder(user, store.clone(), mutable).await?;
+    if has_child(&sharing, &hidden, store.clone(), mutable).await? {
+        // revoke access to everything ever shared with this user
+        unshare_items_in_sharing_folder(user, &hidden, username, store.clone(), mutable).await?;
+        delete_shared_child(user, &hidden, store.clone(), mutable).await?;
+    }
+    // they may have become a follower again since an interrupted removal
+    let sharing = sharing_folder(user, store.clone(), mutable).await?;
+    if has_child(&sharing, username, store.clone(), mutable).await? {
+        return Ok(());
+    }
+    remove_from_all_groups(user, username, store, mutable).await
+}
+
+/// Remove them from every group they are in, built in or not.
+async fn remove_from_all_groups(
+    user: &LoggedInUser,
+    username: &str,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let to_remove: BTreeSet<String> = [username.to_string()].into_iter().collect();
+    for uid in get_or_create_groups(user, store.clone(), mutable).await?.uid_to_name.keys() {
+        remove_members_from_group(user, uid, &to_remove, store.clone(), mutable).await?;
+    }
+    Ok(())
+}
+
+/// Only followers can be in a group, and removing anyone from a group fails while
+/// it has a member we no longer have a sharing dir for, e.g. left by an older client.
+async fn remove_group_members_without_sharing_dirs(
+    user: &LoggedInUser,
+    follower_dirs: &BTreeSet<String>,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    for uid in get_or_create_groups(user, store.clone(), mutable).await?.uid_to_name.keys() {
+        let stale: BTreeSet<String> =
+            get_group_members(user, uid, store.clone(), mutable).await?.difference(follower_dirs).cloned().collect();
+        remove_members_from_group(user, uid, &stale, store.clone(), mutable).await?;
+    }
+    Ok(())
+}
+
+/// Keep the built-in groups in line with who our followers and friends are
+/// (`reconcileGroups`): finish any interrupted follower removal, remove group
+/// members we no longer have a sharing dir for, and add current followers and
+/// mutual friends missing from the followers and friends groups, e.g. after
+/// following someone again.
+pub async fn reconcile_groups(
+    user: &LoggedInUser,
+    following: &BTreeSet<String>,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let sharing = sharing_folder(user, store.clone(), mutable).await?;
+    for e in list_directory(&sharing, store.clone(), mutable).await? {
+        if let Some(name) = e.name.strip_prefix(REMOVING_FOLLOWER_PREFIX) {
+            complete_follower_removal(user, name, store.clone(), mutable).await?;
+        }
+    }
+    let dirs = follower_dirs(user, store.clone(), mutable).await?;
+    let groups = get_or_create_groups(user, store.clone(), mutable).await?;
+    let (Some(followers_uid), Some(friends_uid)) = (groups.uid_for(FOLLOWERS_GROUP), groups.uid_for(FRIENDS_GROUP)) else {
+        return Ok(());
+    };
+    let followers = get_group_members(user, &followers_uid, store.clone(), mutable).await?;
+    let friends = get_group_members(user, &friends_uid, store.clone(), mutable).await?;
+    let stale_followers: BTreeSet<String> = followers.difference(&dirs).cloned().collect();
+    let stale_friends: BTreeSet<String> = friends.difference(&dirs).cloned().collect();
+    remove_members_from_group(user, &friends_uid, &stale_friends, store.clone(), mutable).await?;
+    remove_members_from_group(user, &followers_uid, &stale_followers, store.clone(), mutable).await?;
+    remove_group_members_without_sharing_dirs(user, &dirs, store.clone(), mutable).await?;
+
+    let pending: BTreeSet<String> = get_pending_outgoing(user, store.clone(), mutable).await?.into_iter().collect();
+    let current: BTreeSet<String> = dirs.difference(&pending).cloned().collect();
+    let followers = get_group_members(user, &followers_uid, store.clone(), mutable).await?;
+    let friends = get_group_members(user, &friends_uid, store.clone(), mutable).await?;
+    let missing_followers: Vec<String> = current.difference(&followers).cloned().collect();
+    let missing_friends: Vec<String> =
+        current.intersection(following).filter(|u| !friends.contains(*u)).cloned().collect();
+    add_members_to_group(user, &followers_uid, &missing_followers, store.clone(), mutable).await?;
+    add_members_to_group(user, &friends_uid, &missing_friends, store, mutable).await
+}
+
+/// Unsharing a group also unshares its members who were shared with individually
+/// (`gatherAllUsernamesToUnshare`). Followers contain friends, so unsharing
+/// followers also unshares the friends group. Custom groups can overlap without
+/// either containing the other, so no such rule applies to them.
+async fn expand_groups_to_unshare(
+    user: &LoggedInUser,
+    current: &BTreeSet<String>,
+    to_unshare: &[String],
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<Vec<String>> {
+    let mut res: BTreeSet<String> = to_unshare.iter().cloned().collect();
+    if !to_unshare.iter().any(|u| u.starts_with('.')) {
+        return Ok(res.into_iter().collect());
+    }
+    let groups = get_or_create_groups(user, store.clone(), mutable).await?;
+    if let (Some(followers), Some(friends)) = (groups.uid_for(FOLLOWERS_GROUP), groups.uid_for(FRIENDS_GROUP)) {
+        if res.contains(&followers) && current.contains(&friends) {
+            res.insert(friends);
+        }
+    }
+    for uid in to_unshare.iter().filter(|u| u.starts_with('.')) {
+        let members = get_group_members(user, uid, store.clone(), mutable).await?;
+        res.extend(current.intersection(&members).cloned());
+    }
+    Ok(res.into_iter().collect())
+}
+
+/// Every home-relative path shared with `name` (a username or group uid), read or write.
+pub async fn get_all_paths_shared_with(
+    user: &LoggedInUser,
+    name: &str,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<BTreeSet<String>> {
+    let mut res = BTreeSet::new();
+    for (dir, state) in get_all_shares(user, store, mutable).await? {
+        for (child, users) in state.read.iter().chain(state.write.iter()) {
+            if users.contains(name) {
+                res.insert(join_path(&dir, child));
+            }
+        }
+    }
+    Ok(res)
+}
+
+fn valid_group_name(name: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(Error::Protocol("A group needs a name".into()));
+    }
+    if is_built_in_group_name(trimmed) {
+        return Err(Error::Protocol(format!("'{trimmed}' is reserved for a built-in group")));
+    }
+    Ok(trimmed.to_string())
+}
+
+async fn ensure_followers(
+    user: &LoggedInUser,
+    usernames: &[String],
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let followers = get_follower_names(user, store, mutable).await?;
+    let unknown: Vec<&String> = usernames.iter().filter(|u| !followers.contains(u)).collect();
+    if !unknown.is_empty() {
+        return Err(Error::Protocol(format!("Only followers can be added to a group, not: {unknown:?}")));
+    }
+    Ok(())
+}
+
+/// Create a sharing group (`createGroup`), returning its uid. The directory and
+/// its share are the group, the name is only our label for it, so the name is
+/// written last: a failure before then leaves an unnamed, invisible directory.
+pub async fn create_group(
+    user: &LoggedInUser,
+    name: &str,
+    members: &[String],
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<String> {
+    let name = valid_group_name(name)?;
+    ensure_followers(user, members, store.clone(), mutable).await?;
+    let mut groups = get_or_create_groups(user, store.clone(), mutable).await?;
+    let uid = generate_group_uid();
+    let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
+    let signer = recover_signer(home, store.clone(), mutable).await?;
+    let sharing = sharing_folder(user, store.clone(), mutable).await?;
+    get_or_mkdir(&sharing, &uid, &signer, user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
+    add_members_to_group(user, &uid, members, store.clone(), mutable).await?;
+    groups.uid_to_name.insert(uid.clone(), name);
+    set_groups(user, &groups, store, mutable).await?;
+    Ok(uid)
+}
+
+/// Change our label for a custom group (`renameGroup`); nothing is shared or rotated.
+pub async fn rename_group(
+    user: &LoggedInUser,
+    group_uid: &str,
+    new_name: &str,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let name = valid_group_name(new_name)?;
+    let mut groups = get_or_create_groups(user, store.clone(), mutable).await?;
+    match groups.uid_to_name.get(group_uid) {
+        None => return Err(Error::Protocol(format!("Unknown group {group_uid}"))),
+        Some(n) if is_built_in_group_name(n) => return Err(Error::Protocol("Built-in groups cannot be renamed".into())),
+        _ => {}
+    }
+    groups.uid_to_name.insert(group_uid.to_string(), name);
+    set_groups(user, &groups, store, mutable).await
+}
+
+fn ensure_custom(groups: &Groups, group_uid: &str) -> Result<()> {
+    if groups.uid_to_name.get(group_uid).is_some_and(|n| is_built_in_group_name(n)) {
+        return Err(Error::Protocol("Membership of built-in groups is managed automatically".into()));
+    }
+    Ok(())
+}
+
+/// Add followers to a custom group (`addGroupMembers`).
+pub async fn add_group_members(
+    user: &LoggedInUser,
+    group_uid: &str,
+    members: &[String],
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    ensure_custom(&get_or_create_groups(user, store.clone(), mutable).await?, group_uid)?;
+    ensure_followers(user, members, store.clone(), mutable).await?;
+    add_members_to_group(user, group_uid, members, store, mutable).await
+}
+
+/// Remove a member from a custom group (`removeGroupMember`). This always rotates
+/// the keys of the group directory, so they cannot see anything shared with the
+/// group from now on. Things shared with the group before which they have already
+/// retrieved stay readable to them unless `revoke_shared` is set, which also
+/// rotates the keys of every one of those.
+pub async fn remove_group_member(
+    user: &LoggedInUser,
+    group_uid: &str,
+    member: &str,
+    revoke_shared: bool,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    ensure_custom(&get_or_create_groups(user, store.clone(), mutable).await?, group_uid)?;
+    let revoked = [member.to_string()];
+    unshare_read_path(user, &group_path(group_uid), &revoked, store.clone(), mutable).await?;
+    if revoke_shared {
+        unshare_items_in_sharing_folder(user, group_uid, member, store, mutable).await?;
+    }
+    Ok(())
+}
+
+/// The number of files and folders shared with a group, which is how much work
+/// revoking them all is (`countSharedWithGroup`).
+pub async fn count_shared_with_group(
+    user: &LoggedInUser,
+    group_uid: &str,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<usize> {
+    Ok(get_all_paths_shared_with(user, group_uid, store, mutable).await?.len())
+}
+
+/// Delete a custom group (`deleteGroup`). Without `revoke_shared`, members keep
+/// access to what was shared with the group before, but nothing new reaches them
+/// through it. With `revoke_shared`, everything shared with the group is unshared
+/// from it first, rotating the keys of each; `progress` is called once per item.
+pub async fn delete_group(
+    user: &LoggedInUser,
+    group_uid: &str,
+    revoke_shared: bool,
+    mut progress: impl FnMut(),
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let mut groups = get_or_create_groups(user, store.clone(), mutable).await?;
+    match groups.uid_to_name.get(group_uid) {
+        None => return Err(Error::Protocol(format!("Unknown group {group_uid}"))),
+        Some(n) if is_built_in_group_name(n) => return Err(Error::Protocol("Built-in groups cannot be deleted".into())),
+        _ => {}
+    }
+    let group = [group_uid.to_string()];
+    if revoke_shared {
+        for path in get_all_paths_shared_with(user, group_uid, store.clone(), mutable).await? {
+            if get_shared_with(user, &path, Access::Write, store.clone(), mutable).await?.contains(&group[0]) {
+                unshare_write_path(user, &path, &group, store.clone(), mutable).await?;
+            }
+            if get_shared_with(user, &path, Access::Read, store.clone(), mutable).await?.contains(&group[0]) {
+                unshare_read_path(user, &path, &group, store.clone(), mutable).await?;
+            }
+            progress();
+        }
+    }
+    groups.uid_to_name.remove(group_uid);
+    set_groups(user, &groups, store.clone(), mutable).await?;
+    // Anything still recording the group would be re-sent to its directory, which is
+    // about to go, whenever it is next re-keyed.
+    for path in get_all_paths_shared_with(user, group_uid, store.clone(), mutable).await? {
+        let (dir_path, filename) = split_path(&path);
+        let mut state = read_shared_with_at(user, &dir_path, store.clone(), mutable).await?;
+        for access in [Access::Read, Access::Write] {
+            let map = state.map(access);
+            if let Some(users) = map.get_mut(&filename) {
+                users.remove(group_uid);
+                if users.is_empty() {
+                    map.remove(&filename);
+                }
+            }
+        }
+        write_shared_with_at(user, &dir_path, &state, store.clone(), mutable).await?;
+    }
+    delete_shared_child(user, group_uid, store, mutable).await
 }
 
 /// `move` with shared-with cache maintenance (`FileWrapper.moveTo` +

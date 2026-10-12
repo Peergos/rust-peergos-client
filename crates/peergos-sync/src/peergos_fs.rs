@@ -87,39 +87,55 @@ impl SyncFilesystem for PeergosSyncFS {
     }
 
     async fn mkdirs(&self, p: &Path) -> Result<()> {
-        let p_str = p.to_string_lossy();
-        if p_str.is_empty() || p == Path::new(".") || p == Path::new("/") {
-            return Ok(());
-        }
-        let components: Vec<&str> = p_str.split('/')
-            .filter(|s| !s.is_empty())
-            .collect();
-        let mut current = self.root_cap.clone();
-        for comp in &components {
-            let children = list_directory(&current, self.bstore(), &*self.bmutable()).await?;
-            if let Some(child) = children.into_iter().find(|e| e.name == *comp) {
-                current = child.cap;
-            } else {
-                let new_cap = mkdir_hidden(&current, comp, self.signer.clone(), self.mirror_bat_id().as_ref(), self.bstore(), &*self.bmutable()).await?;
-                current = new_cap;
+        let cp = self.net.checkpoint();
+        let res: Result<_> = async {
+            let p_str = p.to_string_lossy();
+            if p_str.is_empty() || p == Path::new(".") || p == Path::new("/") {
+                return Ok(());
             }
+            let components: Vec<&str> = p_str.split('/')
+                .filter(|s| !s.is_empty())
+                .collect();
+            let mut current = self.root_cap.clone();
+            for comp in &components {
+                let children = list_directory(&current, self.bstore(), &*self.bmutable()).await?;
+                if let Some(child) = children.into_iter().find(|e| e.name == *comp) {
+                    current = child.cap;
+                } else {
+                    let new_cap = mkdir_hidden(&current, comp, self.signer.clone(), self.mirror_bat_id().as_ref(), self.bstore(), &*self.bmutable()).await?;
+                    current = new_cap;
+                }
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        if res.is_err() {
+            self.net.rollback(&cp);
+        }
+        res
     }
 
     async fn delete(&self, p: &Path) -> Result<()> {
-        self.resolve_cap(p).await?
-            .ok_or_else(|| Error::Protocol(format!("not found: {}", p.display())))?;
-        let parent_path = p.parent().map(|pp| {
-            let s = pp.to_string_lossy();
-            if s.is_empty() { PathBuf::from(".") } else { pp.to_path_buf() }
-        }).unwrap_or_else(|| PathBuf::from("."));
-        let parent = self.resolve_cap(&parent_path).await?
-            .ok_or_else(|| Error::Protocol("parent not found".into()))?;
-        let fname = p.file_name().unwrap().to_string_lossy().to_string();
-        let signer = recover_signer(&parent, self.bstore(), &*self.bmutable()).await?;
-        delete_child(&parent, &fname, Some(signer), self.mirror_bat_id().as_ref(), self.bstore(), &*self.bmutable()).await?;
-        Ok(())
+        let cp = self.net.checkpoint();
+        let res: Result<_> = async {
+            self.resolve_cap(p).await?
+                .ok_or_else(|| Error::Protocol(format!("not found: {}", p.display())))?;
+            let parent_path = p.parent().map(|pp| {
+                let s = pp.to_string_lossy();
+                if s.is_empty() { PathBuf::from(".") } else { pp.to_path_buf() }
+            }).unwrap_or_else(|| PathBuf::from("."));
+            let parent = self.resolve_cap(&parent_path).await?
+                .ok_or_else(|| Error::Protocol("parent not found".into()))?;
+            let fname = p.file_name().unwrap().to_string_lossy().to_string();
+            let signer = recover_signer(&parent, self.bstore(), &*self.bmutable()).await?;
+            delete_child(&parent, &fname, Some(signer), self.mirror_bat_id().as_ref(), self.bstore(), &*self.bmutable()).await?;
+            Ok(())
+        }
+        .await;
+        if res.is_err() {
+            self.net.rollback(&cp);
+        }
+        res
     }
 
     async fn bulk_delete(&self, dir: &Path, children: &[String]) -> Result<()> {
@@ -130,55 +146,63 @@ impl SyncFilesystem for PeergosSyncFS {
     }
 
     async fn move_to(&self, src: &Path, target: &Path) -> Result<()> {
-        let src_parent = src.parent().unwrap_or(Path::new("."));
-        let tgt_parent = target.parent().unwrap_or(Path::new("."));
-        let src_name = src.file_name().unwrap().to_string_lossy().to_string();
-        let tgt_name = target.file_name().unwrap().to_string_lossy().to_string();
+        let cp = self.net.checkpoint();
+        let res: Result<_> = async {
+            let src_parent = src.parent().unwrap_or(Path::new("."));
+            let tgt_parent = target.parent().unwrap_or(Path::new("."));
+            let src_name = src.file_name().unwrap().to_string_lossy().to_string();
+            let tgt_name = target.file_name().unwrap().to_string_lossy().to_string();
 
-        if src_parent == tgt_parent && src_name == tgt_name {
-            return Ok(());
-        }
+            if src_parent == tgt_parent && src_name == tgt_name {
+                return Ok(());
+            }
 
-        if src_parent == tgt_parent {
-            // Same-directory rename — atomic metadata-only
-            let parent = self.resolve_cap(src_parent).await?
-                .ok_or_else(|| Error::Protocol("move_to: parent not found".into()))?;
-            let signer = recover_signer(&parent, self.bstore(), &*self.bmutable()).await?;
-            rename_child(&parent, &src_name, &tgt_name, Some(signer), self.mirror_bat_id().as_ref(), self.bstore(), &*self.bmutable()).await?;
-            return Ok(());
-        }
+            if src_parent == tgt_parent {
+                // Same-directory rename — atomic metadata-only
+                let parent = self.resolve_cap(src_parent).await?
+                    .ok_or_else(|| Error::Protocol("move_to: parent not found".into()))?;
+                let signer = recover_signer(&parent, self.bstore(), &*self.bmutable()).await?;
+                rename_child(&parent, &src_name, &tgt_name, Some(signer), self.mirror_bat_id().as_ref(), self.bstore(), &*self.bmutable()).await?;
+                return Ok(());
+            }
 
-        // Cross-directory move: ensure target parent exists
-        if !tgt_parent.to_string_lossy().is_empty() {
-            self.mkdirs(tgt_parent).await?;
-        }
+            // Cross-directory move: ensure target parent exists
+            if !tgt_parent.to_string_lossy().is_empty() {
+                self.mkdirs(tgt_parent).await?;
+            }
 
-        let src_parent_cap = self.resolve_cap(src_parent).await?
-            .ok_or_else(|| Error::Protocol("move_to: source parent not found".into()))?;
-        let tgt_parent_cap = self.resolve_cap(tgt_parent).await?
-            .ok_or_else(|| Error::Protocol("move_to: target parent not found".into()))?;
+            let src_parent_cap = self.resolve_cap(src_parent).await?
+                .ok_or_else(|| Error::Protocol("move_to: source parent not found".into()))?;
+            let tgt_parent_cap = self.resolve_cap(tgt_parent).await?
+                .ok_or_else(|| Error::Protocol("move_to: target parent not found".into()))?;
 
-        let signer = recover_signer(&src_parent_cap, self.bstore(), &*self.bmutable()).await?;
+            let signer = recover_signer(&src_parent_cap, self.bstore(), &*self.bmutable()).await?;
 
-        // Use peergos_fs::move_to — fast path (metadata-only) when both dirs
-        // share a writer, otherwise copy-under-fresh-keys + delete.
-        peergos_fs::move_to(
-            &src_parent_cap, &src_name, &tgt_parent_cap, true,
-            Some(signer), self.mirror_bat_id().as_ref(),
-            self.bstore(), &*self.bmutable(),
-        ).await?;
-
-        // Rename the child in the target directory if the filename changed
-        if src_name != tgt_name {
-            let tgt_signer = recover_signer(&tgt_parent_cap, self.bstore(), &*self.bmutable()).await?;
-            rename_child(
-                &tgt_parent_cap, &src_name, &tgt_name,
-                Some(tgt_signer), self.mirror_bat_id().as_ref(),
+            // Use peergos_fs::move_to — fast path (metadata-only) when both dirs
+            // share a writer, otherwise copy-under-fresh-keys + delete.
+            peergos_fs::move_to(
+                &src_parent_cap, &src_name, &tgt_parent_cap, true,
+                Some(signer), self.mirror_bat_id().as_ref(),
                 self.bstore(), &*self.bmutable(),
             ).await?;
-        }
 
-        Ok(())
+            // Rename the child in the target directory if the filename changed
+            if src_name != tgt_name {
+                let tgt_signer = recover_signer(&tgt_parent_cap, self.bstore(), &*self.bmutable()).await?;
+                rename_child(
+                    &tgt_parent_cap, &src_name, &tgt_name,
+                    Some(tgt_signer), self.mirror_bat_id().as_ref(),
+                    self.bstore(), &*self.bmutable(),
+                ).await?;
+            }
+
+            Ok(())
+        }
+        .await;
+        if res.is_err() {
+            self.net.rollback(&cp);
+        }
+        res
     }
 
     async fn get_last_modified(&self, p: &Path) -> Result<i64> {
@@ -201,17 +225,25 @@ impl SyncFilesystem for PeergosSyncFS {
     }
 
     async fn truncate(&self, p: &Path, size: u64) -> Result<()> {
-        let cap = self.resolve_cap(p).await?
-            .ok_or_else(|| Error::Protocol(format!("truncate: not found: {}", p.display())))?;
-        let (_node, props) = retrieve_file_metadata(&cap, self.bstore(), &*self.bmutable()).await?;
-        if size >= props.size {
-            return Ok(());
+        let cp = self.net.checkpoint();
+        let res: Result<_> = async {
+            let cap = self.resolve_cap(p).await?
+                .ok_or_else(|| Error::Protocol(format!("truncate: not found: {}", p.display())))?;
+            let (_node, props) = retrieve_file_metadata(&cap, self.bstore(), &*self.bmutable()).await?;
+            if size >= props.size {
+                return Ok(());
+            }
+            let (_full_props, data) = read_file(&cap, self.bstore(), &*self.bmutable()).await?;
+            let truncated = &data[..size as usize];
+            let signer = recover_signer(&cap, self.bstore(), &*self.bmutable()).await?;
+            rewrite_file_content(&cap, truncated, &signer, self.mirror_bat_id().as_ref(), self.bstore(), &*self.bmutable()).await?;
+            Ok(())
         }
-        let (_full_props, data) = read_file(&cap, self.bstore(), &*self.bmutable()).await?;
-        let truncated = &data[..size as usize];
-        let signer = recover_signer(&cap, self.bstore(), &*self.bmutable()).await?;
-        rewrite_file_content(&cap, truncated, &signer, self.mirror_bat_id().as_ref(), self.bstore(), &*self.bmutable()).await?;
-        Ok(())
+        .await;
+        if res.is_err() {
+            self.net.rollback(&cp);
+        }
+        res
     }
 
     async fn read(&self, p: &Path) -> Result<Vec<u8>> {
@@ -222,17 +254,25 @@ impl SyncFilesystem for PeergosSyncFS {
     }
 
     async fn write(&self, p: &Path, data: &[u8], _file_offset: u64) -> Result<()> {
-        let parent_path = p.parent().map(|pp| {
-            let s = pp.to_string_lossy();
-            if s.is_empty() { PathBuf::from(".") } else { pp.to_path_buf() }
-        }).unwrap_or_else(|| PathBuf::from("."));
-        let parent = self.resolve_cap(&parent_path).await?
-            .ok_or_else(|| Error::Protocol("parent not found".into()))?;
-        let fname = p.file_name().unwrap().to_string_lossy().to_string();
-        let signer = recover_signer(&parent, self.bstore(), &*self.bmutable()).await?;
-        upload_file(&parent, &fname, data, None, Some(signer), self.mirror_bat_id().as_ref(), self.bstore(), &*self.bmutable()).await?;
+        let cp = self.net.checkpoint();
+        let res: Result<_> = async {
+            let parent_path = p.parent().map(|pp| {
+                let s = pp.to_string_lossy();
+                if s.is_empty() { PathBuf::from(".") } else { pp.to_path_buf() }
+            }).unwrap_or_else(|| PathBuf::from("."));
+            let parent = self.resolve_cap(&parent_path).await?
+                .ok_or_else(|| Error::Protocol("parent not found".into()))?;
+            let fname = p.file_name().unwrap().to_string_lossy().to_string();
+            let signer = recover_signer(&parent, self.bstore(), &*self.bmutable()).await?;
+            upload_file(&parent, &fname, data, None, Some(signer), self.mirror_bat_id().as_ref(), self.bstore(), &*self.bmutable()).await?;
 
-        Ok(())
+            Ok(())
+        }
+        .await;
+        if res.is_err() {
+            self.net.rollback(&cp);
+        }
+        res
     }
 
     async fn hash_file(&self, p: &Path, _size: u64, _chunk_size: u64) -> Result<([u8; 32], u64)> {
@@ -248,37 +288,45 @@ impl SyncFilesystem for PeergosSyncFS {
     }
 
     async fn set_hash(&self, p: &Path, hash: [u8; 32], _size: u64) -> Result<()> {
-        let cap = self.resolve_cap(p).await?
-            .ok_or_else(|| Error::Protocol(format!("set_hash: not found: {}", p.display())))?;
-        let (_node, props) = retrieve_file_metadata(&cap, self.bstore(), &*self.bmutable()).await?;
-        if props.is_directory {
-            return Err(Error::Protocol("cannot set hash on a directory".into()));
+        let cp = self.net.checkpoint();
+        let res: Result<_> = async {
+            let cap = self.resolve_cap(p).await?
+                .ok_or_else(|| Error::Protocol(format!("set_hash: not found: {}", p.display())))?;
+            let (_node, props) = retrieve_file_metadata(&cap, self.bstore(), &*self.bmutable()).await?;
+            if props.is_directory {
+                return Err(Error::Protocol("cannot set hash on a directory".into()));
+            }
+            let parent_path = p.parent().map(|pp| {
+                let s = pp.to_string_lossy();
+                if s.is_empty() { std::path::PathBuf::from(".") } else { pp.to_path_buf() }
+            }).unwrap_or_else(|| std::path::PathBuf::from("."));
+            let dir_cap = self.resolve_cap(&parent_path).await?
+                .ok_or_else(|| Error::Protocol("set_hash: parent not found".into()))?;
+            let signer = recover_signer(&dir_cap, self.bstore(), &*self.bmutable()).await?;
+            let branch = HashBranch {
+                root_hash: RootHash { hash: hash.to_vec() },
+                level1: None,
+                level2: None,
+                level3: None,
+            };
+            let mut new_props = props.clone();
+            new_props.tree_hash = Some(branch);
+            update_file_properties(
+                &dir_cap,
+                &cap,
+                Some(signer),
+                self.mirror_bat_id().as_ref(),
+                new_props,
+                self.bstore(),
+                &*self.bmutable(),
+            ).await?;
+            Ok(())
         }
-        let parent_path = p.parent().map(|pp| {
-            let s = pp.to_string_lossy();
-            if s.is_empty() { std::path::PathBuf::from(".") } else { pp.to_path_buf() }
-        }).unwrap_or_else(|| std::path::PathBuf::from("."));
-        let dir_cap = self.resolve_cap(&parent_path).await?
-            .ok_or_else(|| Error::Protocol("set_hash: parent not found".into()))?;
-        let signer = recover_signer(&dir_cap, self.bstore(), &*self.bmutable()).await?;
-        let branch = HashBranch {
-            root_hash: RootHash { hash: hash.to_vec() },
-            level1: None,
-            level2: None,
-            level3: None,
-        };
-        let mut new_props = props.clone();
-        new_props.tree_hash = Some(branch);
-        update_file_properties(
-            &dir_cap,
-            &cap,
-            Some(signer),
-            self.mirror_bat_id().as_ref(),
-            new_props,
-            self.bstore(),
-            &*self.bmutable(),
-        ).await?;
-        Ok(())
+        .await;
+        if res.is_err() {
+            self.net.rollback(&cp);
+        }
+        res
     }
 
     async fn files_count(&self) -> Result<usize> {

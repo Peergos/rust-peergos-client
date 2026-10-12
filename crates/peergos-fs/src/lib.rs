@@ -29,19 +29,26 @@ pub mod social;
 pub mod thumbnail;
 pub mod transaction;
 pub mod writing_space;
+pub mod writer_quota;
 
 pub use capability::{AbsoluteCapability, EncryptedCapability, Location, SecretLink, SecretLinkTarget};
-pub use login::{change_password, login, EntryPoint, LoggedInUser, MfaResponder};
+pub use login::{
+    change_password, login, set_device_token_store, DeviceTokenStore, EntryPoint, InMemoryDeviceTokens, LoggedInUser,
+    MfaResponder,
+};
 pub use mfa::{
     current_totp, generate_totp, BackupCodes, MfaType, MultiFactorAuthMethod, MultiFactorAuthRequest,
     MultiFactorAuthResponse, TotpKey,
 };
 pub use signup::signup;
 pub use social::{
-    accept_follow_request, add_friend_annotation, add_member_to_group, block, collect_shares_for_user,
-    get_blocked, get_directory_sharing_state, get_follow_requests, get_follower_names,
-    get_all_shares, get_friend_annotations, get_following, get_friends, get_links, get_or_create_groups,
-    get_pending_outgoing, get_public_keys, get_shared_with, group_uid, unblock, unfollow,
+    accept_follow_request, add_friend_annotation, add_group_members, add_member_to_group, add_members_to_group,
+    block, collect_shares_for_user, complete_blocks, count_shared_with_group, create_group, delete_group,
+    follow_again, get_all_paths_shared_with, get_blocked, get_directory_sharing_state, get_follow_requests,
+    get_follower_names, get_all_shares, get_friend_annotations, get_following, get_friends, get_group_members,
+    get_links, get_or_create_groups, get_pending_outgoing, get_public_keys, get_shared_with, get_unfollowed,
+    group_uid, is_built_in_group_name, process_follow_requests, reconcile_groups, remove_group_member,
+    remove_members_from_group, rename_group, revoke_follower, unblock, unfollow, unshare_items_in_sharing_folder,
     load_read_access_sharing_links, load_write_access_sharing_links, move_file,
     process_follow_reply, read_shared_capabilities, read_write_shared_capabilities, record_link,
     reject_follow_request, remove_link, send_follow_request, share_read_access, share_read_with_group, share_write_access,
@@ -66,6 +73,7 @@ pub use incoming::{CapsInDirectory, ChildElement, IncomingCapCache, ProcessedCap
 pub use retrieve::{chunk_size_for_new_files, FragmentedPaddedCipherText, DEFAULT_CHUNK_SIZE, LEGACY_CHUNK_SIZE};
 pub use transaction::FileUploadTransaction;
 pub use writing_space::move_to_new_writing_space;
+pub use writer_quota::{WriterQuotaRequest, WriterUsageInfo};
 // move_to, rename_child, delete_child etc. are `pub async fn` at the crate root.
 
 use cryptree::{
@@ -410,7 +418,7 @@ async fn fetch_chunk_node_verified(
 ) -> Result<Option<CryptreeNode>> {
     // A hit skips both the champ/get round-trip and the decrypt. Safe because the
     // key includes the content-addressed champ `root`.
-    if let Some(hit) = cache.get(root, map_key) {
+    if let Some(hit) = cache.get(root, map_key, &cap.r_base_key) {
         return Ok(hit);
     }
     let mirror = ChunkMirrorCap::new(map_key.to_vec(), bat_with_id(bat)?);
@@ -418,7 +426,7 @@ async fn fetch_chunk_node_verified(
         .get_champ_lookup(&cap.owner, root, std::slice::from_ref(&mirror), None)
         .await?;
     if blocks.is_empty() {
-        cache.put(root, map_key, None);
+        cache.put_absent(root, map_key);
         return Ok(None);
     }
     let local = Arc::new(RamStorage::new());
@@ -433,7 +441,7 @@ async fn fetch_chunk_node_verified(
     )
     .await?;
     let node = fetch_chunk_node(&champ, cap, map_key, bat, local.as_ref()).await?;
-    cache.put(root, map_key, node.clone());
+    cache.put_lookup(root, map_key, &cap.r_base_key, node.clone());
     Ok(node)
 }
 
@@ -845,7 +853,7 @@ async fn retrieve_all_metadata_single_writer(
     // Serve cache hits (decrypted nodes) without any network; only miss the rest.
     let mut remaining = Vec::new();
     for l in links {
-        match cache.get(&root, &l.map_key) {
+        match cache.get(&root, &l.map_key, &l.r_base_key) {
             Some(Some(node)) => {
                 let properties = node.get_properties(&l.r_base_key)?;
                 retrieved.push(RetrievedCapability { cap: l.clone(), node, properties });
@@ -881,7 +889,7 @@ async fn retrieve_all_metadata_single_writer(
 
     for l in &remaining {
         let node = fetch_chunk_node(&champ, l, &l.map_key, &l.bat, combined.as_ref()).await?;
-        cache.put(&root, &l.map_key, node.clone());
+        cache.put_lookup(&root, &l.map_key, &l.r_base_key, node.clone());
         match node {
             Some(node) => {
                 let properties = node.get_properties(&l.r_base_key)?;

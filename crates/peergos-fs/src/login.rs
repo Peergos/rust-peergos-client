@@ -259,8 +259,47 @@ fn sign_now(login_secret: &SecretSigningKey) -> Result<Vec<u8>> {
 pub type MfaResponder<'a> =
     dyn Fn(&crate::mfa::MultiFactorAuthRequest) -> Result<crate::mfa::MultiFactorAuthResponse> + 'a;
 
-/// POST `login/getLogin`, optionally carrying an MFA response, decoding the
-/// `LoginResponse` cbor `{"a": bool, "r": UserStaticData | MultiFactorAuthRequest}`.
+/// Where a client keeps the token its home server gave it for logging in from
+/// this device (`DeviceTokenStore`). A device presenting its token gets a budget
+/// of failed login guesses of its own, so someone guessing a password can only
+/// block logins from new devices.
+pub trait DeviceTokenStore: Send + Sync {
+    fn get(&self, username: &str) -> Option<String>;
+    fn set(&self, username: &str, token: &str);
+}
+
+/// Keeps tokens for the life of the process (`DeviceTokenStore.inMemory`).
+#[derive(Default)]
+pub struct InMemoryDeviceTokens(std::sync::Mutex<std::collections::HashMap<String, String>>);
+
+impl DeviceTokenStore for InMemoryDeviceTokens {
+    fn get(&self, username: &str) -> Option<String> {
+        self.0.lock().unwrap().get(username).cloned()
+    }
+    fn set(&self, username: &str, token: &str) {
+        self.0.lock().unwrap().insert(username.to_string(), token.to_string());
+    }
+}
+
+static DEVICE_TOKENS: std::sync::RwLock<Option<Arc<dyn DeviceTokenStore>>> = std::sync::RwLock::new(None);
+
+/// Use `store` for the device tokens of every later login, e.g. to keep them
+/// across restarts. Tokens are otherwise kept in memory only.
+pub fn set_device_token_store(store: Arc<dyn DeviceTokenStore>) {
+    *DEVICE_TOKENS.write().unwrap() = Some(store);
+}
+
+fn device_tokens() -> Arc<dyn DeviceTokenStore> {
+    if let Some(store) = DEVICE_TOKENS.read().unwrap().as_ref() {
+        return store.clone();
+    }
+    DEVICE_TOKENS.write().unwrap().get_or_insert_with(|| Arc::new(InMemoryDeviceTokens::default())).clone()
+}
+
+/// POST `login/getLogin`, optionally carrying an MFA response and this device's
+/// token, decoding the `LoginResponse` cbor `{"a": bool, "r": UserStaticData |
+/// MultiFactorAuthRequest, "d"?: device token}`. A device token in the response is
+/// kept for the next login.
 async fn fetch_login(
     poster: &dyn HttpPoster,
     username: &str,
@@ -275,8 +314,16 @@ async fn fetch_login(
     if let Some(m) = mfa {
         url.push_str(&format!("&mfa={}", to_hex(&m.serialize())));
     }
+    let tokens = device_tokens();
+    if let Some(token) = tokens.get(username) {
+        url.push_str(&format!("&device={token}"));
+    }
     // always a POST: a server that isn't public refuses a GET
-    Ok(CborObject::from_bytes(&poster.post_unzip(&url, Vec::new(), peergos_core::poster::DEFAULT_TIMEOUT_MS).await?)?)
+    let resp = CborObject::from_bytes(&poster.post_unzip(&url, Vec::new(), peergos_core::poster::DEFAULT_TIMEOUT_MS).await?)?;
+    if let Some(token) = resp.get("d").and_then(|c| c.as_string()) {
+        tokens.set(username, token);
+    }
+    Ok(resp)
 }
 
 /// `Account.getLoginData` — fetch and decrypt the encrypted entry points. If the

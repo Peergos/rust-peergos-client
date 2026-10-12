@@ -4,8 +4,8 @@
 //! Making a file public adds its read-only capability to a public path→cap map (an
 //! [`InodeFileSystem`], a CHAMP of `Inode → DirectoryInode` keyed by sha256),
 //! whose root is stored in `WriterData.public`. Anyone can then resolve
-//! `/public/<owner>/<path>` — the gateway does exactly this and 302-redirects to a
-//! secret-link URL. A website is just a public directory whose path is recorded in
+//! `/public/<owner>/<path>` — the gateway does exactly this and 302-redirects to the
+//! read-only secret link each path is published through ([`PublishedLink`]). A website is just a public directory whose path is recorded in
 //! the profile `webroot` field.
 
 use crate::capability::AbsoluteCapability;
@@ -69,11 +69,44 @@ impl Inode {
     }
 }
 
+/// The secret link a path is published through (`PublishedLink`). Its password sits
+/// in the public tree on purpose: anyone may open a published file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedLink {
+    pub label: i64,
+    pub link_password: String,
+}
+
+impl PublishedLink {
+    pub fn to_link(&self, owner: &PublicKeyHash) -> crate::SecretLink {
+        crate::SecretLink { owner: owner.clone(), label: self.label, link_password: self.link_password.clone() }
+    }
+    fn to_cbor(&self) -> CborObject {
+        CborObject::map()
+            .put("l", CborObject::Long(self.label))
+            .put("p", CborObject::Str(self.link_password.clone()))
+            .build()
+    }
+    fn from_cbor(cbor: &CborObject) -> Result<PublishedLink> {
+        Ok(PublishedLink {
+            label: cbor.get("l").and_then(|c| c.as_long()).ok_or_else(|| Error::Cbor("PublishedLink missing 'l'".into()))?,
+            link_password: cbor
+                .get("p")
+                .and_then(|c| c.as_string())
+                .ok_or_else(|| Error::Cbor("PublishedLink missing 'p'".into()))?
+                .to_string(),
+        })
+    }
+}
+
 /// A child entry: an inode + (for a published file/dir) its capability (`InodeCap`).
+/// `link` is absent on anything published before links were, and on the
+/// directories in between.
 #[derive(Debug, Clone)]
 struct InodeCap {
     inode: Inode,
     cap: Option<AbsoluteCapability>,
+    link: Option<PublishedLink>,
 }
 
 impl InodeCap {
@@ -82,12 +115,16 @@ impl InodeCap {
         if let Some(cap) = &self.cap {
             b = b.put("c", cap.to_cbor());
         }
+        if let Some(link) = &self.link {
+            b = b.put("l", link.to_cbor());
+        }
         b.build()
     }
     fn from_cbor(cbor: &CborObject) -> Result<InodeCap> {
         Ok(InodeCap {
             inode: Inode::from_cbor(cbor.get("i").ok_or_else(|| Error::Cbor("InodeCap missing 'i'".into()))?)?,
             cap: cbor.get("c").map(AbsoluteCapability::from_cbor).transpose()?,
+            link: cbor.get("l").map(PublishedLink::from_cbor).transpose()?,
         })
     }
 }
@@ -308,6 +345,7 @@ impl InodeFileSystem {
         &mut self,
         path: &str,
         cap: &AbsoluteCapability,
+        link: Option<&PublishedLink>,
         signer: &SigningPrivateKeyAndPublicHash,
         tid: &peergos_core::storage::TransactionId,
     ) -> Result<()> {
@@ -335,7 +373,8 @@ impl InodeFileSystem {
 
             if i + 1 == elements.len() {
                 // Leaf: attach the capability to this child in the parent directory.
-                parent_dir.add_child(InodeCap { inode: child_key, cap: Some(cap.clone()) }, &owner, signer, store.as_ref(), tid).await?;
+                parent_dir
+                    .add_child(InodeCap { inode: child_key, cap: Some(cap.clone()), link: link.cloned() }, &owner, signer, store.as_ref(), tid).await?;
                 self.put_value(&parent_key, &parent_dir, signer, tid).await?;
             } else {
                 // Interior: ensure the child directory exists and is linked.
@@ -344,7 +383,7 @@ impl InodeFileSystem {
                     self.put_value(&child_key, &DirectoryInode::default(), signer, tid).await?;
                 }
                 if existing.is_none() {
-                    parent_dir.add_child(InodeCap { inode: child_key.clone(), cap: None }, &owner, signer, store.as_ref(), tid).await?;
+                    parent_dir.add_child(InodeCap { inode: child_key.clone(), cap: None, link: None }, &owner, signer, store.as_ref(), tid).await?;
                     self.put_value(&parent_key, &parent_dir, signer, tid).await?;
                 }
                 parent_key = child_key;
@@ -399,7 +438,7 @@ impl InodeFileSystem {
         if leaf_has_descendants {
             // something below is published in its own right, so keep the node and drop
             // only its capability, or that subtree is orphaned
-            leaf_dir.add_child(InodeCap { inode: leaf.inode, cap: None }, &owner, signer, store.as_ref(), tid).await?;
+            leaf_dir.add_child(InodeCap { inode: leaf.inode, cap: None, link: None }, &owner, signer, store.as_ref(), tid).await?;
             self.put_value(&leaf_key, &leaf_dir, signer, tid).await?;
             return Ok(());
         }
@@ -420,10 +459,15 @@ impl InodeFileSystem {
     }
 
     /// The most-privileged capability for `path` (`getByPath`).
+    #[cfg(test)]
     async fn get_by_path(&self, path: &str) -> Result<Option<AbsoluteCapability>> {
-        let elements = canonical_elements(path);
+        Ok(self.get_published(path).await?.and_then(|ic| ic.cap))
+    }
+
+    /// The closest published ancestor of `path` (or `path` itself).
+    async fn get_published(&self, path: &str) -> Result<Option<InodeCap>> {
         let mut current = Inode::root();
-        for name in &elements {
+        for name in &canonical_elements(path) {
             let dir = match self.get_value(&current).await? {
                 Some(d) => d,
                 None => return Ok(None),
@@ -432,13 +476,33 @@ impl InodeFileSystem {
                 Some(c) => c,
                 None => return Ok(None),
             };
-            if let Some(cap) = child.cap {
+            if child.cap.is_some() {
                 // A cap here grants access to it (and its descendants).
-                return Ok(Some(cap));
+                return Ok(Some(child));
             }
             current = child.inode;
         }
         Ok(None)
+    }
+
+    /// What is published at exactly `path`, where `get_published` stops at the
+    /// closest published ancestor (`publishedAt`).
+    async fn published_at(&self, path: &str) -> Result<Option<InodeCap>> {
+        let mut current = Inode::root();
+        let mut found = None;
+        for name in &canonical_elements(path) {
+            let dir = match self.get_value(&current).await? {
+                Some(d) => d,
+                None => return Ok(None),
+            };
+            let child = match dir.get_child(name, &self.owner, self.store.as_ref()).await? {
+                Some(c) => c,
+                None => return Ok(None),
+            };
+            current = child.inode.clone();
+            found = Some(child);
+        }
+        Ok(found)
     }
 }
 
@@ -460,49 +524,59 @@ fn writer_data_with_public(wd: &CborObject, public_cid: &Cid) -> Result<CborObje
 // Public API on UserContext
 // ---------------------------------------------------------------------------
 
-impl UserContext {
-    /// Make the file/directory at home-relative `path` public: add its read-only
-    /// capability to our public filesystem and commit the new `WriterData.public`
-    /// root (`makePublic`). Anyone can then resolve `/public/<username>/<path>`.
-    pub async fn make_public(&self, path: &str) -> Result<()> {
-        let user = self.user().ok_or_else(|| Error::Protocol("not signed in".into()))?;
-        let username = user.username.clone();
+/// Our identity WriterData, loaded to change its public filesystem.
+struct PublicUpdate {
+    owner: PublicKeyHash,
+    signer: SigningPrivateKeyAndPublicHash,
+    wd_cid: Cid,
+    wd: CborObject,
+    sequence: Option<i64>,
+    public: Option<Cid>,
+}
+
+impl PublicUpdate {
+    async fn load(ctx: &UserContext) -> Result<PublicUpdate> {
+        let user = ctx.user().ok_or_else(|| Error::Protocol("not signed in".into()))?;
         let owner = user.identity.clone();
-        let signer = user.signer.clone();
-        let store = self.store();
-        let mutable = self.mutable();
-
-        // The file's read-only capability.
-        let file = self
-            .get_by_path(path)
-            .await?
-            .ok_or_else(|| Error::Protocol(format!("no file at {path}")))?;
-        let cap = file.capability().read_only();
-        let public_path = format!("/{username}/{}", path.trim_start_matches('/'));
-
-        // Load our identity WriterData.
-        let pointer = mutable.get_pointer_target(&owner, &owner, store.as_ref()).await?;
+        let store = ctx.store();
+        let pointer = ctx.mutable().get_pointer_target(&owner, &owner, store.as_ref()).await?;
         let wd_cid = pointer.updated.clone().ok_or_else(|| Error::Protocol("no writer data".into()))?;
         let wd = store.get(&owner, &wd_cid, None).await?.ok_or_else(|| Error::Protocol("writer data missing".into()))?;
+        let public = wd.get("public").and_then(|c| c.as_link()).map(Cid::cast).transpose()?;
+        Ok(PublicUpdate { owner, signer: user.signer.clone(), wd_cid, wd, sequence: pointer.sequence, public })
+    }
 
-        let tid = store.start_transaction(&owner).await?;
-        // Load or create the public filesystem.
-        let mut fs = match wd.get("public").and_then(|c| c.as_link()) {
-            Some(link) => InodeFileSystem::load(owner.clone(), &Cid::cast(link)?, store.clone()).await?,
-            None => InodeFileSystem::create_empty(owner.clone(), &signer, store.clone(), &tid).await?,
-        };
-        fs.add_cap(&public_path, &cap, &signer, &tid).await?;
+    async fn filesystem(&self, ctx: &UserContext, tid: &TransactionId) -> Result<InodeFileSystem> {
+        match &self.public {
+            Some(root) => InodeFileSystem::load(self.owner.clone(), root, ctx.store()).await,
+            None => InodeFileSystem::create_empty(self.owner.clone(), &self.signer, ctx.store(), tid).await,
+        }
+    }
 
-        // Store the InodeFileSystem block and update WriterData.public.
-        let public_cid = put_block_signed(store.as_ref(), &owner, &signer, fs.to_cbor().to_bytes(), &tid).await?;
-        let new_wd = writer_data_with_public(&wd, &public_cid)?;
-        let new_wd_cid = put_block_signed(store.as_ref(), &owner, &signer, new_wd.to_bytes(), &tid).await?;
-        let update = PointerUpdate::new(Some(wd_cid), Some(new_wd_cid), PointerUpdate::increment(pointer.sequence));
-        if !mutable.set_pointer_update(&owner, &signer, &update).await? {
+    async fn commit(self, ctx: &UserContext, fs: &InodeFileSystem, tid: &TransactionId) -> Result<()> {
+        let store = ctx.store();
+        let public_cid = put_block_signed(store.as_ref(), &self.owner, &self.signer, fs.to_cbor().to_bytes(), tid).await?;
+        // committing an unchanged root is a noop pointer update
+        if self.public.as_ref() == Some(&public_cid) {
+            return Ok(());
+        }
+        let new_wd = writer_data_with_public(&self.wd, &public_cid)?;
+        let new_wd_cid = put_block_signed(store.as_ref(), &self.owner, &self.signer, new_wd.to_bytes(), tid).await?;
+        let update = PointerUpdate::new(Some(self.wd_cid), Some(new_wd_cid), PointerUpdate::increment(self.sequence));
+        if !ctx.mutable().set_pointer_update(&self.owner, &self.signer, &update).await? {
             return Err(Error::Protocol("public data pointer update rejected".into()));
         }
-        store.close_transaction(&owner, &tid).await?;
         Ok(())
+    }
+}
+
+impl UserContext {
+    /// Make the file/directory at home-relative `path` public (`makePublic`): mint
+    /// a read-only secret link to it, which is what the public file handler
+    /// redirects to, and add its read-only capability and that link to our public
+    /// filesystem. Anyone can then resolve `/public/<username>/<path>`.
+    pub async fn make_public(&self, path: &str) -> Result<()> {
+        self.make_public_many(&[path.to_string()]).await
     }
 
     /// Make many files/directories public in a single `WriterData.public` commit
@@ -511,41 +585,94 @@ impl UserContext {
         if paths.is_empty() {
             return Ok(());
         }
-        let user = self.user().ok_or_else(|| Error::Protocol("not signed in".into()))?;
-        let username = user.username.clone();
-        let owner = user.identity.clone();
-        let signer = user.signer.clone();
-        let store = self.store();
-        let mutable = self.mutable();
-
-        let pointer = mutable.get_pointer_target(&owner, &owner, store.as_ref()).await?;
-        let wd_cid = pointer.updated.clone().ok_or_else(|| Error::Protocol("no writer data".into()))?;
-        let wd = store.get(&owner, &wd_cid, None).await?.ok_or_else(|| Error::Protocol("writer data missing".into()))?;
-
-        let tid = store.start_transaction(&owner).await?;
-        let mut fs = match wd.get("public").and_then(|c| c.as_link()) {
-            Some(link) => InodeFileSystem::load(owner.clone(), &Cid::cast(link)?, store.clone()).await?,
-            None => InodeFileSystem::create_empty(owner.clone(), &signer, store.clone(), &tid).await?,
+        let username = self.username().ok_or_else(|| Error::Protocol("not signed in".into()))?.to_string();
+        let current = PublicUpdate::load(self).await?;
+        let existing_fs = match &current.public {
+            Some(root) => Some(InodeFileSystem::load(current.owner.clone(), root, self.store()).await?),
+            None => None,
         };
+        let mut to_publish = Vec::new();
         for path in paths {
+            let path = path.trim_matches('/').to_string();
+            if path.is_empty() {
+                return Err(Error::Protocol("You cannot publish your home directory!".into()));
+            }
             let cap = self
-                .get_by_path(path)
+                .get_by_path(&path)
                 .await?
                 .ok_or_else(|| Error::Protocol(format!("no file at {path}")))?
                 .capability()
                 .read_only();
-            let public_path = format!("/{username}/{}", path.trim_start_matches('/'));
-            fs.add_cap(&public_path, &cap, &signer, &tid).await?;
+            let public_path = format!("/{username}/{path}");
+            if let Some(fs) = &existing_fs {
+                // the profile republishes on every change, which mustn't mint a new link each time
+                if let Some(e) = fs.published_at(&public_path).await? {
+                    if e.cap.as_ref() == Some(&cap) && e.link.is_some() {
+                        continue;
+                    }
+                }
+            }
+            to_publish.push((path, public_path, cap));
         }
+        if to_publish.is_empty() {
+            return Ok(());
+        }
+        let mut minted: Vec<(String, PublishedLink)> = Vec::new();
+        for (path, _, _) in &to_publish {
+            match self.create_secret_link_to(&[path.clone()], &[], "", None, None).await {
+                Ok(props) => minted.push((
+                    path.clone(),
+                    PublishedLink { label: props.label, link_password: props.link_password },
+                )),
+                Err(e) => {
+                    self.forget_published_links(&minted).await;
+                    return Err(e);
+                }
+            }
+        }
+        // the links were written after `current` was loaded, so reload it
+        let result = async {
+            let update = PublicUpdate::load(self).await?;
+            let store = self.store();
+            let tid = store.start_transaction(&update.owner).await?;
+            let mut fs = update.filesystem(self, &tid).await?;
+            let mut previous = Vec::new();
+            for ((path, public_path, cap), (_, link)) in to_publish.iter().zip(&minted) {
+                if let Some(old) = fs.published_at(public_path).await?.and_then(|ic| ic.link) {
+                    previous.push((path.clone(), old));
+                }
+                fs.add_cap(public_path, cap, Some(link), &update.signer, &tid).await?;
+            }
+            let owner = update.owner.clone();
+            update.commit(self, &fs, &tid).await?;
+            store.close_transaction(&owner, &tid).await?;
+            Ok::<_, Error>(previous)
+        }
+        .await;
+        match result {
+            Ok(previous) => self.drop_published_links(&previous).await,
+            Err(e) => {
+                // a link nothing publishes would linger as a share of its own
+                self.forget_published_links(&minted).await;
+                Err(e)
+            }
+        }
+    }
 
-        let public_cid = put_block_signed(store.as_ref(), &owner, &signer, fs.to_cbor().to_bytes(), &tid).await?;
-        let new_wd = writer_data_with_public(&wd, &public_cid)?;
-        let new_wd_cid = put_block_signed(store.as_ref(), &owner, &signer, new_wd.to_bytes(), &tid).await?;
-        let update = PointerUpdate::new(Some(wd_cid), Some(new_wd_cid), PointerUpdate::increment(pointer.sequence));
-        if !mutable.set_pointer_update(&owner, &signer, &update).await? {
-            return Err(Error::Protocol("public data pointer update rejected".into()));
+    async fn forget_published_links(&self, links: &[(String, PublishedLink)]) {
+        for (path, link) in links {
+            if let Err(e) = self.delete_secret_link_from(link.label, &[path.clone()]).await {
+                log::warn!("Couldn't delete unused public link for {path}: {e}");
+            }
         }
-        store.close_transaction(&owner, &tid).await?;
+    }
+
+    /// A link replaced or unpublished would otherwise keep opening the file, and
+    /// keep showing as a share.
+    async fn drop_published_links(&self, links: &[(String, PublishedLink)]) -> Result<()> {
+        for (path, link) in links {
+            self.delete_secret_link_from(link.label, &[path.clone()]).await?;
+        }
         Ok(())
     }
 
@@ -553,6 +680,25 @@ impl UserContext {
     /// (`/owner/...`) — the client half of the `/public/` gateway
     /// (`getPublicCapability`). `path`'s first component is the owner's username.
     pub async fn get_public_capability(&self, path: &str) -> Result<AbsoluteCapability> {
+        let (_, published) = self.get_published(path).await?;
+        published.cap.ok_or_else(|| Error::Protocol(format!("nothing published at {path}")))
+    }
+
+    /// The link the closest published ancestor of `path` (`/owner/...`) is
+    /// published through (`getPublishedLink`).
+    pub async fn get_published_link(&self, path: &str) -> Result<crate::SecretLink> {
+        let (owner, published) = self.get_published(path).await?;
+        match published.link {
+            Some(link) => Ok(link.to_link(&owner)),
+            None => Err(Error::Protocol(format!(
+                "{} published this before public links existed, and has to publish it again",
+                canonical_elements(path).first().cloned().unwrap_or_default()
+            ))),
+        }
+    }
+
+    /// The owner, and the closest published ancestor of `path`.
+    async fn get_published(&self, path: &str) -> Result<(PublicKeyHash, InodeCap)> {
         let elements = canonical_elements(path);
         let owner_name = elements.first().ok_or_else(|| Error::Protocol("empty public path".into()))?;
         let owner = crate::login::get_public_key_hash(self.poster().as_ref(), owner_name)
@@ -566,10 +712,13 @@ impl UserContext {
             .get("public")
             .and_then(|c| c.as_link())
             .ok_or_else(|| Error::Protocol(format!("{owner_name} has not made any files public")))?;
-        let fs = InodeFileSystem::load(owner, &Cid::cast(public_link)?, store).await?;
-        fs.get_by_path(&format!("/{}", elements.join("/")))
+        let fs = InodeFileSystem::load(owner.clone(), &Cid::cast(public_link)?, store).await?;
+        let published = fs
+            .get_published(&format!("/{}", elements.join("/")))
             .await?
-            .ok_or_else(|| Error::Protocol(format!("nothing published at {path}")))
+            .filter(|ic| ic.cap.is_some())
+            .ok_or_else(|| Error::Protocol(format!("User {owner_name} has not published a file at {path}")))?;
+        Ok((owner, published))
     }
 
     /// Publish the directory at home-relative `path` as your website. The gateway
@@ -585,38 +734,28 @@ impl UserContext {
     }
 
     /// Un-publish the file/directory at home-relative `path` (`removeCap`): remove
-    /// its cap from our public filesystem and commit the new `WriterData.public`.
-    /// A no-op if nothing was published there.
+    /// its cap from our public filesystem, commit the new `WriterData.public`, and
+    /// delete the link it was published through. A no-op if nothing was published there.
     pub async fn unpublish(&self, path: &str) -> Result<()> {
-        let user = self.user().ok_or_else(|| Error::Protocol("not signed in".into()))?;
-        let username = user.username.clone();
-        let owner = user.identity.clone();
-        let signer = user.signer.clone();
-        let store = self.store();
-        let mutable = self.mutable();
-        let public_path = format!("/{username}/{}", path.trim_start_matches('/'));
-
-        let pointer = mutable.get_pointer_target(&owner, &owner, store.as_ref()).await?;
-        let wd_cid = pointer.updated.clone().ok_or_else(|| Error::Protocol("no writer data".into()))?;
-        let wd = store.get(&owner, &wd_cid, None).await?.ok_or_else(|| Error::Protocol("writer data missing".into()))?;
-        let public_link = match wd.get("public").and_then(|c| c.as_link()) {
-            Some(l) => l.to_vec(),
-            None => return Ok(()), // nothing is public
-        };
-
-        let tid = store.start_transaction(&owner).await?;
-        let mut fs = InodeFileSystem::load(owner.clone(), &Cid::cast(&public_link)?, store.clone()).await?;
-        fs.remove_cap(&public_path, &signer, &tid).await?;
-
-        let public_cid = put_block_signed(store.as_ref(), &owner, &signer, fs.to_cbor().to_bytes(), &tid).await?;
-        let new_wd = writer_data_with_public(&wd, &public_cid)?;
-        let new_wd_cid = put_block_signed(store.as_ref(), &owner, &signer, new_wd.to_bytes(), &tid).await?;
-        let update = PointerUpdate::new(Some(wd_cid), Some(new_wd_cid), PointerUpdate::increment(pointer.sequence));
-        if !mutable.set_pointer_update(&owner, &signer, &update).await? {
-            return Err(Error::Protocol("public data pointer update rejected".into()));
+        let username = self.username().ok_or_else(|| Error::Protocol("not signed in".into()))?.to_string();
+        let path = path.trim_matches('/').to_string();
+        let public_path = format!("/{username}/{path}");
+        let update = PublicUpdate::load(self).await?;
+        if update.public.is_none() {
+            return Ok(());
         }
+        let store = self.store();
+        let owner = update.owner.clone();
+        let tid = store.start_transaction(&owner).await?;
+        let mut fs = update.filesystem(self, &tid).await?;
+        let removed = fs.published_at(&public_path).await?.and_then(|ic| ic.link);
+        fs.remove_cap(&public_path, &update.signer, &tid).await?;
+        update.commit(self, &fs, &tid).await?;
         store.close_transaction(&owner, &tid).await?;
-        Ok(())
+        match removed {
+            Some(link) => self.drop_published_links(&[(path, link)]).await,
+            None => Ok(()),
+        }
     }
 
     /// Take a published website offline: un-publish the web-root directory and the
@@ -662,7 +801,7 @@ mod tests {
         // Publish 40 files in one directory — forces the inline→champ conversion.
         const N: usize = 40;
         for i in 0..N {
-            fs.add_cap(&format!("/u/dir/file{i}"), &cap(&owner, i), &signer, &tid).await.unwrap();
+            fs.add_cap(&format!("/u/dir/file{i}"), &cap(&owner, i), None, &signer, &tid).await.unwrap();
         }
         // Every file resolves back to its own capability.
         for i in 0..N {
@@ -687,15 +826,7 @@ mod tests {
 
     /// The cap published exactly at `path`, not at an ancestor.
     async fn exact(fs: &InodeFileSystem, path: &str) -> Option<AbsoluteCapability> {
-        let mut current = Inode::root();
-        let mut found = None;
-        for name in canonical_elements(path) {
-            let dir = fs.get_value(&current).await.unwrap()?;
-            let child = dir.get_child(&name, &fs.owner, fs.store.as_ref()).await.unwrap()?;
-            found = child.cap;
-            current = child.inode;
-        }
-        found
+        fs.published_at(path).await.unwrap()?.cap
     }
 
     /// Random publish / unpublish sequences over nested paths must leave exactly the
@@ -719,7 +850,7 @@ mod tests {
                 let i = (seed % paths.len() as u64) as usize;
                 let path = paths[i];
                 if (seed >> 32) % 2 == 0 {
-                    fs.add_cap(path, &cap(&owner, i), &signer, &tid).await.unwrap();
+                    fs.add_cap(path, &cap(&owner, i), None, &signer, &tid).await.unwrap();
                     published.insert(i);
                 } else {
                     fs.remove_cap(path, &signer, &tid).await.unwrap();
