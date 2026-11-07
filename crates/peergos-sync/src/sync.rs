@@ -26,7 +26,9 @@ pub async fn build_dir_state(
         &mut |props: FileProps| {
             let at_sync = synced.by_path(&props.rel_path);
             if let Some(synced_fs) = at_sync {
-                if synced_fs.modification_time == props.modified_time && synced_fs.size == props.size {
+                // a Peergos file carries its hash, which catches an edit at the same size and time
+                let same_hash_if_known = props.hash.is_none_or(|h| h == synced_fs.hash);
+                if synced_fs.modification_time == props.modified_time && synced_fs.size == props.size && same_hash_if_known {
                     btree.lock().unwrap().push(synced_fs.clone());
                     return;
                 }
@@ -110,6 +112,13 @@ pub async fn sync_dir(
         s
     };
 
+    // gone from both sides, by deletes or moves, so nothing will visit them, and they would keep their folders
+    for path in synced.all_file_paths() {
+        if !all_paths.contains(&path) {
+            synced.remove(&path);
+        }
+    }
+
     // ---- first pass: remove identical / already-synced / ignored paths ----
     let mut all_changed_paths: Vec<String> = Vec::new();
     for path in &all_paths {
@@ -119,7 +128,8 @@ pub async fn sync_dir(
 
         if let (Some(l), Some(r)) = (local_fs, remote_fs) {
             if l.hash == r.hash && l.modification_time == r.modification_time && l.size == r.size {
-                if synced_fs.is_none() {
+                // an interrupted copy that a later sync finished can leave an older version recorded
+                if synced_fs != Some(l) {
                     synced.add(l.clone());
                 }
                 if !sync_local_deletes && synced.has_local_delete(path) {
@@ -134,6 +144,12 @@ pub async fn sync_dir(
 
         if let (Some(l), Some(r), Some(s)) = (local_fs, remote_fs, synced_fs) {
             if l.hash == r.hash && (s.equals_ignore_modtime(l) || s.equals_ignore_modtime(r)) {
+                // the recorded time follows the local file, as a local mismatch costs a full hash
+                if s.modification_time != l.modification_time {
+                    let mut updated = s.clone();
+                    updated.modification_time = l.modification_time;
+                    synced.add(updated);
+                }
                 if !sync_local_deletes && synced.has_local_delete(path) {
                     synced.remove_local_delete(path);
                 }
@@ -154,6 +170,9 @@ pub async fn sync_dir(
 
         all_changed_paths.push(path.clone());
     }
+
+    // what was synced before this pass changed it, as a moved file's new path can't be one of these
+    let synced_before: HashSet<String> = synced.all_file_paths().into_iter().collect();
 
     // ---- second pass: classify into small-file batches, local deletes, and per-file sync ----
     let mut small_file_batches: Vec<Vec<String>> = vec![Vec::new()];
@@ -249,9 +268,53 @@ pub async fn sync_dir(
                 None
             };
 
-            if extra_local.len() != extra_remote.len() || remote_at_hashed_path.is_some() {
+            if extra_local.len() != extra_remote.len()
+                || remote_at_hashed_path.is_some()
+                || index.is_some_and(|i| i < extra_local.len() && synced_before.contains(&extra_local[i].rel_path))
+            {
                 local_deletes.push(rel_path.clone());
                 done_files.insert(rel_path.clone());
+            }
+        }
+    }
+
+    // ---- process local deletes (bulk), before uploads, which may need a deleted file's path for a folder ----
+    if !local_deletes.is_empty() {
+        let mut by_folder: HashMap<String, HashSet<String>> = HashMap::new();
+        for rel_path in &local_deletes {
+            if !sync_local_deletes {
+                log(&format!("Sync ignore local delete {rel_path}"));
+                synced.add_local_delete(rel_path.clone());
+                continue;
+            }
+            let (dir, fname) = split_path(rel_path);
+            by_folder.entry(dir).or_default().insert(fname);
+        }
+        for (dir, files) in &by_folder {
+            log(&format!("REMOTE: bulk deleting {} from {}", files.len(), dir));
+            let dir_path = if dir.is_empty() {
+                std::path::PathBuf::from(".")
+            } else {
+                std::path::PathBuf::from(dir)
+            };
+            let children: Vec<String> = files.iter().cloned().collect();
+            let mut still_as_scanned = Vec::new();
+            for fname in &children {
+                let full = if dir.is_empty() { fname.clone() } else { format!("{dir}/{fname}") };
+                match remote_state.by_path(&full) {
+                    Some(scanned) if as_scanned(remote, &full, scanned).await? => still_as_scanned.push(fname.clone()),
+                    _ => {
+                        // a change since the scan is a change against a delete, which the next sync copies over as new
+                        log(&format!("REMOTE: not deleting {full}, as it has changed since"));
+                        synced.remove(&full);
+                    }
+                }
+            }
+            remote.bulk_delete(&dir_path, &still_as_scanned).await?;
+            for fname in &still_as_scanned {
+                let full = if dir.is_empty() { fname.clone() } else { format!("{dir}/{fname}") };
+                log(&format!("REMOTE: deleted {full}"));
+                synced.remove(&full);
             }
         }
     }
@@ -278,6 +341,7 @@ pub async fn sync_dir(
             folder.files.push(UploadFile {
                 name: fname,
                 size: local_fs.size,
+                modified_time: local_fs.modification_time,
                 data,
             });
         }
@@ -285,39 +349,6 @@ pub async fn sync_dir(
         remote.upload_subtree(folder_list).await?;
         for rel_path in batch {
             synced.add(local_state.by_path(rel_path).cloned().unwrap());
-        }
-    }
-
-    // ---- process local deletes (bulk) ----
-    if !local_deletes.is_empty() {
-        let mut by_folder: HashMap<String, HashSet<String>> = HashMap::new();
-        for rel_path in &local_deletes {
-            if !sync_local_deletes {
-                log(&format!("Sync ignore local delete {rel_path}"));
-                synced.add_local_delete(rel_path.clone());
-                continue;
-            }
-            let (dir, fname) = split_path(rel_path);
-            by_folder.entry(dir).or_default().insert(fname);
-        }
-        for (dir, files) in &by_folder {
-            log(&format!("REMOTE: bulk deleting {} from {}", files.len(), dir));
-            let dir_path = if dir.is_empty() {
-                std::path::PathBuf::from(".")
-            } else {
-                std::path::PathBuf::from(dir)
-            };
-            let children: Vec<String> = files.iter().cloned().collect();
-            remote.bulk_delete(&dir_path, &children).await?;
-            for fname in &children {
-                let full = if dir.is_empty() {
-                    fname.clone()
-                } else {
-                    format!("{dir}/{fname}")
-                };
-                log(&format!("REMOTE: deleted {full}"));
-                synced.remove(&full);
-            }
         }
     }
 
@@ -337,6 +368,8 @@ pub async fn sync_dir(
             local,
             remote,
             synced,
+            &synced_before,
+            &mut done_files,
             &local_state,
             &remote_state,
             sync_local_deletes,
@@ -364,13 +397,20 @@ pub async fn sync_dir(
     let mut dirs: Vec<&String> = all_dirs.iter().collect();
     dirs.sort_by(|a, b| b.len().cmp(&a.len()).then(b.cmp(a)));
 
+    // a folder deleted on one side, but given new files or folders on the other, still has to exist on both
+    // now, as the copies made it again. Subfolders come first, so they can mark the folders above them.
+    let mut kept: HashSet<String> = HashSet::new();
+    for file in synced.all_file_paths() {
+        kept.extend(ancestors(&file));
+    }
     for dir_path in dirs {
         let has_local = local_state.has_dir(dir_path);
         let has_remote = remote_state.has_dir(dir_path);
         let has_synced = synced.has_dir(dir_path);
 
-        if has_local && has_remote {
+        if (has_local && has_remote) || kept.contains(dir_path) {
             synced.add_dir(dir_path.clone());
+            kept.extend(ancestors(dir_path));
         } else if !has_local && !has_remote {
             synced.remove_dir(dir_path);
         } else if has_local {
@@ -384,6 +424,7 @@ pub async fn sync_dir(
                 log(&format!("Sync Remote: mkdir {dir_path}"));
                 remote.mkdirs(std::path::Path::new(dir_path)).await?;
                 synced.add_dir(dir_path.clone());
+                kept.extend(ancestors(dir_path));
             }
         } else {
             if has_synced {
@@ -396,6 +437,7 @@ pub async fn sync_dir(
                 log(&format!("Sync Local: mkdir {dir_path}"));
                 local.mkdirs(std::path::Path::new(dir_path)).await?;
                 synced.add_dir(dir_path.clone());
+                kept.extend(ancestors(dir_path));
             }
         }
     }
@@ -410,6 +452,8 @@ async fn sync_file(
     local_fs: &dyn SyncFilesystem,
     remote_fs: &dyn SyncFilesystem,
     synced_state: &mut dyn SyncState,
+    synced_before: &HashSet<String>,
+    done_files: &mut HashSet<String>,
     local_tree: &dyn SyncState,
     remote_tree: &dyn SyncState,
     sync_local_deletes: bool,
@@ -420,10 +464,10 @@ async fn sync_file(
         None => {
             match (local, remote) {
                 (None, Some(r)) => {
-                    handle_remote_addition(r, local_fs, remote_fs, synced_state, remote_tree, local_tree, log).await?;
+                    handle_remote_addition(r, local_fs, remote_fs, synced_state, done_files, remote_tree, local_tree, log).await?;
                 }
                 (Some(l), None) => {
-                    handle_local_addition(l, local_fs, remote_fs, synced_state, local_tree, remote_tree, log).await?;
+                    handle_local_addition(l, local_fs, remote_fs, synced_state, done_files, local_tree, remote_tree, log).await?;
                 }
                 (Some(l), Some(r)) => {
                     handle_concurrent_addition(l, r, local_fs, remote_fs, synced_state, log).await?;
@@ -438,10 +482,10 @@ async fn sync_file(
                     synced_state.remove(&s.rel_path);
                 }
                 (None, Some(r)) => {
-                    handle_local_delete(s, r, local_fs, remote_fs, synced_state, remote_tree, local_tree, sync_local_deletes, log).await?;
+                    handle_local_delete(s, r, local_fs, remote_fs, synced_state, synced_before, remote_tree, local_tree, sync_local_deletes, sync_remote_deletes, log).await?;
                 }
                 (Some(l), None) => {
-                    handle_remote_delete(s, l, local_fs, remote_fs, synced_state, local_tree, remote_tree, sync_remote_deletes, log).await?;
+                    handle_remote_delete(s, l, local_fs, remote_fs, synced_state, synced_before, local_tree, remote_tree, sync_remote_deletes, log).await?;
                 }
                 (Some(l), Some(r)) => {
                     handle_both_exist(s, l, r, local_fs, remote_fs, synced_state, local_tree, remote_tree, sync_local_deletes, sync_remote_deletes, log).await?;
@@ -457,6 +501,7 @@ async fn handle_remote_addition(
     local_fs: &dyn SyncFilesystem,
     remote_fs: &dyn SyncFilesystem,
     synced_state: &mut dyn SyncState,
+    done_files: &mut HashSet<String>,
     remote_tree: &dyn SyncState,
     local_tree: &dyn SyncState,
     log: &dyn Fn(&str),
@@ -487,7 +532,12 @@ async fn handle_remote_addition(
         None
     };
 
-    if extra_local.len() == extra_remote.len() && remote_at_hashed_path.is_none() {
+    // the scan can't know of a copy this pass has made there since
+    let source_copied_since = match index.and_then(|i| extra_local.get(i)) {
+        Some(f) => remote_fs.exists(std::path::Path::new(&f.rel_path)).await.unwrap_or(false),
+        None => false,
+    };
+    if extra_local.len() == extra_remote.len() && remote_at_hashed_path.is_none() && !source_copied_since {
         let idx = index.unwrap();
         let to_move = extra_local[idx];
         let remote_path = std::path::Path::new(&remote.rel_path);
@@ -497,8 +547,9 @@ async fn handle_remote_addition(
         log(&format!("Sync Local: Moving {} ==> {}", to_move.rel_path, remote.rel_path));
         let src = std::path::PathBuf::from(&to_move.rel_path);
         let dst = std::path::PathBuf::from(&remote.rel_path);
-        local_fs.move_to(&src, &dst).await?;
+        move_file(local_fs, &src, &dst).await?;
         synced_state.remove(&to_move.rel_path);
+        done_files.insert(to_move.rel_path.clone());
         synced_state.add(remote.clone());
     } else {
         log(&format!("Sync Local: Copying {}", remote.rel_path));
@@ -510,6 +561,7 @@ async fn handle_remote_addition(
         }
         let data = remote_fs.read(&p).await?;
         local_fs.write(&p, &data, 0).await?;
+        local_fs.set_modification_time(&p, remote.modification_time).await?;
         synced_state.add(remote.clone());
     }
     Ok(())
@@ -520,6 +572,7 @@ async fn handle_local_addition(
     local_fs: &dyn SyncFilesystem,
     remote_fs: &dyn SyncFilesystem,
     synced_state: &mut dyn SyncState,
+    done_files: &mut HashSet<String>,
     local_tree: &dyn SyncState,
     remote_tree: &dyn SyncState,
     log: &dyn Fn(&str),
@@ -550,7 +603,12 @@ async fn handle_local_addition(
         None
     };
 
-    if extra_remote.len() == extra_local.len() && local_at_hashed_path.is_none() {
+    // the scan can't know of a copy this pass has made there since
+    let source_copied_since = match index.and_then(|i| extra_remote.get(i)) {
+        Some(f) => local_fs.exists(std::path::Path::new(&f.rel_path)).await.unwrap_or(false),
+        None => false,
+    };
+    if extra_remote.len() == extra_local.len() && local_at_hashed_path.is_none() && !source_copied_since {
         let idx = index.unwrap();
         let to_move = extra_remote[idx];
         let local_path = std::path::Path::new(&local.rel_path);
@@ -560,8 +618,9 @@ async fn handle_local_addition(
         log(&format!("Sync Remote: Moving {} ==> {}", to_move.rel_path, local.rel_path));
         let src = std::path::PathBuf::from(&to_move.rel_path);
         let dst = std::path::PathBuf::from(&local.rel_path);
-        remote_fs.move_to(&src, &dst).await?;
+        move_file(remote_fs, &src, &dst).await?;
         synced_state.remove(&to_move.rel_path);
+        done_files.insert(to_move.rel_path.clone());
         synced_state.add(local.clone());
     } else {
         log(&format!("Sync Remote: Copying {}", local.rel_path));
@@ -573,6 +632,7 @@ async fn handle_local_addition(
         }
         let data = local_fs.read(&p).await?;
         remote_fs.write(&p, &data, 0).await?;
+        remote_fs.set_modification_time(&p, local.modification_time).await?;
         synced_state.add(local.clone());
     }
     Ok(())
@@ -602,7 +662,7 @@ async fn handle_concurrent_addition(
         }
     } else {
         log(&format!("Sync Remote: Concurrent file addition: {} renaming local version", local.rel_path));
-        let renamed = rename_on_conflict(local_fs, std::path::Path::new(&local.rel_path), local).await?;
+        let renamed = rename_on_conflict(local_fs, Some(remote_fs), std::path::Path::new(&local.rel_path), local).await?;
         let p = std::path::PathBuf::from(&remote.rel_path);
         if let Some(parent) = p.parent() {
             if !parent.to_string_lossy().is_empty() {
@@ -611,6 +671,7 @@ async fn handle_concurrent_addition(
         }
         let data = remote_fs.read(&p).await?;
         local_fs.write(&p, &data, 0).await?;
+        local_fs.set_modification_time(&p, remote.modification_time).await?;
         synced_state.add(remote.clone());
 
         let rp = std::path::PathBuf::from(&renamed.rel_path);
@@ -622,6 +683,7 @@ async fn handle_concurrent_addition(
         }
         let data = local_fs.read(&rp).await?;
         remote_fs.write(&rp, &data, 0).await?;
+        remote_fs.set_modification_time(&rp, renamed.modification_time).await?;
         synced_state.add(renamed);
     }
     Ok(())
@@ -633,9 +695,11 @@ async fn handle_local_delete(
     local_fs: &dyn SyncFilesystem,
     remote_fs: &dyn SyncFilesystem,
     synced_state: &mut dyn SyncState,
+    synced_before: &HashSet<String>,
     remote_tree: &dyn SyncState,
     local_tree: &dyn SyncState,
     sync_local_deletes: bool,
+    sync_remote_deletes: bool,
     log: &dyn Fn(&str),
 ) -> Result<()> {
     if synced.equals_ignore_modtime(remote) {
@@ -652,23 +716,26 @@ async fn handle_local_delete(
             .copied()
             .collect();
 
-        let index = extra_local.iter().position(|f| f.rel_path == synced.rel_path);
-        let local_at_hashed_path = if extra_remote.len() == extra_local.len() {
-            index.and_then(|i| {
-                if i < extra_remote.len() {
-                    local_tree.by_path(&extra_remote[i].rel_path)
-                } else {
-                    None
-                }
-            })
-        } else {
-            None
-        };
+        // where it may have moved to locally
+        let partner = extra_remote
+            .iter()
+            .position(|f| f.rel_path == remote.rel_path)
+            .and_then(|i| extra_local.get(i));
+        let remote_at_hashed_path = partner.and_then(|p| remote_tree.by_path(&p.rel_path));
 
-        if extra_remote.len() == extra_local.len() && local_at_hashed_path.is_none() {
+        // a synced partner is a copy that was already there, not where this moved to
+        if extra_remote.len() == extra_local.len()
+            && partner.is_some()
+            && remote_at_hashed_path.is_none()
+            && !synced_before.contains(&partner.unwrap().rel_path)
+        {
             // rename handled by new path entry
         } else {
-            if sync_local_deletes {
+            if sync_local_deletes && !as_scanned(remote_fs, &remote.rel_path, remote).await? {
+                // an edit since the scan is a change against a delete, which the next sync copies over as new
+                log(&format!("Sync Remote: not deleting {}, as it has changed since", remote.rel_path));
+                synced_state.remove(&synced.rel_path);
+            } else if sync_local_deletes {
                 log(&format!("Sync Remote: delete {}", synced.rel_path));
                 let p = std::path::PathBuf::from(&synced.rel_path);
                 remote_fs.delete(&p).await?;
@@ -690,9 +757,13 @@ async fn handle_local_delete(
         }
         let data = remote_fs.read(&p).await?;
         local_fs.write(&p, &data, 0).await?;
+        local_fs.set_modification_time(&p, remote.modification_time).await?;
         synced_state.add(remote.clone());
         if !sync_local_deletes && synced_state.has_local_delete(&remote.rel_path) {
             synced_state.remove_local_delete(&remote.rel_path);
+        }
+        if !sync_remote_deletes && synced_state.has_remote_delete(&remote.rel_path) {
+            synced_state.remove_remote_delete(&remote.rel_path);
         }
     }
     Ok(())
@@ -704,6 +775,7 @@ async fn handle_remote_delete(
     local_fs: &dyn SyncFilesystem,
     remote_fs: &dyn SyncFilesystem,
     synced_state: &mut dyn SyncState,
+    synced_before: &HashSet<String>,
     local_tree: &dyn SyncState,
     remote_tree: &dyn SyncState,
     sync_remote_deletes: bool,
@@ -723,23 +795,26 @@ async fn handle_remote_delete(
             .copied()
             .collect();
 
-        let index = extra_remote.iter().position(|f| f.rel_path == synced.rel_path);
-        let remote_at_hashed_path = if extra_local.len() == extra_remote.len() {
-            index.and_then(|i| {
-                if i < extra_local.len() {
-                    remote_tree.by_path(&extra_local[i].rel_path)
-                } else {
-                    None
-                }
-            })
-        } else {
-            None
-        };
+        // where it may have moved to remotely
+        let partner = extra_local
+            .iter()
+            .position(|f| f.rel_path == local.rel_path)
+            .and_then(|i| extra_remote.get(i));
+        let local_at_hashed_path = partner.and_then(|p| local_tree.by_path(&p.rel_path));
 
-        if extra_local.len() == extra_remote.len() && remote_at_hashed_path.is_none() {
+        // a synced partner is a copy that was already there, not where this moved to
+        if extra_local.len() == extra_remote.len()
+            && partner.is_some()
+            && local_at_hashed_path.is_none()
+            && !synced_before.contains(&partner.unwrap().rel_path)
+        {
             // rename handled by new path entry
         } else {
-            if sync_remote_deletes {
+            if sync_remote_deletes && !as_scanned(local_fs, &local.rel_path, local).await? {
+                // an edit since the scan is a change against a delete, which the next sync copies over as new
+                log(&format!("Sync Local: not deleting {}, as it has changed since", local.rel_path));
+                synced_state.remove(&synced.rel_path);
+            } else if sync_remote_deletes {
                 log(&format!("Sync Local: delete {}", synced.rel_path));
                 let p = std::path::PathBuf::from(&synced.rel_path);
                 local_fs.delete(&p).await?;
@@ -761,6 +836,7 @@ async fn handle_remote_delete(
         }
         let data = local_fs.read(&p).await?;
         remote_fs.write(&p, &data, 0).await?;
+        remote_fs.set_modification_time(&p, local.modification_time).await?;
         synced_state.add(local.clone());
         if !sync_remote_deletes && synced_state.has_remote_delete(&local.rel_path) {
             synced_state.remove_remote_delete(&local.rel_path);
@@ -794,7 +870,7 @@ async fn handle_both_exist(
             }
         } else if synced_state.has_remote_delete(&remote.rel_path) {
             log(&format!("Sync Remote: Concurrent change: {} renaming local version after remote delete", local.rel_path));
-            let renamed = rename_on_conflict(local_fs, std::path::Path::new(&local.rel_path), local).await?;
+            let renamed = rename_on_conflict(local_fs, Some(remote_fs), std::path::Path::new(&local.rel_path), local).await?;
             let p = std::path::PathBuf::from(&remote.rel_path);
             if let Some(parent) = p.parent() {
                 if !parent.to_string_lossy().is_empty() {
@@ -803,6 +879,7 @@ async fn handle_both_exist(
             }
             let data = remote_fs.read(&p).await?;
             local_fs.write(&p, &data, 0).await?;
+            local_fs.set_modification_time(&p, remote.modification_time).await?;
             synced_state.add(remote.clone());
 
             let rp = std::path::PathBuf::from(&renamed.rel_path);
@@ -814,6 +891,7 @@ async fn handle_both_exist(
             }
             let data = local_fs.read(&rp).await?;
             remote_fs.write(&rp, &data, 0).await?;
+            remote_fs.set_modification_time(&rp, renamed.modification_time).await?;
             synced_state.add(renamed);
             synced_state.remove_remote_delete(&remote.rel_path);
         } else {
@@ -826,6 +904,7 @@ async fn handle_both_exist(
             }
             let data = remote_fs.read(&p).await?;
             local_fs.write(&p, &data, 0).await?;
+            local_fs.set_modification_time(&p, remote.modification_time).await?;
             synced_state.add(remote.clone());
         }
     } else if synced.equals_ignore_modtime(remote) {
@@ -840,7 +919,7 @@ async fn handle_both_exist(
             }
         } else if synced_state.has_local_delete(&local.rel_path) {
             log(&format!("Sync Remote: Concurrent change: {} renaming local version after local delete", local.rel_path));
-            let renamed = rename_on_conflict(local_fs, std::path::Path::new(&local.rel_path), local).await?;
+            let renamed = rename_on_conflict(local_fs, Some(remote_fs), std::path::Path::new(&local.rel_path), local).await?;
             let p = std::path::PathBuf::from(&remote.rel_path);
             if let Some(parent) = p.parent() {
                 if !parent.to_string_lossy().is_empty() {
@@ -849,6 +928,7 @@ async fn handle_both_exist(
             }
             let data = remote_fs.read(&p).await?;
             local_fs.write(&p, &data, 0).await?;
+            local_fs.set_modification_time(&p, remote.modification_time).await?;
             synced_state.add(remote.clone());
 
             let rp = std::path::PathBuf::from(&renamed.rel_path);
@@ -860,6 +940,7 @@ async fn handle_both_exist(
             }
             let data = local_fs.read(&rp).await?;
             remote_fs.write(&rp, &data, 0).await?;
+            remote_fs.set_modification_time(&rp, renamed.modification_time).await?;
             synced_state.add(renamed);
             synced_state.remove_local_delete(&local.rel_path);
         } else {
@@ -872,6 +953,7 @@ async fn handle_both_exist(
             }
             let data = local_fs.read(&p).await?;
             remote_fs.write(&p, &data, 0).await?;
+            remote_fs.set_modification_time(&p, local.modification_time).await?;
             synced_state.add(local.clone());
         }
     } else {
@@ -901,10 +983,11 @@ async fn handle_concurrent_change(
         }
         let data = local_fs.read(&p).await?;
         remote_fs.write(&p, &data, 0).await?;
+        remote_fs.set_modification_time(&p, local.modification_time).await?;
         synced_state.add(local.clone());
     } else {
         log(&format!("Sync Remote: Concurrent change: {} renaming local version", local.rel_path));
-        let renamed = rename_on_conflict(local_fs, std::path::Path::new(&local.rel_path), local).await?;
+        let renamed = rename_on_conflict(local_fs, Some(remote_fs), std::path::Path::new(&local.rel_path), local).await?;
         let p = std::path::PathBuf::from(&remote.rel_path);
         if let Some(parent) = p.parent() {
             if !parent.to_string_lossy().is_empty() {
@@ -913,6 +996,7 @@ async fn handle_concurrent_change(
         }
         let data = remote_fs.read(&p).await?;
         local_fs.write(&p, &data, 0).await?;
+        local_fs.set_modification_time(&p, remote.modification_time).await?;
         synced_state.add(remote.clone());
 
         let rp = std::path::PathBuf::from(&renamed.rel_path);
@@ -924,56 +1008,108 @@ async fn handle_concurrent_change(
         }
         let data = local_fs.read(&rp).await?;
         remote_fs.write(&rp, &data, 0).await?;
+        remote_fs.set_modification_time(&rp, renamed.modification_time).await?;
         synced_state.add(renamed);
     }
     Ok(())
 }
 
+/// Rename to a conflict name that is free on this side and, if given, on the other one, where a file may yet be
+/// copied across under the same name
 async fn rename_on_conflict(
     fs: &dyn SyncFilesystem,
+    other: Option<&dyn SyncFilesystem>,
     path: &Path,
     state: &FileState,
 ) -> Result<FileState> {
     let name = path.file_name().unwrap().to_string_lossy().to_string();
-    let parent = path.parent().unwrap_or(Path::new("."));
-    let new_name = if let Some(cs) = name.find("[conflict-") {
-        let before = &name[..cs];
-        let after = cs + name[cs..].find(']').map(|i| i + 1).unwrap_or(name.len());
-        let rest = &name[after..];
-        let ver: u32 = name[cs + "[conflict-".len()..name[cs..].find(']').map(|i| cs + i).unwrap_or(name.len())]
-            .parse()
-            .unwrap_or(0);
-        loop {
-            let candidate = format!("{before}[conflict-{}]{rest}", ver + 1);
-            if !fs.exists(&parent.join(&candidate)).await.unwrap_or(false) {
-                break candidate;
-            }
+    let parent = path.parent().unwrap_or(Path::new(""));
+    let dir_rel = state.rel_path.strip_suffix(name.as_str()).unwrap_or("").to_string();
+    let taken = |candidate: String| {
+        let (here, there) = (parent.join(&candidate), std::path::PathBuf::from(format!("{dir_rel}{candidate}")));
+        async move {
+            fs.exists(&here).await.unwrap_or(false)
+                || match other {
+                    Some(o) => o.exists(&there).await.unwrap_or(false),
+                    None => false,
+                }
         }
-    } else {
-        let mut version = 0u32;
-        loop {
-            let candidate = if let Some(dot) = name.rfind('.') {
-                format!("{}[conflict-{version}]{}", &name[..dot], &name[dot..])
-            } else {
-                format!("{name}[conflict-{version}]")
-            };
-            if !fs.exists(&parent.join(&candidate)).await.unwrap_or(false) {
+    };
+    let conflict = name.rfind("[conflict-").and_then(|start| {
+        let end = start + name[start..].find(']')?;
+        let version: u32 = name[start + "[conflict-".len()..end].parse().ok()?;
+        Some((start, end, version))
+    });
+    let new_name = match conflict {
+        Some((start, end, mut version)) => loop {
+            let candidate = format!("{}[conflict-{}]{}", &name[..start], version + 1, &name[end + 1..]);
+            if !taken(candidate.clone()).await {
                 break candidate;
             }
             version += 1;
+        },
+        None => {
+            let mut version = 0u32;
+            loop {
+                let candidate = match name.rfind('.') {
+                    Some(dot) => format!("{}[conflict-{version}]{}", &name[..dot], &name[dot..]),
+                    None => format!("{name}[conflict-{version}]"),
+                };
+                if !taken(candidate.clone()).await {
+                    break candidate;
+                }
+                version += 1;
+            }
         }
     };
 
     let new_path = parent.join(&new_name);
     fs.move_to(path, &new_path).await?;
     let new_mtime = fs.get_last_modified(&new_path).await.unwrap_or(state.modification_time);
-    let name_old = path.file_name().unwrap().to_string_lossy();
-    let new_rel_path = if let Some(prefix) = state.rel_path.strip_suffix(name_old.as_ref()) {
-        format!("{prefix}{new_name}")
-    } else {
-        new_name.clone()
-    };
-    Ok(FileState::new(new_rel_path, new_mtime, state.size, state.hash).with_chunk_size(state.chunk_size))
+    Ok(FileState::new(format!("{dir_rel}{new_name}"), new_mtime, state.size, state.hash).with_chunk_size(state.chunk_size))
+}
+
+/// A file moved into a folder that took its name has to make way for the folder first
+async fn move_file(fs: &dyn SyncFilesystem, from: &Path, to: &Path) -> Result<()> {
+    if !to.starts_with(from) {
+        return fs.move_to(from, to).await;
+    }
+    let parent = from.parent().unwrap_or(Path::new(""));
+    let name = from.file_name().unwrap().to_string_lossy().to_string();
+    let mut aside = parent.join(format!("{name}.sync-moving"));
+    let mut i = 1;
+    while fs.exists(&aside).await? {
+        aside = parent.join(format!("{name}.sync-moving{i}"));
+        i += 1;
+    }
+    fs.move_to(from, &aside).await?;
+    fs.move_to(&aside, to).await
+}
+
+/// Whether a file is still as the scan found it
+async fn as_scanned(fs: &dyn SyncFilesystem, rel_path: &str, scanned: &FileState) -> Result<bool> {
+    let p = Path::new(rel_path);
+    if !fs.exists(p).await? || fs.size(p).await? != scanned.size {
+        return Ok(false);
+    }
+    if fs.get_last_modified(p).await? == scanned.modification_time {
+        return Ok(true);
+    }
+    // a scan keeps the synced version of a file whose contents haven't changed, whatever its modification time
+    Ok(fs.hash_file(p, scanned.size, scanned.chunk_size).await?.0 == scanned.hash)
+}
+
+fn ancestors(path: &str) -> Vec<String> {
+    let mut res = Vec::new();
+    let mut end = path.len();
+    while let Some(slash) = path[..end].rfind('/') {
+        if slash == 0 {
+            break;
+        }
+        res.push(path[..slash].to_string());
+        end = slash;
+    }
+    res
 }
 
 fn split_path(path: &str) -> (String, String) {

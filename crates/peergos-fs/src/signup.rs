@@ -601,7 +601,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Sign a `TimeLimitedClient.SignedRequest{path, now}` with `identity` (attached).
-fn sign_time_limited(identity: &SigningPrivateKeyAndPublicHash, path: &str) -> Result<Vec<u8>> {
+pub(crate) fn sign_time_limited(identity: &SigningPrivateKeyAndPublicHash, path: &str) -> Result<Vec<u8>> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)

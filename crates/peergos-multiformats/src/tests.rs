@@ -102,3 +102,16 @@ fn read_uvarint_rejects_overflow() {
     let mut pos = 0;
     assert!(read_uvarint(&buf, &mut pos).is_err());
 }
+
+#[test]
+fn base64_vectors() {
+    for (raw, enc) in [("", ""), ("f", "Zg"), ("fo", "Zm8"), ("foo", "Zm9v"), ("foob", "Zm9vYg"), ("fooba", "Zm9vYmE"), ("foobar", "Zm9vYmFy")] {
+        assert_eq!(base64_encode(raw.as_bytes()), enc);
+        assert_eq!(base64_decode(enc).unwrap(), raw.as_bytes());
+    }
+    assert_eq!(base64_decode("Zm8=").unwrap(), b"fo");
+    let data = [0xfbu8, 0xff, 0xfe];
+    assert_eq!(base64_encode(&data), "+//+");
+    assert_eq!(base64_decode("-__-").unwrap(), data);
+    assert_eq!(multibase_decode(&multibase_encode_base64(&data)).unwrap(), data);
+}

@@ -288,44 +288,81 @@ impl ChatController {
 
     /// Mirror an attachment referenced from another member's message into our own
     /// chat media directory, preserving its `year/month/filename` sub-path
-    /// (`mirrorMedia`). We never mirror our own media.
+    /// (`mirrorMedia`). We never mirror our own media. Anything that can't be
+    /// mirrored is skipped, as failing would stop every later merge of this chat.
     async fn mirror_media(&self, r: &FileRef, mirror_username: &str) -> Result<()> {
         if mirror_username == self.username()? {
             return Ok(());
         }
-        // The chat-relative part of the source path: everything after
-        // `.../shared/media/` (i.e. `<year>/<month>/<file>`).
-        const MARKER: &str = "/shared/media/";
-        let rel = match r.path.find(MARKER) {
-            Some(i) => &r.path[i + MARKER.len()..],
-            None => return Ok(()), // not a chat-media path
+        let media_dir = [MESSAGING_BASE_DIR, self.chat_uuid.as_str(), "shared", "media"];
+        let Some(parts) = chat_media_parts(&r.path, &media_dir) else {
+            log::warn!("Not copying a chat attachment from outside the chat's media folders");
+            return Ok(());
         };
-        let (sub_dir, filename) = match rel.rsplit_once('/') {
-            Some((d, f)) => (d.to_string(), f.to_string()),
-            None => (String::new(), rel.to_string()),
-        };
-        // Read the source file (reachable via getByPath, incl. a friend's share).
-        let source = self
-            .context
-            .get_by_path(&r.path)
-            .await?
-            .ok_or_else(|| Error::Protocol(format!("chat media not found: {}", r.path)))?;
-        let data = source.read().await?;
+        let chat_relative = &parts[1 + media_dir.len()..];
+        let (filename, sub_dirs) = chat_relative.split_last().unwrap();
 
-        // Our own copy: .messaging/<uuid>/shared/media/<year>/<month>/<file>.
-        let mut dir_rel = format!("{MESSAGING_BASE_DIR}/{}/shared/media", self.chat_uuid);
-        if !sub_dir.is_empty() {
+        // Try the source first, then the mirror we are currently merging
+        let mirrored_path = format!("/{mirror_username}/{}", parts[1..].join("/"));
+        let source = match self.context.get_by_path(&r.path).await {
+            Ok(Some(f)) => Some(f),
+            _ => self.context.get_by_path(&mirrored_path).await?,
+        };
+        let Some(source) = source else {
+            // failing here reads as the member's whole mirror being gone, which removes them from the chat
+            log::warn!("Not copying a chat attachment that is no longer there");
+            return Ok(());
+        };
+        if source.is_directory() {
+            log::warn!("Not copying a folder named as a chat attachment");
+            return Ok(());
+        }
+
+        let mut dir_rel = media_dir.join("/");
+        for d in sub_dirs {
             dir_rel.push('/');
-            dir_rel.push_str(&sub_dir);
+            dir_rel.push_str(d);
         }
         let home = self.context.get_home().await?;
         let dir = home.get_or_mkdirs(&dir_rel).await?;
-        dir.upload(&filename, &data).await?;
+        // A media file's name is unique, so one already there is this file, mirrored before or our own named back at us
+        if dir.child(filename).await?.is_some() {
+            return Ok(());
+        }
+        let data = source.read().await?;
+        dir.upload(filename, &data).await?;
         Ok(())
     }
+}
+
+/// The components of `path` if it is a file in some member's media folder for this chat, which is where every
+/// attachment is uploaded. The copy is made with our own access, so any other path would copy one of our own
+/// files, or one shared with us, into the chat for its members to read.
+fn chat_media_parts<'a>(path: &'a str, media_dir: &[&str]) -> Option<Vec<&'a str>> {
+    let parts: Vec<&str> = path.strip_prefix('/').unwrap_or(path).split('/').collect();
+    if parts.len() <= 1 + media_dir.len() || parts.iter().any(|p| p.is_empty() || *p == "." || *p == "..") {
+        return None;
+    }
+    (parts[1..1 + media_dir.len()] == *media_dir).then_some(parts)
 }
 
 /// Join a sorted set of admin names with commas (matching Java's `TreeSet` join).
 fn join_csv(names: &BTreeSet<String>) -> String {
     names.iter().cloned().collect::<Vec<_>>().join(",")
+}
+
+#[cfg(test)]
+mod media_path_tests {
+    use super::chat_media_parts;
+
+    #[test]
+    fn only_this_chats_media_is_copied() {
+        let dir = [".messaging", "u1", "shared", "media"];
+        assert!(chat_media_parts("/bob/.messaging/u1/shared/media/2026/10/a.jpg", &dir).is_some());
+        assert!(chat_media_parts("/bob/.messaging/u2/shared/media/2026/10/a.jpg", &dir).is_none());
+        assert!(chat_media_parts("/bob/docs/shared/media/a.jpg", &dir).is_none());
+        assert!(chat_media_parts("/bob/.messaging/u1/shared/media/../../../../secret.txt", &dir).is_none());
+        assert!(chat_media_parts("/bob/.messaging/u1/shared/media", &dir).is_none());
+        assert!(chat_media_parts("/bob/.messaging/u1/shared/media//a.jpg", &dir).is_none());
+    }
 }

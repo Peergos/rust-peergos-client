@@ -9,6 +9,8 @@ pub struct FileProps {
     pub rel_path: String,
     pub modified_time: i64,
     pub size: u64,
+    /// The content hash, where the filesystem keeps one, as Peergos does.
+    pub hash: Option<[u8; 32]>,
 }
 
 /// A small file ready for bulk upload (≤5 MiB, with pre-read bytes).
@@ -16,6 +18,7 @@ pub struct FileProps {
 pub struct UploadFile {
     pub name: String,
     pub size: u64,
+    pub modified_time: i64,
     pub data: Vec<u8>,
 }
 

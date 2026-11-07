@@ -5,8 +5,11 @@ use std::fmt;
 pub enum Error {
     /// Transport / IO failure talking to the server.
     Http(String),
-    /// Server returned a rate-limit / overloaded status (429/502/503/504).
+    /// Server returned an overloaded status (502/503/504), or its queue is full.
     RateLimited,
+    /// An HTTP 429: the server refused the request without acting on it. The message
+    /// starts with "Rate Limit" for a per user or server wide limit, which won't clear soon.
+    TooManyRequests(String),
     /// Storage quota reached.
     QuotaExceeded(String),
     /// A malformed or unexpected server response.
@@ -24,12 +27,20 @@ impl fmt::Display for Error {
         match self {
             Error::Http(s) => write!(f, "http error: {s}"),
             Error::RateLimited => write!(f, "rate limited"),
+            Error::TooManyRequests(s) => write!(f, "{s}"),
             Error::QuotaExceeded(s) => write!(f, "storage quota exceeded: {s}"),
             Error::Protocol(s) => write!(f, "protocol error: {s}"),
             Error::Cbor(s) => write!(f, "cbor error: {s}"),
             Error::Multiformat(s) => write!(f, "multiformat error: {s}"),
             Error::Crypto(s) => write!(f, "crypto error: {s}"),
         }
+    }
+}
+
+impl Error {
+    /// A 429 that is safe and worth retrying soon.
+    pub fn is_transient_too_many_requests(&self) -> bool {
+        matches!(self, Error::TooManyRequests(msg) if !msg.starts_with("Rate Limit"))
     }
 }
 

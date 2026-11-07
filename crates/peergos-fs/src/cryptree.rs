@@ -222,7 +222,10 @@ pub struct FileProperties {
     pub size: u64,
     pub is_hidden: bool,
     pub modified_epoch: i64,
+    /// The sub-second part of the modified time.
+    pub modified_nanos: u32,
     pub created_epoch: i64,
+    pub created_nanos: u32,
     /// Present for files with multiple chunks; drives next-chunk map-key derivation.
     pub stream_secret: Option<Vec<u8>>,
     /// Optional thumbnail: (mime type, bytes).
@@ -257,7 +260,9 @@ impl FileProperties {
             size,
             is_hidden: get_bool("h").unwrap_or(false),
             modified_epoch,
+            modified_nanos: cbor.get("tn").and_then(|c| c.as_long()).unwrap_or(0) as u32,
             created_epoch: cbor.get("c").and_then(|c| c.as_long()).unwrap_or(modified_epoch),
+            created_nanos: cbor.get("cn").and_then(|c| c.as_long()).unwrap_or(0) as u32,
             stream_secret: cbor.get("p").and_then(|c| c.as_bytes()).map(|b| b.to_vec()),
             thumbnail: cbor.get("i").and_then(|c| c.as_bytes()).map(|d| {
                 // Thumbnails are always WebP; default accordingly if the mime is absent.
@@ -289,7 +294,9 @@ impl FileProperties {
             size,
             is_hidden: false,
             modified_epoch: epoch,
+            modified_nanos: 0,
             created_epoch: epoch,
+            created_nanos: 0,
             stream_secret: Some(stream_secret),
             thumbnail,
             tree_hash: None,
@@ -307,7 +314,9 @@ impl FileProperties {
             size: 0,
             is_hidden: false,
             modified_epoch: 0,
+            modified_nanos: 0,
             created_epoch: 0,
+            created_nanos: 0,
             stream_secret: None,
             thumbnail: None,
             tree_hash: None,
@@ -325,12 +334,23 @@ impl FileProperties {
             size: 0,
             is_hidden: false,
             modified_epoch: epoch,
+            modified_nanos: 0,
             created_epoch: epoch,
+            created_nanos: 0,
             stream_secret: None,
             thumbnail: None,
             tree_hash: None,
             chunk_size: crate::retrieve::LEGACY_CHUNK_SIZE,
         }
+    }
+
+    pub fn modified_millis(&self) -> i64 {
+        self.modified_epoch * 1000 + (self.modified_nanos / 1_000_000) as i64
+    }
+
+    pub fn set_modified_millis(&mut self, millis: i64) {
+        self.modified_epoch = millis.div_euclid(1000);
+        self.modified_nanos = (millis.rem_euclid(1000) * 1_000_000) as u32;
     }
 
     pub fn to_cbor(&self) -> CborObject {
@@ -341,9 +361,9 @@ impl FileProperties {
             .put("m", CborObject::Str(self.mime_type.clone()))
             .put("s", CborObject::Long(self.size as i64))
             .put("t", CborObject::Long(self.modified_epoch))
-            .put("tn", CborObject::Long(0))
+            .put("tn", CborObject::Long(self.modified_nanos as i64))
             .put("c", CborObject::Long(self.created_epoch))
-            .put("cn", CborObject::Long(0))
+            .put("cn", CborObject::Long(self.created_nanos as i64))
             .put("h", CborObject::Boolean(self.is_hidden));
         if let Some(branch) = &self.tree_hash {
             b = b.put("th", branch.to_cbor());
@@ -579,6 +599,7 @@ impl CryptreeNode {
         let mut props = self.get_properties(base_key)?;
         props.tree_hash = None;
         props.modified_epoch = modified_epoch;
+        props.modified_nanos = 0;
         let from_parent = CborObject::map()
             .put_opt("p", parent_link.as_ref().map(|p| p.to_cbor()))
             .put("s", props.to_cbor())

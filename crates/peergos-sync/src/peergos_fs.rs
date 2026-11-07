@@ -58,7 +58,7 @@ impl PeergosSyncFS {
     async fn resolve_cap(&self, p: &Path) -> Result<Option<AbsoluteCapability>> {
         let path_str = p.to_string_lossy();
         let components: Vec<&str> = path_str.split('/')
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty() && *s != ".")
             .collect();
         let mut current = self.root_cap.clone();
         for comp in &components {
@@ -69,6 +69,12 @@ impl PeergosSyncFS {
             }
         }
         Ok(Some(current))
+    }
+
+    async fn parent_cap(&self, p: &Path) -> Result<AbsoluteCapability> {
+        let parent = p.parent().unwrap_or(Path::new(""));
+        self.resolve_cap(parent).await?
+            .ok_or_else(|| Error::Protocol(format!("parent not found: {}", p.display())))
     }
 
     fn mirror_bat_id(&self) -> Option<peergos_core::auth::BatId> {
@@ -178,23 +184,13 @@ impl SyncFilesystem for PeergosSyncFS {
 
             let signer = recover_signer(&src_parent_cap, self.bstore(), &*self.bmutable()).await?;
 
-            // Use peergos_fs::move_to — fast path (metadata-only) when both dirs
-            // share a writer, otherwise copy-under-fresh-keys + delete.
-            peergos_fs::move_to(
-                &src_parent_cap, &src_name, &tgt_parent_cap, true,
+            // fast path (metadata-only) when both dirs share a writer, otherwise copy-under-fresh-keys + delete,
+            // and the new name in the same write
+            peergos_fs::move_to_as(
+                &src_parent_cap, &src_name, &tgt_parent_cap, &tgt_name, true,
                 Some(signer), self.mirror_bat_id().as_ref(),
                 self.bstore(), &*self.bmutable(),
             ).await?;
-
-            // Rename the child in the target directory if the filename changed
-            if src_name != tgt_name {
-                let tgt_signer = recover_signer(&tgt_parent_cap, self.bstore(), &*self.bmutable()).await?;
-                rename_child(
-                    &tgt_parent_cap, &src_name, &tgt_name,
-                    Some(tgt_signer), self.mirror_bat_id().as_ref(),
-                    self.bstore(), &*self.bmutable(),
-                ).await?;
-            }
 
             Ok(())
         }
@@ -209,12 +205,27 @@ impl SyncFilesystem for PeergosSyncFS {
         let cap = self.resolve_cap(p).await?
             .ok_or_else(|| Error::Protocol(format!("not found: {}", p.display())))?;
         let (_node, props) = retrieve_file_metadata(&cap, self.bstore(), &*self.bmutable()).await?;
-        let millis = props.modified_epoch * 1000;
-        Ok(millis / 1000 * 1000)
+        Ok(props.modified_millis())
     }
 
-    async fn set_modification_time(&self, _p: &Path, _t: i64) -> Result<()> {
-        Ok(())
+    async fn set_modification_time(&self, p: &Path, t: i64) -> Result<()> {
+        let cp = self.net.checkpoint();
+        let res: Result<_> = async {
+            let cap = self.resolve_cap(p).await?
+                .ok_or_else(|| Error::Protocol(format!("set_modification_time: not found: {}", p.display())))?;
+            let (_node, props) = retrieve_file_metadata(&cap, self.bstore(), &*self.bmutable()).await?;
+            let dir_cap = self.parent_cap(p).await?;
+            let signer = recover_signer(&dir_cap, self.bstore(), &*self.bmutable()).await?;
+            let mut new_props = props.clone();
+            new_props.set_modified_millis(t);
+            update_file_properties(&dir_cap, &cap, Some(signer), self.mirror_bat_id().as_ref(), new_props,
+                self.bstore(), &*self.bmutable()).await
+        }
+        .await;
+        if res.is_err() {
+            self.net.rollback(&cp);
+        }
+        res
     }
 
     async fn size(&self, p: &Path) -> Result<u64> {
@@ -343,7 +354,7 @@ impl SyncFilesystem for PeergosSyncFS {
             .ok_or_else(|| Error::Protocol("upload_subtree: no signer".into()))?;
         let pfolders: Vec<FolderUpload> = folders.into_iter().map(|f| {
             let files: Vec<FileUpload> = f.files.into_iter().map(|uf| {
-                FileUpload::from_bytes(uf.name, uf.data)
+                FileUpload::from_bytes(uf.name, uf.data).with_modified_millis(uf.modified_time)
             }).collect();
             FolderUpload { rel_path: f.rel_path, files }
         }).collect();
@@ -391,11 +402,11 @@ async fn apply_to_subtree_recursive(
         let child_path = rel.join(&child.name);
         let rel_str = child_path.to_string_lossy().replace('\\', "/");
         let (node, props) = retrieve_file_metadata(&child.cap, store.clone(), mutable).await?;
-        let millis = props.modified_epoch * 1000;
         let fp = FileProps {
             rel_path: rel_str,
-            modified_time: millis / 1000 * 1000,
+            modified_time: props.modified_millis(),
             size: props.size,
+            hash: props.tree_hash.as_ref().and_then(|t| t.root_hash.hash.as_slice().try_into().ok()),
         };
         if node.is_directory() {
             on_dir(fp);

@@ -1099,6 +1099,16 @@ impl UserContext {
         crate::get_friend_annotations(user, self.store.clone(), self.mutable.as_ref()).await
     }
 
+    /// "verified", "unverified", or "changed" if the friend's identity is no longer the one that was verified
+    /// (`verificationStatus`).
+    pub async fn verification_status(&self, friend: &str, annotation: Option<&crate::FriendAnnotation>) -> Result<&'static str> {
+        let Some(annotation) = annotation.filter(|a| a.is_verified) else {
+            return Ok("unverified");
+        };
+        let id = crate::login::get_public_key_hash(self.poster.as_ref(), friend).await?;
+        Ok(if id.is_some_and(|id| annotation.is_verified_for(&id)) { "verified" } else { "changed" })
+    }
+
     /// Add or replace a friend annotation (`addFriendAnnotation`).
     pub async fn add_friend_annotation(&self, annotation: crate::FriendAnnotation) -> Result<()> {
         let user = self.require_user()?;

@@ -173,9 +173,7 @@ pub async fn send_follow_request(
             fr = fr.put("k", k.to_cbor());
         }
         let follow_request = fr.build();
-        let mut updated = pending.clone();
-        updated.insert(target_username.to_string());
-        write_pending_outgoing(user, &updated, store.clone(), mutable).await?;
+        change_pending_outgoing(user, |p| p.insert(target_username.to_string()), store.clone(), mutable).await?;
         // a request that reached them but whose response was lost is harmless to
         // resend, whereas rolling back our pending state would leave their reply
         // unrecognised
@@ -567,17 +565,33 @@ async fn write_pending_outgoing(
     write_home_file(user, SOCIAL_STATE_FILE, &cbor.to_bytes(), store, mutable).await
 }
 
+// Each change reads the file, changes it and writes it back, so two at once lose one: a follow request sent
+// while a reply is taken in would put back the name the reply removes, and with the reply gone nothing would
+// answer that request again. So they are made one after another.
+static PENDING_OUTGOING_CHANGES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// `change` returns whether it changed anything.
+async fn change_pending_outgoing(
+    user: &LoggedInUser,
+    change: impl FnOnce(&mut BTreeSet<String>) -> bool,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let _turn = PENDING_OUTGOING_CHANGES.lock().await;
+    let mut pending: BTreeSet<String> = get_pending_outgoing(user, store.clone(), mutable).await?.into_iter().collect();
+    if !change(&mut pending) {
+        return Ok(());
+    }
+    write_pending_outgoing(user, &pending, store, mutable).await
+}
+
 async fn remove_from_pending_outgoing(
     user: &LoggedInUser,
     username: &str,
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<()> {
-    let mut pending: BTreeSet<String> = get_pending_outgoing(user, store.clone(), mutable).await?.into_iter().collect();
-    if !pending.remove(username) {
-        return Ok(());
-    }
-    write_pending_outgoing(user, &pending, store, mutable).await
+    change_pending_outgoing(user, |p| p.remove(username), store, mutable).await
 }
 
 /// The root of this user's shared-with records, `.capabilitycache/outbound/<user>`,
@@ -807,6 +821,10 @@ pub struct FriendAnnotation {
 impl FriendAnnotation {
     pub fn new(username: impl Into<String>, is_verified: bool, keys_at_verification: Vec<PublicKeyHash>) -> FriendAnnotation {
         FriendAnnotation { username: username.into(), is_verified, keys_at_verification }
+    }
+
+    pub fn is_verified_for(&self, current_identity: &PublicKeyHash) -> bool {
+        self.is_verified && self.keys_at_verification.first() == Some(current_identity)
     }
 
     fn to_cbor(&self) -> CborObject {

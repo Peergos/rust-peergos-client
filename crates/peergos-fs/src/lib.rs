@@ -1128,7 +1128,13 @@ async fn finish_dir_write_multi(
     let parent_link = dir_chunks[0].node.parent_link(&dir_cap.r_base_key)?;
     let max_links = max_child_links_per_blob();
 
-    // 2. Dedup by name across ALL chunks (overwrite existing same-named children).
+    // 2. Dedup by name across ALL chunks (overwrite existing same-named children),
+    //    but never replace a folder with a file, which would orphan the folder.
+    for link in child_links.iter().filter(|l| l.is_dir == Some(false)) {
+        if dir_chunks.iter().flat_map(|c| &c.children).any(|c| c.name == link.name && c.is_dir == Some(true)) {
+            return Err(Error::Protocol(format!("Cannot replace folder {} with a file", link.name)));
+        }
+    }
     let new_names: std::collections::HashSet<&str> = child_links.iter().map(|l| l.name.as_str()).collect();
     for chunk in &mut dir_chunks {
         let before = chunk.children.len();
@@ -2216,6 +2222,7 @@ async fn create_writable_shared_file(
         name,
         &mime,
         old_props.created_epoch,
+        None,
         &old_props.thumbnail,
         mirror_bat,
         content,
@@ -2545,6 +2552,7 @@ async fn write_file_chunks(
     name: &str,
     mime: &str,
     created: i64,
+    modified_millis: Option<i64>,
     thumbnail: &Option<(String, Vec<u8>)>,
     mirror_bat: Option<&BatId>,
     content: &[u8],
@@ -2590,6 +2598,9 @@ async fn write_file_chunks(
             stream_secret.to_vec(),
             if i == 0 { thumbnail.clone() } else { None },
         );
+        if let Some(ms) = modified_millis {
+            props.set_modified_millis(ms);
+        }
         props.chunk_size = chunk_size as u64;
         if i % 1024 == 0 {
             props.tree_hash = Some(tree.branch(i as u64));
@@ -2660,6 +2671,7 @@ pub async fn rewrite_file_content(
         &old_props.name,
         &old_props.mime_type,
         old_props.created_epoch,
+        None,
         &old_props.thumbnail,
         mirror_bat,
         new_content,
@@ -2754,6 +2766,7 @@ fn resized_props(props: &FileProperties, new_size: u64) -> FileProperties {
     p.size = new_size;
     p.tree_hash = None;
     p.modified_epoch = now_epoch();
+    p.modified_nanos = 0;
     p
 }
 
@@ -2974,6 +2987,7 @@ async fn move_fast_path(
     target_node: &CryptreeNode,
     child: &DirEntry,
     name: &str,
+    new_name: &str,
     entry_signer: Option<SigningPrivateKeyAndPublicHash>,
     mirror_bat: Option<&BatId>,
     store: Arc<dyn ContentAddressedStorage>,
@@ -2987,7 +3001,8 @@ async fn move_fast_path(
         .await?
         .ok_or_else(|| Error::Protocol("child node missing".into()))?;
     let parent_key = child_node.get_parent_key(&child.cap.r_base_key);
-    let props = child_node.get_properties(&child.cap.r_base_key)?;
+    let mut props = child_node.get_properties(&child.cap.r_base_key)?;
+    props.name = new_name.to_string();
     let target_parent_key = target_node.get_parent_key(&target_dir.r_base_key);
     let new_parent_link = RelCap {
         writer: if different_writer { Some(target_dir.writer.clone()) } else { None },
@@ -3017,7 +3032,7 @@ async fn move_fast_path(
         _ => None,
     };
     let child_link = NamedRelativeCapability {
-        name: name.to_string(),
+        name: new_name.to_string(),
         cap: RelCap {
             writer: if different_writer { Some(child.cap.writer.clone()) } else { None },
             map_key: child.cap.map_key.clone(),
@@ -3156,6 +3171,7 @@ fn is_within_subtree<'a>(
 ///   is copied into the target under fresh keys (`copyTo`) and the old one
 ///   deleted. Returns the new cap. Shares to the old cap do not follow — pass
 ///   `keep_access = false` to deliberately drop shares on a same-writer move.
+#[allow(clippy::too_many_arguments)]
 pub async fn move_to(
     source_parent_cap: &AbsoluteCapability,
     name: &str,
@@ -3166,6 +3182,25 @@ pub async fn move_to(
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<AbsoluteCapability> {
+    move_to_as(source_parent_cap, name, target_dir_cap, name, keep_access, entry_signer, mirror_bat, store, mutable).await
+}
+
+/// [`move_to`], taking `new_name` in the target in the same write.
+#[allow(clippy::too_many_arguments)]
+pub async fn move_to_as(
+    source_parent_cap: &AbsoluteCapability,
+    name: &str,
+    target_dir_cap: &AbsoluteCapability,
+    new_name: &str,
+    keep_access: bool,
+    entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<AbsoluteCapability> {
+    if !is_legal_name(new_name) {
+        return Err(Error::Protocol(format!("Illegal file name: {new_name}")));
+    }
     if !target_dir_cap.is_writable() || !source_parent_cap.is_writable() {
         return Err(Error::Protocol("move requires write access to both directories".into()));
     }
@@ -3173,8 +3208,8 @@ pub async fn move_to(
     if !target_props.is_directory {
         return Err(Error::Protocol("move target must be a directory".into()));
     }
-    if list_directory(target_dir_cap, store.clone(), mutable).await?.iter().any(|e| e.name == name) {
-        return Err(Error::Protocol(format!("target already has a child named '{name}'")));
+    if list_directory(target_dir_cap, store.clone(), mutable).await?.iter().any(|e| e.name == new_name) {
+        return Err(Error::Protocol(format!("target already has a child named '{new_name}'")));
     }
     let child = list_directory(source_parent_cap, store.clone(), mutable)
         .await?
@@ -3191,14 +3226,19 @@ pub async fn move_to(
 
     // Fast path only when keeping access AND the target shares the source's writer.
     if keep_access && target_dir_cap.writer == source_parent_cap.writer {
-        move_fast_path(source_parent_cap, target_dir_cap, &target_node, &child, name, entry_signer, mirror_bat, store, mutable)
+        move_fast_path(source_parent_cap, target_dir_cap, &target_node, &child, name, new_name, entry_signer, mirror_bat, store, mutable)
             .await?;
         Ok(child.cap)
     } else {
-        let new_cap = copy_into(target_dir_cap, &child, name, entry_signer.clone(), mirror_bat, store.clone(), mutable).await?;
+        let new_cap = copy_into(target_dir_cap, &child, new_name, entry_signer.clone(), mirror_bat, store.clone(), mutable).await?;
         delete_child(source_parent_cap, name, entry_signer, mirror_bat, store, mutable).await?;
         Ok(new_cap)
     }
+}
+
+/// `FileWrapper.isLegalName`
+fn is_legal_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains('/') && name != "." && name != ".."
 }
 
 /// The location of a chunk within the writer's champ (map-key + BAT + read key).
@@ -3660,7 +3700,7 @@ pub async fn rename_child(
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<()> {
-    if new_name.is_empty() || new_name.contains('/') {
+    if !is_legal_name(new_name) {
         return Err(Error::Protocol(format!("illegal file name: {new_name}")));
     }
     let mut ctx = begin_dir_write(dir_cap, entry_signer, mirror_bat, &store, mutable).await?;
@@ -4184,6 +4224,7 @@ pub struct FileUpload {
     hash: Option<hashtree::RootHash>,
     /// An existing thumbnail to keep, e.g. when copying a file.
     thumbnail: Option<(String, Vec<u8>)>,
+    modified_millis: Option<i64>,
 }
 
 impl FileUpload {
@@ -4200,6 +4241,7 @@ impl FileUpload {
             open: Arc::new(move || open().map(|r| Box::new(r) as Box<dyn std::io::Read + Send>)),
             hash: None,
             thumbnail: None,
+            modified_millis: None,
         }
     }
 
@@ -4214,6 +4256,7 @@ impl FileUpload {
             open: Arc::new(move || std::fs::File::open(&path).map(|f| Box::new(f) as Box<dyn std::io::Read + Send>)),
             hash: None,
             thumbnail: None,
+            modified_millis: None,
         })
     }
 
@@ -4229,6 +4272,7 @@ impl FileUpload {
             open: Arc::new(move || Ok(Box::new(std::io::Cursor::new((*data).clone())) as Box<dyn std::io::Read + Send>)),
             hash,
             thumbnail: None,
+            modified_millis: None,
         }
     }
 
@@ -4239,6 +4283,11 @@ impl FileUpload {
 
     /// Attach a precomputed content hash-tree root (from a prior scan) so this file
     /// can be deduped against an unchanged remote copy without reading it.
+    pub fn with_modified_millis(mut self, millis: i64) -> FileUpload {
+        self.modified_millis = Some(millis);
+        self
+    }
+
     pub fn with_hash(mut self, hash: hashtree::RootHash) -> FileUpload {
         self.hash = Some(hash);
         self
@@ -4597,6 +4646,7 @@ async fn commit_small_batch(
             &f.name,
             &mime,
             epoch,
+            f.modified_millis,
             &f.thumbnail,
             mirror_bat,
             &data,

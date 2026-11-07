@@ -164,7 +164,15 @@ impl ScryptParams {
                 .to_string(),
         })
     }
+
+    /// The parameters come from the user's WriterData, which whoever answers the username lookup can substitute
+    fn is_strong_enough_for_login(&self) -> bool {
+        self.memory_cost >= LOGIN_MEMORY_COST && self.cpu_cost >= LOGIN_CPU_COST && self.parallelism >= 1
+    }
 }
+
+const LOGIN_MEMORY_COST: u8 = 17;
+const LOGIN_CPU_COST: u32 = 8;
 
 /// The derived login credentials (`UserWithRoot`).
 struct GeneratedUser {
@@ -180,6 +188,12 @@ fn generate_user(username: &str, password: &str, algo: &ScryptParams) -> Result<
         return Err(Error::Protocol(
             "Your password cannot be the same as your username!".into(),
         ));
+    }
+    if !algo.is_strong_enough_for_login() {
+        return Err(Error::Protocol(format!(
+            "Refusing to log in with weaker key derivation than scrypt N=2^{LOGIN_MEMORY_COST}, r={LOGIN_CPU_COST}: m={}, c={}, p={}",
+            algo.memory_cost, algo.cpu_cost, algo.parallelism
+        )));
     }
     let salt = format!("{username}{}", algo.extra_salt);
     let key_bytes = hash_to_key_bytes(

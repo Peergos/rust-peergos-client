@@ -93,14 +93,12 @@ impl SyncFilesystem for LocalFileSystem {
     async fn get_last_modified(&self, p: &Path) -> Result<i64> {
         let meta = fs::metadata(self.resolve(p)).map_err(|e| Error::Protocol(e.to_string()))?;
         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        let millis = mtime.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-        Ok(millis / 1000 * 1000)
+        Ok(mtime.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0))
     }
 
     async fn set_modification_time(&self, p: &Path, t: i64) -> Result<()> {
         let target = self.resolve(p);
-        let secs = t.max(0) / 1000;
-        let mtime = UNIX_EPOCH + std::time::Duration::from_secs(secs as u64);
+        let mtime = UNIX_EPOCH + std::time::Duration::from_millis(t.max(0) as u64);
         let atime = target.metadata().ok().and_then(|m| m.accessed().ok()).unwrap_or(mtime);
         filetime::set_file_times(&target, atime.into(), mtime.into())
             .map_err(|e| Error::Protocol(format!("set_modification_time failed: {e}")))
@@ -170,6 +168,7 @@ impl SyncFilesystem for LocalFileSystem {
                     }
                 }
                 self.write(&file_path, &file.data, 0).await?;
+                self.set_modification_time(&file_path, file.modified_time).await?;
             }
         }
         Ok(())
@@ -217,8 +216,9 @@ fn apply_to_subtree_recursive(
         let millis = mtime.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
         let props = FileProps {
             rel_path,
-            modified_time: millis / 1000 * 1000,
+            modified_time: millis,
             size: meta.len(),
+            hash: None,
         };
         if meta.is_dir() {
             on_dir(props);

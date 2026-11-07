@@ -13,10 +13,12 @@ use crate::poster::HttpPoster;
 use async_trait::async_trait;
 use peergos_cbor::{CborObject, Cborable};
 use peergos_crypto::hash::sha256;
-use peergos_multiformats::bases::multibase_encode_base58btc;
+use peergos_multiformats::bases::multibase_encode_base64;
 use peergos_multiformats::{Cid, Codec, Multihash, MultihashType, CID_V1};
 use std::collections::HashSet;
 use std::sync::Arc;
+
+const BULK_COMMIT_ATTEMPTS: u32 = 5;
 
 /// The maximum number of champ lookups to batch into a single `champ/get/bulk`
 /// call (`ContentAddressedStorage.MAX_CHAMP_GETS`).
@@ -603,7 +605,21 @@ impl ContentAddressedStorage for HttpStorage {
         }
         let url = format!("{API_PREFIX}bulk/commit?owner={}", url_encode(&owner.to_string()));
         let timeout = crate::poster::write_timeout_ms(60_000, body.len());
-        parse_link_list(&self.poster.post(&url, body, false, timeout).await?)
+        // The pointer half of a commit is a CAS, so a retry of one that landed fails the CAS, and the
+        // caller merges rather than retries. Except a 429: the server refuses those before setting any pointer.
+        let mut attempt = 0u32;
+        loop {
+            match self.poster.post(&url, body.clone(), false, timeout).await {
+                Ok(res) => return parse_link_list(&res),
+                Err(e) if e.is_transient_too_many_requests() && attempt + 1 < BULK_COMMIT_ATTEMPTS => {
+                    let jitter = u64::from(peergos_crypto::random_bytes(2).iter().fold(0u16, |a, b| a << 8 | *b as u16));
+                    let delay = (1000u64 << attempt) + jitter % (500u64 << attempt);
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     async fn id(&self) -> Result<Cid> {
@@ -737,7 +753,8 @@ impl ContentAddressedStorage for HttpStorage {
             return Ok(Vec::new());
         }
         let caps_cbor = CborObject::List(caps.iter().map(|c| c.to_cbor()).collect());
-        let encoded = multibase_encode_base58btc(&caps_cbor.serialize());
+        // base58 encodes in time quadratic in the length, and the caps run to a few KB
+        let encoded = url_encode(&multibase_encode_base64(&caps_cbor.serialize()));
         let url = format!(
             "{API_PREFIX}champ/get/bulk?arg={root}&owner={}&caps={encoded}",
             url_encode(&owner.to_string())

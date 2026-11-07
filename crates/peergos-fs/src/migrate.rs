@@ -33,15 +33,15 @@ pub async fn get_chain(poster: &dyn HttpPoster, username: &str) -> Result<Vec<Cb
 }
 
 /// `HTTPCoreNode.startMirror` (via `UserContext.mirrorOnThisServer`, unpaid path):
-/// POST `core/mirror` with the username, mirror BAT, a signed timestamp and a
-/// proof-of-work. Returns the server's boolean acknowledgement.
+/// POST `core/mirror` with the username, mirror BAT, a `SignedRequest` for
+/// `core/startMirror` and a proof-of-work. Returns the server's boolean acknowledgement.
 pub async fn start_mirror(
     poster: &dyn HttpPoster,
     username: &str,
     mirror_bat: &BatWithId,
     signer: &SigningPrivateKeyAndPublicHash,
 ) -> Result<bool> {
-    let auth = sign_now(&signer.secret)?;
+    let auth = crate::signup::sign_time_limited(signer, &format!("{CORE_URL}startMirror"))?;
     // ProofOfWork.MIN_DIFFICULTY is 0, so this is a trivial proof over the username.
     let prefix = peergos_crypto::hash::generate_proof_of_work(0, username.as_bytes());
     let proof = CborObject::map()
@@ -135,16 +135,6 @@ pub fn claim_storage_provider(link: &CborObject) -> Result<Cid> {
     let providers = claim.get(2).and_then(|c| c.as_list()).ok_or_else(|| Error::Cbor("claim missing storage providers".into()))?;
     let bytes = providers.first().and_then(|c| c.as_bytes()).ok_or_else(|| Error::Cbor("no storage provider in claim".into()))?;
     Ok(Cid::cast(bytes)?)
-}
-
-/// `TimeLimitedClient.signNow`: sign `cbor(currentTimeMillis)`, returning the raw
-/// NaCl attached signature bytes.
-fn sign_now(secret: &SecretSigningKey) -> Result<Vec<u8>> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    secret.sign_message(&CborObject::Long(now).to_bytes())
 }
 
 // ---- date arithmetic on ISO `YYYY-MM-DD` claim expiries --------------------

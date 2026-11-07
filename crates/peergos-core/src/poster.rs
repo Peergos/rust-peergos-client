@@ -88,7 +88,8 @@ impl ReqwestPoster {
         let body = resp.bytes().await.map_err(|e| Error::Http(e.to_string()))?;
         match status {
             200 => Ok(body.to_vec()),
-            429 | 502 | 503 | 504 => Err(Error::RateLimited),
+            429 => Err(Error::TooManyRequests(trailer.unwrap_or_else(|| "Too Many Requests".into()))),
+            502 | 503 | 504 => Err(Error::RateLimited),
             other => {
                 let msg = trailer.unwrap_or_else(|| String::from_utf8_lossy(&body).to_string());
                 if msg.contains("Storage quota reached") || msg.contains("Storage+quota+reached") {
