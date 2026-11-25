@@ -180,6 +180,19 @@ impl DirectoryInode {
         }
     }
 
+    async fn children(&self, owner: &PublicKeyHash, store: &dyn ContentAddressedStorage) -> Result<Vec<InodeCap>> {
+        match self {
+            DirectoryInode::Inline(list) => Ok(list.clone()),
+            DirectoryInode::Champ(champ) => champ
+                .collect_mappings(owner, store)
+                .await?
+                .into_iter()
+                .filter_map(|m| m.value)
+                .map(|v| InodeCap::from_cbor(&v))
+                .collect(),
+        }
+    }
+
     async fn child_count(&self, owner: &PublicKeyHash, store: &dyn ContentAddressedStorage) -> Result<usize> {
         match self {
             DirectoryInode::Inline(list) => Ok(list.len()),
@@ -485,6 +498,33 @@ impl InodeFileSystem {
         Ok(None)
     }
 
+    /// Every path published at or below `path`.
+    async fn published_at_or_below(&self, path: &str) -> Result<Vec<String>> {
+        let elements = canonical_elements(path);
+        let mut out = Vec::new();
+        let start = match self.published_at(path).await? {
+            Some(at) => {
+                if at.cap.is_some() {
+                    out.push(format!("/{}", elements.join("/")));
+                }
+                at.inode
+            }
+            None => return Ok(out),
+        };
+        let mut todo = vec![(elements.join("/"), start)];
+        while let Some((dir_path, inode)) = todo.pop() {
+            let Some(dir) = self.get_value(&inode).await? else { continue };
+            for child in dir.children(&self.owner, self.store.as_ref()).await? {
+                let child_path = format!("{dir_path}/{}", child.inode.name);
+                if child.cap.is_some() {
+                    out.push(format!("/{child_path}"));
+                }
+                todo.push((child_path, child.inode));
+            }
+        }
+        Ok(out)
+    }
+
     /// What is published at exactly `path`, where `get_published` stops at the
     /// closest published ancestor (`publishedAt`).
     async fn published_at(&self, path: &str) -> Result<Option<InodeCap>> {
@@ -661,7 +701,7 @@ impl UserContext {
 
     async fn forget_published_links(&self, links: &[(String, PublishedLink)]) {
         for (path, link) in links {
-            if let Err(e) = self.delete_secret_link_from(link.label, &[path.clone()]).await {
+            if let Err(e) = self.forget_secret_link(link.label, &[path.clone()]).await {
                 log::warn!("Couldn't delete unused public link for {path}: {e}");
             }
         }
@@ -671,7 +711,7 @@ impl UserContext {
     /// keep showing as a share.
     async fn drop_published_links(&self, links: &[(String, PublishedLink)]) -> Result<()> {
         for (path, link) in links {
-            self.delete_secret_link_from(link.label, &[path.clone()]).await?;
+            Box::pin(self.delete_secret_link_from(link.label, &[path.clone()])).await?;
         }
         Ok(())
     }
@@ -756,6 +796,33 @@ impl UserContext {
             Some(link) => self.drop_published_links(&[(path, link)]).await,
             None => Ok(()),
         }
+    }
+
+    /// Whether home-relative `path` or an ancestor of it is published.
+    pub(crate) async fn is_public(&self, path: &str) -> Result<bool> {
+        let username = self.username().ok_or_else(|| Error::Protocol("not signed in".into()))?.to_string();
+        let update = PublicUpdate::load(self).await?;
+        let Some(root) = &update.public else { return Ok(false) };
+        let fs = InodeFileSystem::load(update.owner.clone(), root, self.store()).await?;
+        let public_path = format!("/{username}/{}", path.trim_matches('/'));
+        Ok(fs.get_published(&public_path).await?.is_some_and(|ic| ic.cap.is_some()))
+    }
+
+    /// Publish anything published at or below home-relative `path` again, with the
+    /// caps its keys have now.
+    pub(crate) async fn update_published_caps(&self, path: &str) -> Result<()> {
+        let username = self.username().ok_or_else(|| Error::Protocol("not signed in".into()))?.to_string();
+        let update = PublicUpdate::load(self).await?;
+        let Some(root) = &update.public else { return Ok(()) };
+        let fs = InodeFileSystem::load(update.owner.clone(), root, self.store()).await?;
+        let prefix = format!("/{username}/");
+        let published: Vec<String> = fs
+            .published_at_or_below(&format!("{prefix}{}", path.trim_matches('/')))
+            .await?
+            .into_iter()
+            .filter_map(|p| p.strip_prefix(&prefix).map(str::to_string))
+            .collect();
+        self.make_public_many(&published).await
     }
 
     /// Take a published website offline: un-publish the web-root directory and the

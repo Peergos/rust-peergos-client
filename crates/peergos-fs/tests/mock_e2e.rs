@@ -4459,3 +4459,120 @@ async fn zip_archive_read_and_edit() {
     assert!(zip.index().get("docs/sub/b.bin").is_none());
     assert!(zip.index().get("empty").is_none());
 }
+
+/// Whoever opened a link keeps its capabilities, so a link that is deleted, loses a
+/// member, or expires rotates the keys of what it no longer gives, while other links
+/// to the same items keep working.
+#[tokio::test]
+async fn secret_link_revocation_rotates_keys() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = UserContext::sign_up("rho", "rpw", None, poster, store.clone(), mutable.clone()).await.expect("sign up");
+    let home = ctx.get_home().await.unwrap();
+    home.upload("a.txt", b"alpha").await.unwrap();
+    home.get_latest().await.unwrap().upload("b.txt", b"beta").await.unwrap();
+    let docs = home.get_latest().await.unwrap().mkdir("docs").await.unwrap();
+    docs.upload("c.txt", b"gamma").await.unwrap();
+    home.get_latest().await.unwrap().mkdir("w").await.unwrap();
+    let opens = |cap: &peergos_fs::AbsoluteCapability| {
+        let (cap, store, mutable) = (cap.clone(), store.clone(), mutable.clone());
+        async move { peergos_fs::retrieve_file_metadata(&cap, store, mutable.as_ref()).await.is_ok() }
+    };
+
+    let paths = vec!["a.txt".to_string(), "docs".to_string()];
+    let props = ctx.create_secret_link_to(&paths, &[], "", None, None).await.unwrap();
+    let link = ctx.secret_link_string(&props).unwrap();
+    let other = ctx.create_secret_link("a.txt", false, "", None, None).await.unwrap();
+    let old = peergos_fs::retrieve_secret_link_capabilities(&link, store.as_ref(), None).await.unwrap();
+    assert!(opens(&old[0]).await && opens(&old[1]).await);
+
+    // a member dropped from the link is rotated; the one kept is not
+    let shrunk = ctx.set_secret_link_members(&["docs".to_string()], &[], props.clone()).await.unwrap();
+    assert!(!opens(&old[0]).await, "a.txt's old cap is revoked");
+    assert!(opens(&old[1]).await, "docs is still in the link");
+    let via_other = peergos_fs::retrieve_secret_link_capability(&other, store.as_ref(), None).await.unwrap();
+    assert_eq!(peergos_fs::read_file(&via_other, store.clone(), mutable.as_ref()).await.unwrap().1, b"alpha");
+
+    // deleting the link rotates what it held
+    ctx.delete_secret_link("docs", shrunk.label).await.unwrap();
+    assert!(!opens(&old[1]).await, "docs' old cap is revoked");
+    assert_eq!(ctx.get_by_path("docs/c.txt").await.unwrap().unwrap().read().await.unwrap(), b"gamma");
+
+    // a password change rotates every member, and the link opens with the new one
+    let pw = ctx.create_secret_link_to(&["b.txt".to_string()], &[], "one", None, None).await.unwrap();
+    let pw_link = ctx.secret_link_string(&pw).unwrap();
+    let before = peergos_fs::retrieve_secret_link_capability(&pw_link, store.as_ref(), Some("one")).await.unwrap();
+    let mut changed = pw.clone();
+    changed.user_password = "two".to_string();
+    ctx.set_secret_link_members(&["b.txt".to_string()], &[], changed).await.unwrap();
+    assert!(!opens(&before).await, "the cap the old password gave is revoked");
+    let after = peergos_fs::retrieve_secret_link_capability(&pw_link, store.as_ref(), Some("two")).await.unwrap();
+    assert_eq!(peergos_fs::read_file(&after, store.clone(), mutable.as_ref()).await.unwrap().1, b"beta");
+
+    // a writable member gets a new signer
+    let writable = ctx.create_secret_link_to(&["w".to_string()], &["w".to_string()], "", None, None).await.unwrap();
+    let w_cap = ctx.get_by_path("w").await.unwrap().unwrap().capability().clone();
+    assert!(w_cap.w_base_key.is_some());
+    ctx.delete_secret_link("w", writable.label).await.unwrap();
+    let rotated = ctx.get_by_path("w").await.unwrap().unwrap().capability().clone();
+    assert!(!opens(&w_cap).await, "w's old cap is revoked");
+    assert_ne!(rotated.writer, w_cap.writer);
+
+    // an expired link is deleted and its members rotated
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    ctx.create_secret_link_to(&["a.txt".to_string()], &[], "", Some(now - 10), None).await.unwrap();
+    let a_cap = ctx.get_by_path("a.txt").await.unwrap().unwrap().capability().clone();
+    assert_eq!(ctx.delete_expired_secret_links().await.unwrap(), 1);
+    assert!(!opens(&a_cap).await, "the expired link's member is rotated");
+    assert_eq!(ctx.get_by_path("a.txt").await.unwrap().unwrap().read().await.unwrap(), b"alpha");
+    let via_other = peergos_fs::retrieve_secret_link_capability(&other, store.as_ref(), None).await.unwrap();
+    assert_eq!(peergos_fs::read_file(&via_other, store.clone(), mutable.as_ref()).await.unwrap().1, b"alpha");
+}
+
+/// Moving a folder into another writing space keeps every key and block: its champ
+/// entries move to the target's writer, and a writing space nested in it is
+/// re-parented, so it all stays readable and writable without being copied.
+#[tokio::test]
+async fn move_across_writing_spaces_keeps_keys() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = UserContext::sign_up("xi", "xpw", None, poster, store.clone(), mutable.clone()).await.expect("sign up");
+    let home = ctx.get_home().await.unwrap();
+    home.mkdir("w").await.unwrap();
+    let docs = home.get_latest().await.unwrap().mkdir("docs").await.unwrap();
+    docs.upload("a.txt", b"alpha").await.unwrap();
+    let inner = docs.get_latest().await.unwrap().mkdir("inner").await.unwrap();
+    inner.upload("b.txt", b"beta").await.unwrap();
+    let home = home.get_latest().await.unwrap();
+    let w_cap = peergos_fs::move_dir_to_own_writer(home.capability(), "w", home.signer().cloned(), None, store.clone(), mutable.as_ref())
+        .await
+        .unwrap();
+    let docs = ctx.get_by_path("docs").await.unwrap().unwrap();
+    peergos_fs::move_dir_to_own_writer(docs.capability(), "inner", docs.signer().cloned(), None, store.clone(), mutable.as_ref())
+        .await
+        .unwrap();
+    let before = ctx.get_by_path("docs").await.unwrap().unwrap().capability().clone();
+    assert_eq!(before.writer, home.capability().writer);
+
+    let home = ctx.get_home().await.unwrap();
+    let w = ctx.get_by_path("w").await.unwrap().unwrap();
+    assert_eq!(w.capability().writer, w_cap.writer);
+    let moved = home.move_child("docs", &w, true).await.unwrap();
+    assert_eq!(moved.writer, w_cap.writer);
+    assert_eq!(moved.r_base_key, before.r_base_key, "no key changed");
+    assert!(ctx.get_by_path("docs").await.unwrap().is_none());
+    assert_eq!(ctx.get_by_path("w/docs/a.txt").await.unwrap().unwrap().read().await.unwrap(), b"alpha");
+    assert_eq!(ctx.get_by_path("w/docs/inner/b.txt").await.unwrap().unwrap().read().await.unwrap(), b"beta");
+
+    // both the moved folder and the writing space nested in it can still be written
+    ctx.get_by_path("w/docs").await.unwrap().unwrap().upload("c.txt", b"gamma").await.unwrap();
+    ctx.get_by_path("w/docs/inner").await.unwrap().unwrap().upload("d.txt", b"delta").await.unwrap();
+    assert_eq!(ctx.get_by_path("w/docs/c.txt").await.unwrap().unwrap().read().await.unwrap(), b"gamma");
+    assert_eq!(ctx.get_by_path("w/docs/inner/d.txt").await.unwrap().unwrap().read().await.unwrap(), b"delta");
+    // and its old entries are gone from the home writing space
+    assert!(peergos_fs::retrieve_file_metadata(&before, store.clone(), mutable.as_ref()).await.is_err());
+
+    // logging in again finds it all
+    let again = UserContext::sign_in("xi", "xpw", None, ctx.poster(), store.clone(), mutable.clone()).await.unwrap();
+    assert_eq!(again.get_by_path("w/docs/inner/d.txt").await.unwrap().unwrap().read().await.unwrap(), b"delta");
+}

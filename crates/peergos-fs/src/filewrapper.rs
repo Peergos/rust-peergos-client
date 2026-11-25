@@ -147,6 +147,15 @@ impl FileWrapper {
     // ---- navigation --------------------------------------------------------
 
     /// Wrap a directory entry, transparently following a link node to its target.
+    /// The signer for writes into `child`: ours, unless it is in another writing
+    /// space, whose root carries its own.
+    async fn signer_for(&self, child: &AbsoluteCapability) -> Option<SigningPrivateKeyAndPublicHash> {
+        if child.writer == self.cap.writer {
+            return self.signer.clone();
+        }
+        crate::recover_signer(child, self.store.clone(), self.mutable.as_ref()).await.ok().or_else(|| self.signer.clone())
+    }
+
     async fn wrap_child(&self, e: DirEntry) -> Result<FileWrapper> {
         let props = crate::retrieve_file_metadata_cached(&e.cap, self.store.clone(), self.mutable.as_ref(), &self.cache).await?.1;
         let (cap, props) = if props.is_link {
@@ -161,12 +170,13 @@ impl FileWrapper {
         } else {
             (e.cap, props)
         };
+        let signer = self.signer_for(&cap).await;
         Ok(FileWrapper {
             path: join(&self.path, &e.name),
             name: e.name,
             cap,
             props,
-            signer: self.signer.clone(),
+            signer,
             home_cap: self.home_cap.clone(),
             mirror_bat: self.mirror_bat.clone(),
             store: self.store.clone(),
@@ -229,9 +239,9 @@ impl FileWrapper {
                 Some(rc) if !rc.properties.is_link => out.push(FileWrapper {
                     path: join(&self.path, &e.name),
                     name: e.name,
+                    signer: self.signer_for(&rc.cap).await,
                     cap: rc.cap,
                     props: rc.properties,
-                    signer: self.signer.clone(),
                     home_cap: self.home_cap.clone(),
                     mirror_bat: self.mirror_bat.clone(),
                     store: self.store.clone(),

@@ -725,14 +725,153 @@ impl UserContext {
         for path in paths.iter().filter(|p| writable.contains(*p)) {
             self.split_into_own_writing_space(path).await?;
         }
-        let before: Vec<String> = props.members.iter().filter_map(|m| self.home_relative(&m.path).ok()).collect();
-        let props = self.mint_link(&paths, &writable, props).await?;
-        // the owner's listing should only show a link under the items it still holds
-        let user = self.require_user()?;
-        for gone in before.iter().filter(|p| !paths.contains(p)) {
-            crate::remove_link(user, gone, props.label, self.store.clone(), self.mutable.as_ref()).await?;
+        let mut candidates = paths.clone();
+        candidates.extend(props.members.iter().filter_map(|m| self.home_relative(&m.path).ok()));
+        let old = self.recorded_link(props.label, &candidates).await?;
+        let old_members = match &old {
+            Some(o) => self.link_members(o).await?,
+            None => Vec::new(),
+        };
+        // whatever the link no longer gives: a removed member, one made read only, or
+        // every member when the password changes
+        let password_changed = old.as_ref().is_some_and(|o| o.user_password != props.user_password);
+        let lost: Vec<crate::LinkMember> = old_members
+            .iter()
+            .filter(|m| password_changed || !paths.contains(&m.path) || (m.writable && !writable.contains(&m.path)))
+            .cloned()
+            .collect();
+        // or sending the link again after a rotation would bring a removed member back
+        let mut removed: Vec<String> = old_members.iter().map(|m| m.path.clone()).collect();
+        removed.extend(props.members.iter().filter_map(|m| self.home_relative(&m.path).ok()));
+        if let Some(o) = &old {
+            removed.extend(o.members.iter().filter_map(|m| self.home_relative(&m.path).ok()));
         }
-        Ok(props)
+        removed.retain(|p| !paths.contains(p));
+        removed.sort();
+        removed.dedup();
+        let minted = self.mint_link(&paths, &writable, props).await?;
+        let user = self.require_user()?;
+        for gone in &removed {
+            crate::remove_link(user, gone, minted.label, self.store.clone(), self.mutable.as_ref()).await?;
+        }
+        if lost.is_empty() {
+            return Ok(minted);
+        }
+        self.revoke_link_access(&lost).await?;
+        // rotating sends this link again, which replaces the value we wrote
+        Ok(crate::get_links(user, &paths[0], self.store.clone(), self.mutable.as_ref())
+            .await?
+            .into_iter()
+            .find(|l| l.label == minted.label)
+            .unwrap_or(minted))
+    }
+
+    /// The owner's record of a link, preferring one that knows its members.
+    async fn recorded_link(&self, label: i64, paths: &[String]) -> Result<Option<crate::LinkProperties>> {
+        let user = self.require_user()?;
+        let mut found: Option<crate::LinkProperties> = None;
+        for path in paths {
+            if found.as_ref().is_some_and(|f| !f.members.is_empty()) {
+                break;
+            }
+            let here = crate::get_links(user, path.trim_matches('/'), self.store.clone(), self.mutable.as_ref())
+                .await?
+                .into_iter()
+                .find(|l| l.label == label);
+            if let Some(h) = here {
+                if found.is_none() || !h.members.is_empty() {
+                    found = Some(h);
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// What a link holds now, with home-relative paths, read from the champ rather
+    /// than the server so an expired link can still be read. A member that has since
+    /// been deleted has no keys left to rotate.
+    async fn link_members(&self, props: &crate::LinkProperties) -> Result<Vec<crate::LinkMember>> {
+        let user = self.require_user()?;
+        let link = props.to_link(&user.identity);
+        let mirror = self.get_mirror_bat().await?;
+        let caps = crate::secret_link_capabilities_from_champ(
+            &user.identity, &link, &props.user_password, mirror.as_ref(), &self.store, self.mutable.as_ref(),
+        )
+        .await?;
+        let mut members = Vec::with_capacity(caps.len());
+        for cap in caps {
+            let Ok(path) = crate::reconstruct_link_path(&cap, self.store.clone(), self.mutable.as_ref()).await else { continue };
+            let Ok(path) = self.home_relative(&path) else { continue };
+            members.push(crate::LinkMember { path, writable: cap.w_base_key.is_some() });
+        }
+        Ok(members)
+    }
+
+    /// Rotate the keys of members (home-relative paths) a link no longer gives, then
+    /// send every other share and link of them again. Writable members get a new
+    /// signer too. A read only member that is public anyway is left alone, and
+    /// anything published at or below a rotated path is published with its new cap.
+    async fn revoke_link_access(&self, lost: &[crate::LinkMember]) -> Result<()> {
+        let mut by_path: Vec<(String, bool)> = Vec::new();
+        for m in lost {
+            match by_path.iter_mut().find(|(p, _)| *p == m.path) {
+                Some((_, w)) => *w |= m.writable,
+                None => by_path.push((m.path.clone(), m.writable)),
+            }
+        }
+        for (path, writable) in by_path {
+            self.rotate_for_link(&path, writable).await?;
+        }
+        Ok(())
+    }
+
+    async fn rotate_for_link(&self, path: &str, writable: bool) -> Result<()> {
+        if !writable && self.is_public(path).await? {
+            return Ok(());
+        }
+        let Some(file) = self.get_by_path(path).await? else { return Ok(()) };
+        let user = self.require_user()?;
+        let (parent_path, name) = split_home_path(path);
+        let parent = self
+            .get_by_path(parent_path)
+            .await?
+            .ok_or_else(|| Error::Protocol(format!("no parent directory for {path}")))?;
+        let mb = user.mirror_bat_id();
+        let old_writer = file.capability().writer.clone();
+        if old_writer == parent.capability().writer {
+            crate::rotate_child_read_keys(parent.capability(), name, parent.signer().cloned(), mb.as_ref(), self.store.clone(), self.mutable.as_ref())
+                .await?;
+        } else {
+            let quotas = self.writer_quota_map().await.unwrap_or_default();
+            let new_cap = crate::force_rotate_child_to_new_writer(
+                parent.capability(), name, parent.signer().cloned(), mb.as_ref(), self.store.clone(), self.mutable.as_ref(),
+            )
+            .await?;
+            if let Some(quota) = quotas.get(&old_writer) {
+                crate::writer_quota::set_writer_quota(&user.signer, &new_cap.writer, Some(*quota), self.poster.as_ref()).await?;
+                if let Err(e) = crate::writer_quota::set_writer_quota(&user.signer, &old_writer, None, self.poster.as_ref()).await {
+                    log::warn!("Couldn't remove the cap of rotated signer {old_writer}: {e}");
+                }
+            }
+        }
+        self.reshare_all_shares_and_links_recursive(path).await?;
+        Box::pin(self.update_published_caps(path)).await
+    }
+
+    /// Delete every link that has expired, rotating the keys of what it held
+    /// (`deleteExpiredSecretLinks`). Returns how many were deleted.
+    pub async fn delete_expired_secret_links(&self) -> Result<usize> {
+        let now = crate::now_epoch();
+        let expired: Vec<SecretLinkSummary> = self
+            .get_all_secret_links()
+            .await?
+            .into_iter()
+            .filter(|l| l.props.expiry_epoch_secs.is_some_and(|e| e < now))
+            .collect();
+        for l in &expired {
+            self.delete_secret_link_from(l.props.label, &l.paths()).await?;
+        }
+        Ok(expired.len())
     }
 
     /// Append one file or folder to a link that already exists (`addToSecretLink`).
@@ -1213,10 +1352,32 @@ impl UserContext {
         self.delete_secret_link_from(label, &paths).await
     }
 
-    /// Delete a link and clear it from every path it contained
-    /// (`deleteSecretLinkFrom`). Deleting the champ entry is what stops the link
-    /// resolving; the per path records are the owner's own listing.
+    /// Delete a link, clear it from every path it contained, and rotate the keys of
+    /// its members (`deleteSecretLinkFrom`). Deleting the champ entry only stops new
+    /// visitors: anyone who opened the link holds its capabilities, so they are only
+    /// revoked by rotating keys. The records go first, or the rotation would send
+    /// this link again.
     pub async fn delete_secret_link_from(&self, label: i64, member_paths: &[String]) -> Result<()> {
+        let recorded = self.recorded_link(label, member_paths).await?;
+        let members = match &recorded {
+            Some(r) => self.link_members(r).await?,
+            None => Vec::new(),
+        };
+        let mut paths: Vec<String> = member_paths.iter().map(|p| p.trim_matches('/').to_string()).collect();
+        if let Some(r) = &recorded {
+            for p in r.members.iter().filter_map(|m| self.home_relative(&m.path).ok()) {
+                if !paths.contains(&p) {
+                    paths.push(p);
+                }
+            }
+        }
+        self.forget_secret_link(label, &paths).await?;
+        self.revoke_link_access(&members).await
+    }
+
+    /// Delete a link without rotating anything, for a link that never handed out a
+    /// capability.
+    pub(crate) async fn forget_secret_link(&self, label: i64, member_paths: &[String]) -> Result<()> {
         let user = self.require_user()?;
         let mirror = self.get_mirror_bat().await?;
         crate::delete_secret_link(
@@ -1238,6 +1399,38 @@ impl UserContext {
     /// re-mint every recorded secret link so they point at the new capability
     /// (Java `reSendAllSharesAndLinksRecursive` → `reshareAndUpdateLinks`).
     async fn reshare_all_shares_and_links(&self, path: &str) -> Result<()> {
+        self.reshare_with(path, &mut std::collections::HashSet::new()).await
+    }
+
+    /// [`Self::reshare_all_shares_and_links`] for `path` and everything shared below
+    /// it, whose keys a rotation of `path` changed too. A link is sent once, however
+    /// many of its members are below.
+    async fn reshare_all_shares_and_links_recursive(&self, path: &str) -> Result<()> {
+        let user = self.require_user()?;
+        let trimmed = path.trim_matches('/');
+        let prefix = format!("{trimmed}/");
+        let mut targets: Vec<String> = Vec::new();
+        for (dir, state) in crate::get_all_shares(user, self.store.clone(), self.mutable.as_ref()).await? {
+            let names = state.read_shares().keys().chain(state.write_shares().keys()).chain(state.links().keys());
+            for name in names {
+                let full = if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") };
+                if (full == trimmed || full.starts_with(&prefix) || trimmed.is_empty()) && !targets.contains(&full) {
+                    targets.push(full);
+                }
+            }
+        }
+        let mut sent = std::collections::HashSet::new();
+        for t in targets {
+            // a record can outlive what it was for
+            if self.get_by_path(&t).await?.is_none() {
+                continue;
+            }
+            self.reshare_with(&t, &mut sent).await?;
+        }
+        Ok(())
+    }
+
+    async fn reshare_with(&self, path: &str, sent_links: &mut std::collections::HashSet<i64>) -> Result<()> {
         let user = self.require_user()?;
         let new_cap = self
             .get_by_path(path)
@@ -1265,6 +1458,9 @@ impl UserContext {
         // Re-sign each link keeping whatever membership it already has, so re-minting
         // one item of a multi-item link does not drop the others.
         for lp in crate::get_links(user, path, self.store.clone(), self.mutable.as_ref()).await? {
+            if !sent_links.insert(lp.label) {
+                continue;
+            }
             let (paths, writable): (Vec<String>, std::collections::HashSet<String>) = if lp.members.is_empty() {
                 let p = trimmed.to_string();
                 let w = if lp.writable { [p.clone()].into_iter().collect() } else { Default::default() };

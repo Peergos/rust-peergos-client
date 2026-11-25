@@ -179,6 +179,11 @@ async fn run() -> Result<(), BoxErr> {
             }
         }
         println!("Connected to {server} as {username}.");
+        match ctx.delete_expired_secret_links().await {
+            Ok(0) => {}
+            Ok(n) => println!("Deleted {n} expired secret link(s)."),
+            Err(e) => eprintln!("warning: couldn't delete expired secret links: {e}"),
+        }
         shell = Some(make_shell(ctx, username, server));
     }
 

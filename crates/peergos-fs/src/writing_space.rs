@@ -372,6 +372,126 @@ pub async fn move_to_new_writing_space(
     Ok(new_cap)
 }
 
+/// Move `child`, which is in `source_parent`'s writing space, into `target_dir` in
+/// another writing space of the same owner as `new_name`, without copying it
+/// (`moveAcrossWritingSpaces`): its champ entries move to the target's writer and
+/// every block is kept, so nothing is re-encrypted or uploaded again. Writing
+/// spaces nested in it only change their parent link and owner. Returns its new
+/// capability, which differs from the old one only in its writer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn move_across_writing_spaces(
+    source_parent: &AbsoluteCapability,
+    child: &DirEntry,
+    name: &str,
+    target_dir: &AbsoluteCapability,
+    target_node: &CryptreeNode,
+    new_name: &str,
+    entry_signer: Option<SigningPrivateKeyAndPublicHash>,
+    mirror_bat: Option<&BatId>,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<AbsoluteCapability> {
+    let owner = source_parent.owner.clone();
+    let from = parent_writer_signer(source_parent, &entry_signer, store.clone(), mutable).await?;
+    let to = recover_signer(target_dir, store.clone(), mutable)
+        .await
+        .ok()
+        .or_else(|| entry_signer.clone().filter(|s| s.public_key_hash == target_dir.writer))
+        .ok_or_else(|| Error::Protocol("no writer signer for target".into()))?;
+
+    let old_champ = open_writer_champ(&child.cap, store.clone(), mutable).await?;
+    let root = fetch_chunk_node(&old_champ, &child.cap, &child.cap.map_key, &child.cap.bat, store.as_ref())
+        .await?
+        .ok_or_else(|| Error::Protocol("child node missing".into()))?;
+    let mut subtree = Subtree::default();
+    collect_subtree(&child.cap, &old_champ, &mut subtree, &store, mutable).await?;
+
+    // the root's parent becomes the target, in the target's writing space
+    let parent_key = root.get_parent_key(&child.cap.r_base_key);
+    let new_parent_link = RelCap {
+        writer: None,
+        map_key: target_dir.map_key.clone(),
+        bat: target_dir.bat.clone(),
+        r_base_key: target_node.get_parent_key(&target_dir.r_base_key),
+        w_base_key_link: None,
+    };
+    let mut props = root.get_properties(&child.cap.r_base_key)?;
+    props.name = new_name.to_string();
+    let block = root.from_parent_key.decrypt(&parent_key, |c| Ok(c.clone()))?;
+    let block = set_field(&set_field(&block, "p", new_parent_link.to_cbor())?, "s", props.to_cbor())?;
+    let new_root = CryptreeNode {
+        from_parent_key: PaddedCipherText::build(&parent_key, &block, META_DATA_PADDING_BLOCKSIZE)?,
+        ..root.clone()
+    };
+
+    let tid = store.start_transaction(&owner).await?;
+    let root_cid = put_block_signed(store.as_ref(), &owner, &to, new_root.to_cbor().to_bytes(), &tid).await?;
+    let (pointer, wd, mut tree) = open_champ(&owner, &target_dir.writer, "tree", &store, mutable).await?;
+    for (map_key, value) in &subtree.entries {
+        let value = if map_key == &child.cap.map_key {
+            CborObject::MerkleLink(root_cid.to_bytes())
+        } else {
+            value.clone()
+        };
+        let current = tree.get(map_key).await?;
+        tree.put(&to, map_key, &current, Some(value), &tid).await?;
+    }
+    commit_champ(&owner, &to, "tree", &pointer, &wd, &tree, &store, mutable, &tid).await?;
+
+    for nested in &subtree.nested {
+        let (old_writer, new_writer) = (from.public_key_hash.clone(), to.public_key_hash.clone());
+        reparent_writing_space(
+            nested,
+            |link| {
+                let writer = match link.writer {
+                    Some(w) if w == old_writer => Some(new_writer),
+                    other => other,
+                };
+                RelCap { writer, ..link }
+            },
+            &from,
+            &to,
+            &store,
+            mutable,
+            &tid,
+        )
+        .await?;
+    }
+
+    let new_cap = AbsoluteCapability::new(
+        owner.clone(),
+        target_dir.writer.clone(),
+        child.cap.map_key.clone(),
+        child.cap.bat.clone(),
+        child.cap.r_base_key.clone(),
+        child.cap.w_base_key.clone(),
+    )?;
+    let w_link = match (&target_dir.w_base_key, &child.cap.w_base_key) {
+        (Some(pw), Some(cw)) => Some(peergos_core::symmetric::CipherText::build(pw, cw)?.to_cbor()),
+        _ => None,
+    };
+    let child_link = NamedRelativeCapability {
+        name: new_name.to_string(),
+        cap: RelCap {
+            writer: None,
+            map_key: child.cap.map_key.clone(),
+            bat: child.cap.bat.clone(),
+            r_base_key: child.cap.r_base_key.clone(),
+            w_base_key_link: w_link,
+        },
+        is_dir: child.is_dir,
+        mime_type: child.mime_type.clone(),
+        created_epoch: Some(props.created_epoch),
+    };
+    let ctx = begin_dir_write(target_dir, Some(to.clone()), mirror_bat, &store, mutable).await?;
+    finish_dir_write(ctx, target_dir, &store, mutable, child_link).await?;
+    remove_child_link(source_parent, name, entry_signer.clone(), mirror_bat, store.clone(), mutable).await?;
+    // the old entries are unreachable now; nested writing spaces are not in that champ
+    remove_orphaned_subtree(source_parent, &child.cap, entry_signer, mirror_bat, &store, mutable).await?;
+    store.close_transaction(&owner, &tid).await?;
+    Ok(new_cap)
+}
+
 /// Every writer `signer` owns that has no pointer: left behind by an authorisation
 /// that was interrupted before the new writer's first commit (`findOrphanedWriters`).
 pub(crate) async fn orphaned_writers(

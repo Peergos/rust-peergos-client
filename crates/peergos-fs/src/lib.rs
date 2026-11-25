@@ -312,6 +312,32 @@ pub async fn delete_secret_link(
     Ok(())
 }
 
+/// The capabilities the link `label` holds, read from the identity writer's
+/// secret-link CHAMP rather than the server, so an expired link can still be read.
+pub async fn secret_link_capabilities_from_champ(
+    identity: &PublicKeyHash,
+    link: &SecretLink,
+    user_password: &str,
+    mirror_bat: Option<&BatWithId>,
+    store: &Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<Vec<AbsoluteCapability>> {
+    let pointer = mutable.get_pointer_target(identity, identity, store.as_ref()).await?;
+    let Some(wd_cid) = pointer.updated.clone() else { return Ok(Vec::new()) };
+    let wd = store.get(identity, &wd_cid, None).await?.ok_or_else(|| Error::Protocol("writer data missing".into()))?;
+    let Some(links_root) = wd.get("links").and_then(|c| c.as_link()) else { return Ok(Vec::new()) };
+    let champ =
+        ChampWrapper::create(identity.clone(), Cid::cast(links_root)?, mirror_bat, store.clone(), identity_key_hasher()).await?;
+    let Some(value) = champ.get(&secret_link_key(link.label)).await? else { return Ok(Vec::new()) };
+    let target_cid = Cid::cast(value.as_link().ok_or_else(|| Error::Cbor("secret link value is not a link".into()))?)?;
+    let target = store
+        .get(identity, &target_cid, mirror_bat)
+        .await?
+        .ok_or_else(|| Error::Protocol("secret link target missing".into()))?;
+    let enc = EncryptedCapability::from_cbor(target.get("cap").ok_or_else(|| Error::Cbor("link target without 'cap'".into()))?)?;
+    enc.decrypt_from_password(&link.label_string(), &format!("{}{}", link.link_password, user_password))
+}
+
 /// Open the champ tree of the capability's writer (writer pointer →
 /// `WriterData.tree` → champ). All of a file's chunks live in this same tree.
 async fn open_writer_champ(
@@ -3262,7 +3288,10 @@ fn is_within_subtree<'a>(
 ///   target and removed from the source. The file data stays in place with the
 ///   same keys, so the child's capability is unchanged and existing shares to it
 ///   keep working. Returns the (unchanged) capability.
-/// - **Slow path** (different writers, **or `keep_access == false`**): the subtree
+/// - **Across writing spaces** (same owner, keeping access, the child in its
+///   parent's writing space): the subtree's champ entries move to the target's
+///   writer with every block and key kept. Returns the cap with its new writer.
+/// - **Slow path** (otherwise, **or `keep_access == false`**): the subtree
 ///   is copied into the target under fresh keys (`copyTo`) and the old one
 ///   deleted. Returns the new cap. Shares to the old cap do not follow — pass
 ///   `keep_access = false` to deliberately drop shares on a same-writer move.
@@ -3324,6 +3353,11 @@ pub async fn move_to_as(
         move_fast_path(source_parent_cap, target_dir_cap, &target_node, &child, name, new_name, entry_signer, mirror_bat, store, mutable)
             .await?;
         Ok(child.cap)
+    } else if keep_access && child.cap.writer == source_parent_cap.writer && target_dir_cap.owner == source_parent_cap.owner {
+        writing_space::move_across_writing_spaces(
+            source_parent_cap, &child, name, target_dir_cap, &target_node, new_name, entry_signer, mirror_bat, store, mutable,
+        )
+        .await
     } else {
         let new_cap = copy_into(target_dir_cap, &child, new_name, entry_signer.clone(), mirror_bat, store.clone(), mutable).await?;
         delete_child(source_parent_cap, name, entry_signer, mirror_bat, store, mutable).await?;
