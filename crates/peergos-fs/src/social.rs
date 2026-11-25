@@ -288,6 +288,21 @@ pub async fn get_follow_requests(
     user: &LoggedInUser,
     poster: &dyn HttpPoster,
 ) -> Result<Vec<ReceivedFollowRequest>> {
+    Ok(fetch_follow_requests(user, poster).await?.0)
+}
+
+/// Anyone can send us a follow request, so only accept one whose sender is
+/// present and isn't us.
+fn is_well_formed(user: &LoggedInUser, req: &ReceivedFollowRequest) -> bool {
+    req.entry.as_ref().is_some_and(|e| e.owner_name != user.username)
+}
+
+/// The requests we can use, and the raw ciphertexts of those we can't decrypt or
+/// that are malformed, which would otherwise sit in our queue forever.
+async fn fetch_follow_requests(
+    user: &LoggedInUser,
+    poster: &dyn HttpPoster,
+) -> Result<(Vec<ReceivedFollowRequest>, Vec<Vec<u8>>)> {
     let boxer = user
         .boxer
         .as_ref()
@@ -303,7 +318,7 @@ pub async fn get_follow_requests(
     let res = poster.get(&url).await?;
     // Response is a length-prefixed byte array wrapping a cbor list.
     if res.len() < 4 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let len = u32::from_be_bytes([res[0], res[1], res[2], res[3]]) as usize;
     let raw = res.get(4..4 + len).ok_or_else(|| Error::Protocol("truncated follow requests".into()))?;
@@ -311,25 +326,24 @@ pub async fn get_follow_requests(
     let items = list.as_list().ok_or_else(|| Error::Cbor("follow requests not a list".into()))?;
 
     let mut out = Vec::new();
+    let mut unusable = Vec::new();
     for blind in items {
+        // Malformed ones are skipped: the server stored whatever bytes it was sent.
+        let Some(dummy) = blind.get("k").and_then(|k| PublicBoxingKey::from_cbor(k).ok()) else { continue };
+        let Some(cipher) = blind.get("f").and_then(|c| c.as_bytes()) else { continue };
         let raw_cipher = blind.to_bytes();
-        // Decrypt with our boxer secret + the ephemeral sender key ("k").
-        let dummy = blind
-            .get("k")
-            .ok_or_else(|| Error::Cbor("blind request missing 'k'".into()))
-            .and_then(PublicBoxingKey::from_cbor)?;
-        let cipher = blind
-            .get("f")
-            .and_then(|c| c.as_bytes())
-            .ok_or_else(|| Error::Cbor("blind request missing 'f'".into()))?;
-        // A request addressed to someone else won't decrypt — skip it.
-        let Ok(padded) = boxer.secret.decrypt(cipher, &dummy) else { continue };
-        let fr = CborObject::from_bytes_prefix(&padded)?;
-        let entry = fr.get("e").map(EntryPoint::from_cbor).transpose()?;
-        let key = fr.get("k").map(SymmetricKey::from_cbor).transpose()?;
-        out.push(ReceivedFollowRequest { entry, key, raw_cipher });
+        let decrypted = boxer.secret.decrypt(cipher, &dummy).ok().and_then(|padded| {
+            let fr = CborObject::from_bytes_prefix(&padded).ok()?;
+            let entry = fr.get("e").map(EntryPoint::from_cbor).transpose().ok()?;
+            let key = fr.get("k").map(SymmetricKey::from_cbor).transpose().ok()?;
+            Some(ReceivedFollowRequest { entry, key, raw_cipher: raw_cipher.clone() })
+        });
+        match decrypted {
+            Some(r) if is_well_formed(user, &r) => out.push(r),
+            _ => unusable.push(raw_cipher),
+        }
     }
-    Ok(out)
+    Ok((out, unusable))
 }
 
 /// `removeFollowRequest`: delete a processed request from our inbox (signed with
@@ -1098,7 +1112,12 @@ pub async fn process_follow_requests(
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<Vec<ReceivedFollowRequest>> {
-    let all = get_follow_requests(user, poster).await?;
+    let (all, unusable) = fetch_follow_requests(user, poster).await?;
+    for raw in unusable {
+        if let Err(e) = remove_follow_request(user, &raw, poster).await {
+            log::warn!("Couldn't remove unusable follow request: {e}");
+        }
+    }
     if all.is_empty() {
         return Ok(all);
     }

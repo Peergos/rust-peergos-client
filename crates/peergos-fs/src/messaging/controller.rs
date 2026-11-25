@@ -161,15 +161,15 @@ impl ChatController {
 
     /// Send a message and commit (`sendMessage`).
     pub async fn send_message(&self, message: Message) -> Result<ChatController> {
-        let state = self.latest_state().await?;
+        let current = self.latest_state().await?;
         let store = self.own_store()?;
         let signer = self.signer()?;
         let cas = self.context.store();
-        let update = state
+        let update = current
             .send_message(message, &self.private_chat_state.chat_identity, &signer, &store, cas.as_ref())
             .await?;
         let mirror = self.username()?.to_string();
-        self.commit_update(update, mirror).await
+        self.commit_update(update, &current, mirror).await
     }
 
     /// Add `username` to the admin list (`addAdmin`).
@@ -198,29 +198,29 @@ impl ChatController {
     /// Announce our chat identity after creating/cloning the chat (`join`).
     pub async fn join(&self, identity: &SigningPrivateKeyAndPublicHash) -> Result<ChatController> {
         let chat_id = OwnerProof::build(identity, &self.private_chat_state.chat_identity.public_key_hash)?;
-        let state = self.latest_state().await?;
+        let current = self.latest_state().await?;
         let store = self.own_store()?;
         let cas = self.context.store();
-        let host = state.host().clone();
-        let update = state
+        let host = current.host().clone();
+        let update = current
             .join(&host, chat_id, self.private_chat_state.chat_id_public.clone(), identity, &store, cas.as_ref())
             .await?;
         let mirror = self.username()?.to_string();
-        self.commit_update(update, mirror).await
+        self.commit_update(update, &current, mirror).await
     }
 
     /// Invite members and commit; the read-share of the chat dir is done by
     /// [`super::Messenger::invite`] (`invite`).
     pub async fn invite(&self, usernames: Vec<String>, identities: Vec<peergos_core::keys::PublicKeyHash>) -> Result<ChatController> {
-        let state = self.latest_state().await?;
+        let current = self.latest_state().await?;
         let store = self.own_store()?;
         let signer = self.signer()?;
         let cas = self.context.store();
-        let update = state
+        let update = current
             .invite_members(usernames, identities, &self.private_chat_state.chat_identity, &signer, &store, cas.as_ref())
             .await?;
         let mirror = self.username()?.to_string();
-        self.commit_update(update, mirror).await
+        self.commit_update(update, &current, mirror).await
     }
 
     /// Merge new messages from `username`'s mirror store (`mergeMessages`).
@@ -231,16 +231,18 @@ impl ChatController {
             .ok_or_else(|| Error::Protocol(format!("no member named {username}")))?
             .id
             .clone();
-        let state = self.latest_state().await?;
+        let current = self.latest_state().await?;
         let signer = self.signer()?;
         let cas = self.context.store();
-        let update = state.merge(&mirror_id, &signer, mirror_store, cas.as_ref()).await?;
-        self.commit_update(update, username.to_string()).await
+        let update = current.merge(&mirror_id, &signer, mirror_store, cas.as_ref()).await?;
+        self.commit_update(update, &current, username.to_string()).await
     }
 
     // ---- commit -------------------------------------------------------------
 
-    async fn commit_update(&self, update: ChatUpdate, mirror_username: String) -> Result<ChatController> {
+    /// `current` is the chat state the update was computed from, which another
+    /// controller may have moved on from this one's copy.
+    async fn commit_update(&self, update: ChatUpdate, current: &Chat, mirror_username: String) -> Result<ChatController> {
         if update.is_empty() && update.state == self.state {
             return Ok(self.clone());
         }
@@ -260,7 +262,7 @@ impl ChatController {
             new_priv = p.clone();
         }
         // 4. append the new messages to the shared log
-        store.add_messages(self.state.host().messages_merged_upto, update.new_messages.clone()).await?;
+        store.add_messages(current.host().messages_merged_upto, update.new_messages.clone()).await?;
         // 5. overwrite the shared state file
         self.write_state(&update.state).await?;
         Ok(ChatController::new(self.context.clone(), self.chat_uuid.clone(), update.state, new_priv))

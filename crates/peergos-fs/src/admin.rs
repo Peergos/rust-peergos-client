@@ -150,7 +150,8 @@ pub async fn get_pending_space_requests(
     let list = cbor
         .as_list()
         .ok_or_else(|| Error::Protocol("expected a CBOR list".into()))?;
-    list.iter().map(LabelledSignedSpaceRequest::from_cbor).collect()
+    // one bad request mustn't hide the rest
+    Ok(list.iter().filter_map(|c| LabelledSignedSpaceRequest::from_cbor(c).ok()).collect())
 }
 
 /// Approve a pending space request (`approve`). The admin signs the

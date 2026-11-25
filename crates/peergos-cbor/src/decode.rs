@@ -102,7 +102,7 @@ pub(crate) fn from_bytes(bytes: &[u8]) -> Result<CborObject, CborError> {
         return err("Empty cbor byte array!");
     }
     let mut r = Reader { buf: bytes, pos: 0 };
-    let obj = deserialize(&mut r, bytes.len() as u64)?;
+    let obj = deserialize(&mut r, bytes.len() as u64, 0)?;
     if r.pos != bytes.len() {
         return err("trailing bytes after cbor value");
     }
@@ -117,7 +117,7 @@ pub(crate) fn from_bytes_prefix(bytes: &[u8]) -> Result<CborObject, CborError> {
         return err("Empty cbor byte array!");
     }
     let mut r = Reader { buf: bytes, pos: 0 };
-    deserialize(&mut r, bytes.len() as u64)
+    deserialize(&mut r, bytes.len() as u64, 0)
 }
 
 /// Decode a single cbor value and also report how many bytes it consumed, so a
@@ -127,11 +127,20 @@ pub(crate) fn from_bytes_consumed(bytes: &[u8]) -> Result<(CborObject, usize), C
         return err("Empty cbor byte array!");
     }
     let mut r = Reader { buf: bytes, pos: 0 };
-    let obj = deserialize(&mut r, bytes.len() as u64)?;
+    let obj = deserialize(&mut r, bytes.len() as u64, 0)?;
     Ok((obj, r.pos))
 }
 
-fn deserialize(r: &mut Reader, max_group_size: u64) -> Result<CborObject, CborError> {
+// Each edit of a social post nests the old version 3 deeper and doubles the size, so any post under 2 GiB
+// is less than 82 deep. Nothing else Peergos writes is more than about 10 deep.
+const MAX_DEPTH: usize = 128;
+// Declared array lengths aren't trusted for more than this up front
+const MAX_PREALLOCATED_ITEMS: u64 = 16;
+
+fn deserialize(r: &mut Reader, max_group_size: u64, depth: usize) -> Result<CborObject, CborError> {
+    if depth > MAX_DEPTH {
+        return err(format!("Invalid cbor: nested more than {MAX_DEPTH} deep!"));
+    }
     let major = r.peek_major()?;
     match major {
         TYPE_TEXT_STRING => {
@@ -177,12 +186,12 @@ fn deserialize(r: &mut Reader, max_group_size: u64) -> Result<CborObject, CborEr
             }
             let mut map = BTreeMap::new();
             for _ in 0..n {
-                let key = deserialize(r, max_group_size)?;
+                let key = deserialize(r, max_group_size, depth + 1)?;
                 let key = match key {
                     CborObject::Str(s) => CborString::new(s),
                     _ => return err("non-string cbor map key"),
                 };
-                let value = deserialize(r, max_group_size)?;
+                let value = deserialize(r, max_group_size, depth + 1)?;
                 if map.insert(key, value).is_some() {
                     return err("Duplicate map key in cbor!");
                 }
@@ -194,9 +203,9 @@ fn deserialize(r: &mut Reader, max_group_size: u64) -> Result<CborObject, CborEr
             if n > max_group_size {
                 return err("Invalid cbor: more array elements than original bytes!");
             }
-            let mut items = Vec::with_capacity(n as usize);
+            let mut items = Vec::with_capacity(n.min(MAX_PREALLOCATED_ITEMS) as usize);
             for _ in 0..n {
-                items.push(deserialize(r, max_group_size)?);
+                items.push(deserialize(r, max_group_size, depth + 1)?);
             }
             Ok(CborObject::List(items))
         }
@@ -206,7 +215,7 @@ fn deserialize(r: &mut Reader, max_group_size: u64) -> Result<CborObject, CborEr
             if tag != LINK_TAG {
                 return err(format!("Unknown TAG in CBOR: {tag}"));
             }
-            let value = deserialize(r, max_group_size)?;
+            let value = deserialize(r, max_group_size, depth + 1)?;
             match value {
                 CborObject::Str(s) => {
                     // Text CIDs are base-encoded; decoding them needs the
