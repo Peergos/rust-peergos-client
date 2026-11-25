@@ -4360,8 +4360,14 @@ async fn in_place_writes_match_a_model() {
             ("append", 0, 2 * chunk + 5),    // adds two whole chunks and a bit
             ("write_end", 0, 50),            // grows from the current end
             ("truncate", chunk + 3, 0),      // back into the second chunk
+            ("write", chunk + 5, 10),        // same size, only a later chunk
+            ("write", 4 * chunk + 7, 20),    // past the end, leaving a gap of zeros
+            ("resize", 5 * chunk + 1, 0),    // grows reading as zeros
+            ("resize", 3 * chunk, 0),        // cuts on a chunk boundary
             ("truncate", 10, 0),             // into the first chunk
             ("append", 0, 100),
+            ("resize", 0, 0),
+            ("append", 0, 5),
         ];
         for (i, (op, at, n)) in ops.into_iter().enumerate() {
             let f = ctx.get_by_path(&name).await.unwrap().unwrap();
@@ -4379,6 +4385,10 @@ async fn in_place_writes_match_a_model() {
                     }
                     model[at..at + n].copy_from_slice(&data);
                 }
+                "resize" => {
+                    f.resize(at as u64).await.unwrap();
+                    model.resize(at, 0);
+                }
                 _ => {
                     f.truncate(at as u64).await.unwrap();
                     model.truncate(at);
@@ -4386,6 +4396,10 @@ async fn in_place_writes_match_a_model() {
             }
             let f = ctx.get_by_path(&name).await.unwrap().unwrap();
             assert_eq!(f.size(), model.len() as u64, "size after {op} (chunk {chunk})");
+            // the stored hash is kept current, never left describing other contents
+            let stored = f.properties().tree_hash.as_ref().map(|t| t.root_hash.hash.clone());
+            let expected = peergos_fs::content_root_hash(&model, chunk as u64).unwrap().hash;
+            assert_eq!(stored, Some(expected), "tree hash after {op} {i} (chunk {chunk})");
             assert_eq!(f.properties().chunk_size, chunk as u64);
             assert!(f.read().await.unwrap() == model, "content after {op} (chunk {chunk})");
         }

@@ -2758,9 +2758,9 @@ async fn open_file_for_write(
     Ok((root, cache, first, props))
 }
 
-/// What a write that changes a file's size does to its first chunk's properties,
-/// which is where readers take the size from. The hash tree no longer describes the
-/// content, so it goes, as for any partial write.
+/// What a write that changes a file does to its first chunk's properties, which is
+/// where readers take the size from. The old hash tree no longer describes the
+/// content, so it goes unless the caller can compute the new one.
 fn resized_props(props: &FileProperties, new_size: u64) -> FileProperties {
     let mut p = props.clone();
     p.size = new_size;
@@ -2772,12 +2772,73 @@ fn resized_props(props: &FileProperties, new_size: u64) -> FileProperties {
 
 /// Write `data` at `offset` in a file, in place (`overwriteSection`): only the chunks
 /// the range overlaps are re-encrypted, and a range past the end grows the file
-/// with new chunks, so appending to a large file doesn't rewrite it. `offset` may
-/// be at most the current size. Keys, capability and chunk locations are kept.
-/// Returns the map-keys of the chunks written.
+/// with new chunks, so appending to a large file doesn't rewrite it. A write past
+/// the end fills the gap before it with zeros. Keys, capability and chunk
+/// locations are kept. Returns the map-keys of the chunks written.
 pub async fn write_file_section(
     cap: &AbsoluteCapability,
     offset: u64,
+    data: &[u8],
+    signer: &SigningPrivateKeyAndPublicHash,
+    mirror_bat: Option<&BatId>,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<Vec<Vec<u8>>> {
+    write_section_at(cap, Some(offset), data, signer, mirror_bat, store, mutable).await
+}
+
+/// Append `data` at the file's size as it is in this write, so an append that
+/// lands first isn't written over.
+pub async fn append_to_file(
+    cap: &AbsoluteCapability,
+    data: &[u8],
+    signer: &SigningPrivateKeyAndPublicHash,
+    mirror_bat: Option<&BatId>,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<Vec<Vec<u8>>> {
+    write_section_at(cap, None, data, signer, mirror_bat, store, mutable).await
+}
+
+/// Make a file `new_size` long (`resize`): cut, grown reading as zeros past its
+/// end, or left as it is.
+pub async fn resize_file(
+    cap: &AbsoluteCapability,
+    new_size: u64,
+    signer: &SigningPrivateKeyAndPublicHash,
+    mirror_bat: Option<&BatId>,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<Vec<Vec<u8>>> {
+    let (_, _, _, props) = open_file_for_write(cap, &store, mutable).await?;
+    if new_size <= props.size {
+        return truncate_file(cap, new_size, signer, mirror_bat, store, mutable).await;
+    }
+    // a write past the end fills the gap before it with zeros, so one zero as the last byte will do
+    write_file_section(cap, new_size - 1, &[0], signer, mirror_bat, store, mutable).await
+}
+
+/// The stored hashes of a file's chunks, if they are one for each of its
+/// `n_chunks` chunks: a list of another length describes other contents.
+fn stored_chunk_hashes(props: &FileProperties, n_chunks: u64) -> Option<Vec<Vec<u8>>> {
+    let hashes = props.tree_hash.as_ref()?.level1.as_ref()?.hashes();
+    (hashes.len() as u64 == n_chunks).then_some(hashes)
+}
+
+/// The branch chunk 0 holds for a file of `chunks` hashes, if they are all known and
+/// one branch holds them all (1024 chunks).
+fn completed_hash(chunks: &[Option<Vec<u8>>], chunk_size: u64) -> Result<Option<hashtree::HashBranch>> {
+    if chunks.len() > 1024 || chunks.iter().any(|h| h.is_none()) {
+        return Ok(None);
+    }
+    let hashes: Vec<Vec<u8>> = chunks.iter().flatten().cloned().collect();
+    Ok(Some(hashtree::HashTree::build(&hashes, chunk_size)?.branch(0)))
+}
+
+/// With `offset` None, write at the end of the file as it is now.
+async fn write_section_at(
+    cap: &AbsoluteCapability,
+    offset: Option<u64>,
     data: &[u8],
     signer: &SigningPrivateKeyAndPublicHash,
     mirror_bat: Option<&BatId>,
@@ -2788,13 +2849,23 @@ pub async fn write_file_section(
         return Ok(Vec::new());
     }
     let (root, cache, first, props) = open_file_for_write(cap, &store, mutable).await?;
-    if offset > props.size {
-        return Err(Error::Protocol(format!("cannot write at {offset}, past the end of a {} byte file", props.size)));
-    }
+    let requested = offset.unwrap_or(props.size);
+    // a write past the end starts at the end, so that every chunk before it exists,
+    // holding zeros up to its data as a write of zeros would
+    let padded;
+    let (offset, data) = if requested > props.size {
+        let mut d = vec![0u8; (requested - props.size) as usize];
+        d.extend_from_slice(data);
+        padded = d;
+        (props.size, padded.as_slice())
+    } else {
+        (requested, data)
+    };
     let end = offset + data.len() as u64;
     let new_size = props.size.max(end);
     let chunk_size = props.chunk_size;
     let existing = chunk_count(props.size, chunk_size);
+    let new_n = chunk_count(new_size, chunk_size);
     let start_chunk = offset / chunk_size;
     let end_chunk = (end - 1) / chunk_size;
     let stream_secret = props
@@ -2802,7 +2873,20 @@ pub async fn write_file_section(
         .clone()
         .ok_or_else(|| Error::Protocol("file without a stream secret".into()))?;
     let data_key = first.get_data_key(&cap.r_base_key)?;
-    let first_props = if new_size != props.size { Some(resized_props(&props, new_size)) } else { None };
+    let grown_props = resized_props(&props, new_size);
+
+    // the hashes of the chunks this leaves as they were are those stored, so the
+    // file's hash can be kept current while one branch holds them all
+    let mut chunk_hashes: Vec<Option<Vec<u8>>> = vec![None; new_n as usize];
+    if new_n <= 1024 {
+        if let Some(stored) = stored_chunk_hashes(&props, existing) {
+            // BLAKE3 hashes a file's only chunk as the whole file, not as the first of several
+            let first_changed = retrieve::uses_blake3(chunk_size) && (existing == 1) != (new_n == 1);
+            for (i, h) in stored.into_iter().enumerate().skip(first_changed as usize) {
+                chunk_hashes[i] = Some(h);
+            }
+        }
+    }
 
     let (mut map_key, mut bat) = advance_map_key(&stream_secret, &cap.map_key, &cap.bat, start_chunk)?;
     let mut updates: Vec<(Vec<u8>, CryptreeNode, Vec<Vec<u8>>)> = Vec::new();
@@ -2830,17 +2914,14 @@ pub async fn write_file_section(
             chunk_data.resize(local_end, 0);
         }
         chunk_data[(from - chunk_start) as usize..local_end].copy_from_slice(&data[(from - offset) as usize..(to - offset) as usize]);
+        if let Some(h) = chunk_hashes.get_mut(index as usize) {
+            *h = Some(hashtree::chunk_hash(&chunk_data, index, chunk_size, new_n == 1));
+        }
         let (fpct, fragments) =
             FragmentedPaddedCipherText::build(&data_key, &CborObject::ByteString(chunk_data), MIN_FRAGMENT_SIZE, mirror_bat)?;
         let (next_map_key, next_bat) = retrieve::calculate_next_map_key(&stream_secret, &map_key, &bat)?;
         let new_node = match node {
-            Some(node) => {
-                let node = node.overwrite_chunk_data(&cap.r_base_key, fpct.to_cbor(), now_epoch())?;
-                match (&first_props, index) {
-                    (Some(p), 0) => node.update_properties(&cap.r_base_key, p.clone())?,
-                    _ => node,
-                }
-            }
+            Some(node) => node.overwrite_chunk_data(&cap.r_base_key, fpct.to_cbor(), now_epoch())?,
             None => {
                 // a chunk past the old end: laid out as upload lays out every chunk after the first
                 let to_parent = first
@@ -2850,7 +2931,7 @@ pub async fn write_file_section(
                     .put("k", data_key.to_cbor())
                     .put("n", RelCap::subsequent_chunk(next_map_key.clone(), next_bat.clone(), cap.r_base_key.clone()).to_cbor())
                     .build();
-                let mut chunk_props = first_props.clone().unwrap_or_else(|| props.clone());
+                let mut chunk_props = grown_props.clone();
                 chunk_props.thumbnail = None;
                 let from_parent = CborObject::map().put("p", to_parent.to_cbor()).put("s", chunk_props.to_cbor()).build();
                 CryptreeNode::new(
@@ -2866,10 +2947,15 @@ pub async fn write_file_section(
         map_key = next_map_key;
         bat = next_bat;
     }
-    if start_chunk > 0 {
-        if let Some(p) = first_props {
-            updates.push((cap.map_key.clone(), first.update_properties(&cap.r_base_key, p)?, Vec::new()));
-        }
+    // chunk 0 takes the new size and the hash of what this leaves in the file, or
+    // drops the old hash, which no longer describes it
+    let mut first_props = grown_props;
+    first_props.tree_hash = completed_hash(&chunk_hashes, chunk_size)?;
+    if start_chunk == 0 {
+        let (_, node, _) = &mut updates[0];
+        *node = node.update_properties(&cap.r_base_key, first_props)?;
+    } else {
+        updates.push((cap.map_key.clone(), first.update_properties(&cap.r_base_key, first_props)?, Vec::new()));
     }
     let changed: Vec<Vec<u8>> = updates.iter().map(|(k, _, _)| k.clone()).collect();
     reupload_nodes(cap, updates, &[], signer, &store, mutable).await?;
@@ -2915,7 +3001,16 @@ pub async fn truncate_file(
         .await?;
     bytes.truncate((new_size - last * chunk_size) as usize);
     let (fpct, fragments) =
-        FragmentedPaddedCipherText::build(&data_key, &CborObject::ByteString(bytes), MIN_FRAGMENT_SIZE, mirror_bat)?;
+        FragmentedPaddedCipherText::build(&data_key, &CborObject::ByteString(bytes.clone()), MIN_FRAGMENT_SIZE, mirror_bat)?;
+    // the whole chunks before the cut are as they were
+    let mut first_props = first_props;
+    if keep <= 1024 {
+        if let Some(stored) = stored_chunk_hashes(&props, old_n) {
+            let mut hashes: Vec<Option<Vec<u8>>> = stored.into_iter().take(last as usize).map(Some).collect();
+            hashes.push(Some(hashtree::chunk_hash(&bytes, last, chunk_size, keep == 1)));
+            first_props.tree_hash = completed_hash(&hashes, chunk_size)?;
+        }
+    }
     let mut last_new = last_node.overwrite_chunk_data(&cap.r_base_key, fpct.to_cbor(), now_epoch())?;
     let mut updates = Vec::new();
     if last == 0 {

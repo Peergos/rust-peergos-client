@@ -407,8 +407,26 @@ impl FileWrapper {
         if data.is_empty() {
             return Ok(());
         }
-        let size = crate::retrieve_file_metadata(&self.cap, self.store.clone(), self.mutable.as_ref()).await?.1.size;
-        self.write_section(size, data).await
+        let signer = self.write_signer().await?;
+        let prior = self.writer_root().await;
+        let changed = crate::append_to_file(&self.cap, data, &signer, self.mirror_bat.as_ref(), self.store.clone(), self.mutable.as_ref()).await?;
+        let refs: Vec<&[u8]> = changed.iter().map(|k| k.as_slice()).collect();
+        self.migrate_cache(prior, &refs).await;
+        Ok(())
+    }
+
+    /// Make this file `new_size` long (`resize`): cut, grown reading as zeros past
+    /// its end, or left as it is. Requires write access.
+    pub async fn resize(&self, new_size: u64) -> Result<()> {
+        if self.is_directory() {
+            return Err(Error::Protocol("cannot resize a directory".into()));
+        }
+        let signer = self.write_signer().await?;
+        let prior = self.writer_root().await;
+        let changed = crate::resize_file(&self.cap, new_size, &signer, self.mirror_bat.as_ref(), self.store.clone(), self.mutable.as_ref()).await?;
+        let refs: Vec<&[u8]> = changed.iter().map(|k| k.as_slice()).collect();
+        self.migrate_cache(prior, &refs).await;
+        Ok(())
     }
 
     /// Shrink this file to `new_size` bytes (`truncate`), any file size. No-op if
@@ -437,7 +455,7 @@ impl FileWrapper {
 
     /// Write `data` at `offset` in this file, in place, growing it if the range runs
     /// past the end (`overwriteSection`). Only the chunks the range touches are
-    /// rewritten. `offset` may be at most the current size. Requires write access.
+    /// rewritten. A write past the end fills the gap with zeros. Requires write access.
     pub async fn write_section(&self, offset: u64, data: &[u8]) -> Result<()> {
         if self.is_directory() {
             return Err(Error::Protocol("cannot write to a directory".into()));
