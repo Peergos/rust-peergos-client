@@ -22,12 +22,19 @@ impl LocalFileSystem {
         Ok(LocalFileSystem { root })
     }
 
-    fn resolve(&self, p: &Path) -> PathBuf {
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            self.root.join(p)
+    /// Refuses a path outside the sync folder, so a remote name can't write elsewhere.
+    fn resolve(&self, p: &Path) -> Result<PathBuf> {
+        use std::path::Component;
+        let mut rel = PathBuf::new();
+        for c in p.components() {
+            match c {
+                Component::Normal(n) => rel.push(n),
+                Component::CurDir => {}
+                Component::ParentDir if rel.pop() => {}
+                _ => return Err(Error::Protocol(format!("Refusing a path outside the sync folder: {}", p.display()))),
+            }
         }
+        Ok(self.root.join(rel))
     }
 }
 
@@ -38,11 +45,11 @@ impl SyncFilesystem for LocalFileSystem {
     }
 
     async fn exists(&self, p: &Path) -> Result<bool> {
-        Ok(self.resolve(p).exists())
+        Ok(self.resolve(p)?.exists())
     }
 
     async fn mkdirs(&self, p: &Path) -> Result<()> {
-        let target = self.resolve(p);
+        let target = self.resolve(p)?;
         if target.is_dir() {
             return Ok(());
         }
@@ -50,7 +57,7 @@ impl SyncFilesystem for LocalFileSystem {
     }
 
     async fn delete(&self, p: &Path) -> Result<()> {
-        let target = self.resolve(p);
+        let target = self.resolve(p)?;
         if target.is_dir() {
             let children: Vec<PathBuf> = fs::read_dir(&target)
                 .map_err(|e| Error::Protocol(e.to_string()))?
@@ -72,7 +79,7 @@ impl SyncFilesystem for LocalFileSystem {
 
     async fn bulk_delete(&self, dir: &Path, children: &[String]) -> Result<()> {
         for child in children {
-            let target = self.resolve(dir).join(child);
+            let target = self.resolve(&dir.join(child))?;
             if target.exists() {
                 fs::remove_file(&target).or_else(|_| fs::remove_dir(&target))
                     .map_err(|e| Error::Protocol(format!("bulk delete failed: {e}")))?;
@@ -82,8 +89,8 @@ impl SyncFilesystem for LocalFileSystem {
     }
 
     async fn move_to(&self, src: &Path, target: &Path) -> Result<()> {
-        let src = self.resolve(src);
-        let target = self.resolve(target);
+        let src = self.resolve(src)?;
+        let target = self.resolve(target)?;
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|e| Error::Protocol(format!("mkdir for move failed: {e}")))?;
         }
@@ -91,13 +98,13 @@ impl SyncFilesystem for LocalFileSystem {
     }
 
     async fn get_last_modified(&self, p: &Path) -> Result<i64> {
-        let meta = fs::metadata(self.resolve(p)).map_err(|e| Error::Protocol(e.to_string()))?;
+        let meta = fs::metadata(self.resolve(p)?).map_err(|e| Error::Protocol(e.to_string()))?;
         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         Ok(mtime.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0))
     }
 
     async fn set_modification_time(&self, p: &Path, t: i64) -> Result<()> {
-        let target = self.resolve(p);
+        let target = self.resolve(p)?;
         let mtime = UNIX_EPOCH + std::time::Duration::from_millis(t.max(0) as u64);
         let atime = target.metadata().ok().and_then(|m| m.accessed().ok()).unwrap_or(mtime);
         filetime::set_file_times(&target, atime.into(), mtime.into())
@@ -105,22 +112,22 @@ impl SyncFilesystem for LocalFileSystem {
     }
 
     async fn size(&self, p: &Path) -> Result<u64> {
-        let meta = fs::metadata(self.resolve(p)).map_err(|e| Error::Protocol(e.to_string()))?;
+        let meta = fs::metadata(self.resolve(p)?).map_err(|e| Error::Protocol(e.to_string()))?;
         Ok(meta.len())
     }
 
     async fn truncate(&self, p: &Path, size: u64) -> Result<()> {
-        let f = OpenOptions::new().write(true).open(self.resolve(p))
+        let f = OpenOptions::new().write(true).open(self.resolve(p)?)
             .map_err(|e| Error::Protocol(e.to_string()))?;
         f.set_len(size).map_err(|e| Error::Protocol(e.to_string()))
     }
 
     async fn read(&self, p: &Path) -> Result<Vec<u8>> {
-        fs::read(self.resolve(p)).map_err(|e| Error::Protocol(e.to_string()))
+        fs::read(self.resolve(p)?).map_err(|e| Error::Protocol(e.to_string()))
     }
 
     async fn write(&self, p: &Path, data: &[u8], file_offset: u64) -> Result<()> {
-        let target = self.resolve(p);
+        let target = self.resolve(p)?;
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|e| Error::Protocol(e.to_string()))?;
         }
@@ -134,7 +141,7 @@ impl SyncFilesystem for LocalFileSystem {
     }
 
     async fn hash_file(&self, p: &Path, size: u64, chunk_size: u64) -> Result<([u8; 32], u64)> {
-        let target = self.resolve(p);
+        let target = self.resolve(p)?;
         let root = peergos_fs::hash_file_parallel(&target, size, chunk_size)?;
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&root.hash);
@@ -228,4 +235,19 @@ fn apply_to_subtree_recursive(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn paths_stay_inside_the_sync_folder() {
+        let dir = std::env::temp_dir();
+        let fs = LocalFileSystem::new(dir.clone()).unwrap();
+        assert_eq!(fs.resolve(Path::new("a/./b/../c")).unwrap(), dir.join("a/c"));
+        assert!(fs.resolve(Path::new("../outside")).is_err());
+        assert!(fs.resolve(Path::new("a/../../outside")).is_err());
+        assert!(fs.resolve(Path::new("/etc/passwd")).is_err());
+    }
 }

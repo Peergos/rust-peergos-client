@@ -399,7 +399,12 @@ async fn apply_to_subtree_recursive(
 ) -> Result<()> {
     let children = list_directory(cap, store.clone(), mutable).await?;
     for child in children {
-        let child_path = rel.join(&child.name);
+        let name = &child.name;
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+            log::warn!("Sync: skipped a file whose name can't be a local file name: {name}");
+            continue;
+        }
+        let child_path = rel.join(name);
         let rel_str = child_path.to_string_lossy().replace('\\', "/");
         let (node, props) = retrieve_file_metadata(&child.cap, store.clone(), mutable).await?;
         let fp = FileProps {
