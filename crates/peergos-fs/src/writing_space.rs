@@ -803,3 +803,51 @@ async fn point_holder_at(
     recommit_dir_chunk(&mut ctx, &holder, store, map_key, node, champ_value, children.clone()).await?;
     commit_dir_write(&ctx, &holder, store, mutable).await
 }
+
+/// Open `writer`'s WriterData and tree champ.
+pub(crate) async fn open_tree(
+    owner: &PublicKeyHash,
+    writer: &PublicKeyHash,
+    store: &Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<(PointerUpdate, CborObject, ChampWrapper)> {
+    open_champ(owner, writer, "tree", store, mutable).await
+}
+
+/// Make `child` a writer owned by `parent`, with empty champs
+/// (`initAndAuthoriseSigner`, after its key is stored).
+pub(crate) async fn init_writer(
+    owner: &PublicKeyHash,
+    parent: &SigningPrivateKeyAndPublicHash,
+    child: &SigningPrivateKeyAndPublicHash,
+    store: &Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+    tid: &TransactionId,
+) -> Result<()> {
+    add_owned_writer(owner, parent, child, store, mutable, tid).await?;
+    let owned = put_block_signed(store.as_ref(), owner, child, Champ::empty().serialize(), tid).await?;
+    let tree = put_block_signed(store.as_ref(), owner, child, Champ::empty().serialize(), tid).await?;
+    let wd = CborObject::map()
+        .put("controller", child.public_key_hash.to_cbor())
+        .put("owned", CborObject::MerkleLink(owned.to_bytes()))
+        .put("tree", CborObject::MerkleLink(tree.to_bytes()))
+        .build();
+    let wd_cid = put_block_signed(store.as_ref(), owner, child, wd.to_bytes(), tid).await?;
+    let update = PointerUpdate::new(None, Some(wd_cid), PointerUpdate::increment(None));
+    if !mutable.set_pointer_update(owner, child, &update).await? {
+        return Err(Error::Protocol("new writer's pointer rejected".into()));
+    }
+    Ok(())
+}
+
+/// Remove `child` from `parent`'s owned writers, if it is one.
+pub(crate) async fn disown_writer(
+    owner: &PublicKeyHash,
+    parent: &SigningPrivateKeyAndPublicHash,
+    child: &PublicKeyHash,
+    store: &Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+    tid: &TransactionId,
+) -> Result<bool> {
+    remove_owned_writer(owner, parent, child, store, mutable, tid).await
+}

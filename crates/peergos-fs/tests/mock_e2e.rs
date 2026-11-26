@@ -2788,8 +2788,9 @@ async fn safe_copy_of_friends_write_access() {
     safe_copy_of_friends_impl(false, &poster, &store, &mutable).await;
 }
 
-/// Move a shared file to a different writer subspace — shares are dropped because
-/// the capability changes. Java's `moveFileToDifferentWriter`.
+/// Move a shared file to a different writer subspace, keeping access: its keys are
+/// kept, so the share is too, and is sent again with the new writer. Java's
+/// `moveFileToDifferentWriter`.
 ///
 /// Note: For write access, Rust's `move_to` → `copy_into` does not handle link
 /// nodes created by `share_write_access` on the source file, so the write-access
@@ -2827,23 +2828,26 @@ async fn move_file_to_different_writer_read_access() {
         .into_iter().next().expect("link node has a target");
     let destdir_cap = destdir_actual.cap;
 
-    // Move file to destdir (different writer -> preserved = false)
+    // Move file to destdir, in a different writing space
     peergos_fs::move_file(alice_user, &subdir, "subdir", "somefile.txt", &destdir_cap, "destdir", true, Some(s.clone()), store.clone(), mutable.as_ref()).await.unwrap();
 
     // Old path cache cleared
     let shared_old = peergos_fs::get_shared_with(alice_user, "subdir/somefile.txt", peergos_fs::Access::Read, store.clone(), mutable.as_ref()).await.unwrap();
     assert!(shared_old.is_empty(), "old path cache cleared after move to different writer");
 
-    // New path cache should NOT have Bob (different writer, preserved = false)
+    // kept, as in a move within a writing space
     let shared_new = peergos_fs::get_shared_with(alice_user, "destdir/somefile.txt", peergos_fs::Access::Read, store.clone(), mutable.as_ref()).await.unwrap();
-    assert!(shared_new.is_empty(), "new path cache empty after writer change");
+    assert!(shared_new.contains(&"bob".to_string()), "the share moved with the file");
+    let moved = peergos_fs::list_directory(&destdir_cap, store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.name == "somefile.txt").unwrap().cap;
 
     // Bob's old cap still in sharing folder (points to deleted chunks)
     let bob = login("bob", "bpw", &poster, &store, &mutable).await;
     let bob_friend = peergos_fs::get_friends(bob.user().unwrap(), store.clone(), mutable.as_ref()).await.unwrap()
         .into_iter().find(|e| e.owner_name == "alice").unwrap();
     let caps = peergos_fs::read_shared_capabilities(&bob_friend.pointer, store.clone(), mutable.as_ref()).await.unwrap();
-    assert!(!caps.is_empty(), "bob's shared folder still has the cap entry");
+    let resent = caps.iter().find(|c| c.writer == moved.writer && c.map_key == moved.map_key).expect("the share was sent again");
+    assert_eq!(peergos_fs::read_file(resent, store.clone(), mutable.as_ref()).await.unwrap().1, data);
 }
 
 /// Same as read-access version but uses `keep_access=false` to re-encrypt
@@ -4575,4 +4579,175 @@ async fn move_across_writing_spaces_keeps_keys() {
     // logging in again finds it all
     let again = UserContext::sign_in("xi", "xpw", None, ctx.poster(), store.clone(), mutable.clone()).await.unwrap();
     assert_eq!(again.get_by_path("w/docs/inner/d.txt").await.unwrap().unwrap().read().await.unwrap(), b"delta");
+}
+
+/// Revoking access rotates every cryptree node to new keys but keeps file data:
+/// the same fragments, under a data key marked dirty, which the next write to the
+/// file replaces. A writing space nested in it keeps its signer.
+#[tokio::test]
+async fn rotation_keeps_file_data_and_cleans_before_writing() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = UserContext::sign_up("tau", "tpw", None, poster, store.clone(), mutable.clone()).await.expect("sign up");
+    let home = ctx.get_home().await.unwrap();
+    let docs = home.mkdir("docs").await.unwrap();
+    let big: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    docs.upload("big.bin", &big).await.unwrap();
+    docs.get_latest().await.unwrap().upload("small.txt", b"small").await.unwrap();
+    docs.get_latest().await.unwrap().mkdir("inner").await.unwrap().upload("c.txt", b"gamma").await.unwrap();
+    let docs = ctx.get_by_path("docs").await.unwrap().unwrap();
+    let nested = peergos_fs::move_dir_to_own_writer(docs.capability(), "inner", docs.signer().cloned(), None, store.clone(), mutable.as_ref())
+        .await
+        .unwrap();
+    let node_of = |path: &'static str| {
+        let ctx = &ctx;
+        let (store, mutable) = (store.clone(), mutable.clone());
+        async move {
+            let cap = ctx.get_by_path(path).await.unwrap().unwrap().capability().clone();
+            let (node, _) = peergos_fs::retrieve_file_metadata(&cap, store, mutable.as_ref()).await.unwrap();
+            (cap, node)
+        }
+    };
+    let (old_big, old_node) = node_of("docs/big.bin").await;
+
+    let link = ctx.create_secret_link("docs", false, "", None, None).await.unwrap();
+    let label = peergos_fs::SecretLink::from_link(&link).unwrap().label;
+    ctx.delete_secret_link("docs", label).await.unwrap();
+
+    let (new_big, new_node) = node_of("docs/big.bin").await;
+    assert_ne!(new_big.r_base_key, old_big.r_base_key);
+    assert!(peergos_fs::retrieve_file_metadata(&old_big, store.clone(), mutable.as_ref()).await.is_err(), "the old cap is revoked");
+    assert_eq!(new_node.children_or_data, old_node.children_or_data, "the data wasn't copied");
+    assert!(new_node.get_data_key(&new_big.r_base_key).unwrap().is_dirty);
+    assert_eq!(peergos_fs::read_file(&new_big, store.clone(), mutable.as_ref()).await.unwrap().1, big);
+    assert_eq!(ctx.get_by_path("docs/small.txt").await.unwrap().unwrap().read().await.unwrap(), b"small");
+    let inner = ctx.get_by_path("docs/inner").await.unwrap().unwrap();
+    assert_eq!(inner.capability().writer, nested.writer, "the nested writing space keeps its signer");
+    inner.upload("d.txt", b"delta").await.unwrap();
+    assert_eq!(ctx.get_by_path("docs/inner/c.txt").await.unwrap().unwrap().read().await.unwrap(), b"gamma");
+
+    // the first write re-encrypts the file under a fresh key, keeping its cap
+    ctx.get_by_path("docs/big.bin").await.unwrap().unwrap().append(b"more").await.unwrap();
+    let (cleaned, cleaned_node) = node_of("docs/big.bin").await;
+    assert_eq!(cleaned, new_big);
+    let key = cleaned_node.get_data_key(&cleaned.r_base_key).unwrap();
+    assert!(!key.is_dirty);
+    assert_ne!(key.key, new_node.get_data_key(&new_big.r_base_key).unwrap().key);
+    let mut expected = big.clone();
+    expected.extend_from_slice(b"more");
+    assert_eq!(peergos_fs::read_file(&cleaned, store.clone(), mutable.as_ref()).await.unwrap().1, expected);
+}
+
+/// A move that doesn't keep access rotates the subtree into the target instead of
+/// copying it: new keys, the same file data, and new signers for the writing
+/// spaces nested in it.
+#[tokio::test]
+async fn move_without_keeping_access_rotates_keys() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    let ctx = UserContext::sign_up("phi", "ppw", None, poster, store.clone(), mutable.clone()).await.expect("sign up");
+    let home = ctx.get_home().await.unwrap();
+    home.mkdir("w").await.unwrap();
+    let docs = home.get_latest().await.unwrap().mkdir("docs").await.unwrap();
+    docs.upload("a.txt", b"alpha").await.unwrap();
+    docs.get_latest().await.unwrap().mkdir("inner").await.unwrap().upload("b.txt", b"beta").await.unwrap();
+    let home = home.get_latest().await.unwrap();
+    let w_cap = peergos_fs::move_dir_to_own_writer(home.capability(), "w", home.signer().cloned(), None, store.clone(), mutable.as_ref())
+        .await
+        .unwrap();
+    let docs = ctx.get_by_path("docs").await.unwrap().unwrap();
+    let inner = peergos_fs::move_dir_to_own_writer(docs.capability(), "inner", docs.signer().cloned(), None, store.clone(), mutable.as_ref())
+        .await
+        .unwrap();
+    let before = ctx.get_by_path("docs").await.unwrap().unwrap().capability().clone();
+    let a_before = ctx.get_by_path("docs/a.txt").await.unwrap().unwrap().capability().clone();
+    let (a_node, _) = peergos_fs::retrieve_file_metadata(&a_before, store.clone(), mutable.as_ref()).await.unwrap();
+
+    let home = ctx.get_home().await.unwrap();
+    let w = ctx.get_by_path("w").await.unwrap().unwrap();
+    let moved = home.move_child("docs", &w, false).await.unwrap();
+    assert_eq!(moved.writer, w_cap.writer);
+    assert_ne!(moved.r_base_key, before.r_base_key, "the keys changed");
+    assert!(ctx.get_by_path("docs").await.unwrap().is_none());
+    assert!(peergos_fs::retrieve_file_metadata(&before, store.clone(), mutable.as_ref()).await.is_err());
+    assert!(peergos_fs::retrieve_file_metadata(&inner, store.clone(), mutable.as_ref()).await.is_err(), "the nested space's old cap is revoked");
+
+    let a = ctx.get_by_path("w/docs/a.txt").await.unwrap().unwrap();
+    assert_eq!(a.read().await.unwrap(), b"alpha");
+    let (a_moved, _) = peergos_fs::retrieve_file_metadata(a.capability(), store.clone(), mutable.as_ref()).await.unwrap();
+    assert_eq!(a_moved.children_or_data, a_node.children_or_data, "the data wasn't copied");
+    let moved_inner = ctx.get_by_path("w/docs/inner").await.unwrap().unwrap();
+    assert_ne!(moved_inner.capability().writer, inner.writer, "the nested space has a new signer");
+    assert_eq!(ctx.get_by_path("w/docs/inner/b.txt").await.unwrap().unwrap().read().await.unwrap(), b"beta");
+    moved_inner.upload("c.txt", b"gamma").await.unwrap();
+    ctx.get_by_path("w/docs").await.unwrap().unwrap().upload("d.txt", b"delta").await.unwrap();
+    assert_eq!(ctx.get_by_path("w/docs/inner/c.txt").await.unwrap().unwrap().read().await.unwrap(), b"gamma");
+    assert_eq!(ctx.get_by_path("w/docs/d.txt").await.unwrap().unwrap().read().await.unwrap(), b"delta");
+
+    let again = UserContext::sign_in("phi", "ppw", None, ctx.poster(), store.clone(), mutable.clone()).await.unwrap();
+    assert_eq!(again.get_by_path("w/docs/inner/c.txt").await.unwrap().unwrap().read().await.unwrap(), b"gamma");
+}
+
+/// Shares and links follow a rename and a move that keeps access, including the
+/// member paths a link records under its other items, and a move to another
+/// writing space sends the shares again; a move that drops access drops them.
+#[tokio::test]
+async fn shared_with_records_follow_renames_and_moves() {
+    let server = MockServer::new();
+    let (poster, store, mutable) = server.connect();
+    for (u, p) in [("alice", "apw"), ("bob", "bpw")] {
+        UserContext::sign_up(u, p, None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    }
+    befriend(("alice", "apw"), ("bob", "bpw"), &poster, &store, &mutable).await;
+    let ctx = UserContext::sign_in("alice", "apw", None, poster.clone(), store.clone(), mutable.clone()).await.unwrap();
+    let alice = ctx.user().unwrap().clone();
+    let home = ctx.get_home().await.unwrap();
+    let docs = home.mkdir("docs").await.unwrap();
+    docs.upload("a.txt", b"alpha").await.unwrap();
+    docs.get_latest().await.unwrap().upload("b.txt", b"beta").await.unwrap();
+    home.get_latest().await.unwrap().upload("other.txt", b"other").await.unwrap();
+    home.get_latest().await.unwrap().mkdir("w").await.unwrap();
+    let a = ctx.get_by_path("docs/a.txt").await.unwrap().unwrap().capability().clone();
+    peergos_fs::share_read_access(&alice, "docs/a.txt", &a, "bob", store.clone(), mutable.as_ref()).await.unwrap();
+    let props = ctx.create_secret_link_to(&["docs/b.txt".to_string(), "other.txt".to_string()], &[], "", None, None).await.unwrap();
+    let state = |dir: &'static str| {
+        let (alice, store, mutable) = (alice.clone(), store.clone(), mutable.clone());
+        async move { peergos_fs::get_directory_sharing_state(&alice, dir, store, mutable.as_ref()).await.unwrap() }
+    };
+    let members = |s: &peergos_fs::SharedWithState, name: &str| -> Vec<String> {
+        s.links().get(name).and_then(|l| l.first()).map(|l| l.members.iter().map(|m| m.path.clone()).collect()).unwrap_or_default()
+    };
+
+    ctx.get_home().await.unwrap().rename_child("docs", "papers").await.unwrap();
+    let papers = state("papers").await;
+    assert!(papers.read_shares().get("a.txt").is_some_and(|u| u.contains("bob")));
+    assert_eq!(members(&papers, "b.txt"), vec!["/alice/papers/b.txt", "/alice/other.txt"]);
+    assert_eq!(members(&state("").await, "other.txt"), vec!["/alice/papers/b.txt", "/alice/other.txt"]);
+    assert!(state("docs").await.read_shares().is_empty());
+
+    // a move into another writing space
+    let home = ctx.get_home().await.unwrap();
+    peergos_fs::move_dir_to_own_writer(home.capability(), "w", home.signer().cloned(), None, store.clone(), mutable.as_ref()).await.unwrap();
+    let w = ctx.get_by_path("w").await.unwrap().unwrap();
+    ctx.get_home().await.unwrap().move_child("papers", &w, true).await.unwrap();
+    let moved = state("w/papers").await;
+    assert!(moved.read_shares().get("a.txt").is_some_and(|u| u.contains("bob")));
+    assert_eq!(members(&state("").await, "other.txt"), vec!["/alice/w/papers/b.txt", "/alice/other.txt"]);
+    let new_a = ctx.get_by_path("w/papers/a.txt").await.unwrap().unwrap().capability().clone();
+    assert_ne!(new_a.writer, a.writer);
+    let bob = peergos_fs::login("bob", "bpw", poster.as_ref(), store.clone(), mutable.as_ref(), None).await.unwrap();
+    let entry = peergos_fs::get_friends(&bob, store.clone(), mutable.as_ref()).await.unwrap()
+        .into_iter().find(|e| e.owner_name == "alice").unwrap();
+    let caps = peergos_fs::read_shared_capabilities(&entry.pointer, store.clone(), mutable.as_ref()).await.unwrap();
+    let resent = caps.iter().find(|c| c.writer == new_a.writer && c.map_key == new_a.map_key).expect("the share was sent again");
+    assert_eq!(peergos_fs::read_file(resent, store.clone(), mutable.as_ref()).await.unwrap().1, b"alpha");
+
+    // the link can still be edited, by its new paths
+    ctx.set_secret_link_members(&["w/papers/b.txt".to_string(), "other.txt".to_string()], &[], props).await.unwrap();
+
+    // a move that drops access drops the records
+    let papers = ctx.get_by_path("w/papers").await.unwrap().unwrap();
+    papers.move_child("a.txt", &ctx.get_home().await.unwrap(), false).await.unwrap();
+    assert!(state("w/papers").await.read_shares().get("a.txt").is_none());
+    assert!(state("").await.read_shares().get("a.txt").is_none());
 }

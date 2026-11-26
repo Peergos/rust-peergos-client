@@ -24,6 +24,7 @@ pub mod mimetype;
 pub mod profile;
 pub mod publish;
 pub mod retrieve;
+mod rotate;
 pub mod signup;
 pub mod social;
 pub mod thumbnail;
@@ -1725,142 +1726,6 @@ async fn parent_writer_signer(
         .ok_or_else(|| Error::Protocol("no writer available; supply the entry-point signer".into()))
 }
 
-async fn create_writable_shared_dir(
-    parent_cap: &AbsoluteCapability,
-    name: &str,
-    link: &LinkNodeKeys,
-    entry_signer: Option<SigningPrivateKeyAndPublicHash>,
-    mirror_bat: Option<&BatId>,
-    store: Arc<dyn ContentAddressedStorage>,
-    mutable: &dyn MutablePointers,
-) -> Result<AbsoluteCapability> {
-    let epoch = now_epoch();
-    let owner = &parent_cap.owner;
-    // The parent writer owns the new writer; recover its signing key.
-    let parent_writer = parent_writer_signer(parent_cap, &entry_signer, store.clone(), mutable).await?;
-    let parent_writer_hash = parent_writer.public_key_hash.clone();
-
-    let writer_pair = SigningKeyPair::random_writer()?;
-
-    // Directory keys/location.
-    let dir_r = random_symmetric_key()?;
-    let dir_w = loop {
-        let k = random_symmetric_key()?;
-        if k != dir_r {
-            break k;
-        }
-    };
-    let parent_key = loop {
-        let k = random_symmetric_key()?;
-        if k != dir_r {
-            break k;
-        }
-    };
-    let dir_map_key = random_bytes(32);
-    let dir_bat = Bat::new(random_bytes(32))?;
-
-    let tid = store.start_transaction(owner).await?;
-    let writer_hash = put_signing_key(store.as_ref(), owner, &parent_writer, &writer_pair.public, &tid).await?;
-    let writer = SigningPrivateKeyAndPublicHash::new(writer_hash.clone(), writer_pair.secret);
-
-    // --- 1. Register the new writer as owned by the PARENT WRITER first. The
-    // server checks ownership on every block write and pointer set, so this must
-    // happen before any block signed by the new writer is uploaded. The proof
-    // signs the PARENT WRITER's hash (its owner).
-    let pw_pointer = mutable.get_pointer_target(owner, &parent_writer_hash, store.as_ref()).await?;
-    let pw_wd_cid = pw_pointer.updated.clone().ok_or_else(|| Error::Protocol("parent writer has no data".into()))?;
-    let pw_wd = store
-        .get(owner, &pw_wd_cid, None)
-        .await?
-        .ok_or_else(|| Error::Protocol("parent writer data missing".into()))?;
-    let owned_root = Cid::cast(
-        pw_wd.get("owned").and_then(|c| c.as_link()).ok_or_else(|| Error::Protocol("parent writer has no owned champ".into()))?,
-    )?;
-    let signed_owner = writer.secret.sign_message(&parent_writer_hash.to_cbor().to_bytes(), peergos_core::SigningDomain::OwnerProof)?;
-    let owner_proof = CborObject::map()
-        .put("o", writer_hash.to_cbor())
-        .put("p", CborObject::ByteString(signed_owner))
-        .build();
-    let proof_cid = put_block_signed(store.as_ref(), owner, &parent_writer, owner_proof.to_bytes(), &tid).await?;
-    let mut owned_champ =
-        ChampWrapper::create(owner.clone(), owned_root, None, store.clone(), identity_key_hasher()).await?;
-    let mut owned_key = writer_hash.to_cbor().to_bytes();
-    owned_key.reverse();
-    owned_champ
-        .put(&parent_writer, &owned_key, &None, Some(CborObject::MerkleLink(proof_cid.to_bytes())), &tid)
-        .await?;
-    let new_pw_wd = writer_data_with_owned(&pw_wd, owned_champ.root_hash())?;
-    let new_pw_wd_cid = put_block_signed(store.as_ref(), owner, &parent_writer, new_pw_wd.to_bytes(), &tid).await?;
-    let pw_update = PointerUpdate::new(
-        Some(pw_wd_cid),
-        Some(new_pw_wd_cid),
-        PointerUpdate::increment(pw_pointer.sequence),
-    );
-    if !mutable.set_pointer_update(owner, &parent_writer, &pw_update).await? {
-        return Err(Error::Protocol("parent writer pointer rejected".into()));
-    }
-
-    // --- 2. Build the directory node (with a writer link) + the new writer's
-    // subspace, now that the writer is authorised to write.
-    let writer_link = peergos_core::symmetric::CipherText::build(&dir_w, &writer)?.to_cbor();
-    let next_chunk =
-        RelCap::subsequent_chunk(random_bytes(32), Some(Bat::new(random_bytes(32))?), dir_r.clone());
-    let from_base = CborObject::map()
-        .put("k", parent_key.to_cbor())
-        .put("w", writer_link)
-        .put("n", next_chunk.to_cbor())
-        .build();
-    let props = FileProperties::new_directory(name.to_string(), epoch);
-    let to_parent = link.parent_link(&parent_cap.writer);
-    let from_parent = CborObject::map().put("p", to_parent.to_cbor()).put("s", props.to_cbor()).build();
-    let empty_children = retrieve::FragmentedPaddedCipherText::build_inline(
-        &dir_r,
-        &ChildrenLinks::Named(Vec::new()).to_cbor(),
-        MIN_FRAGMENT_SIZE,
-    )?;
-    let node = CryptreeNode::new(
-        true,
-        node_bats(&dir_bat, mirror_bat)?,
-        PaddedCipherText::build(&dir_r, &from_base, BASE_BLOCK_PADDING_BLOCKSIZE)?,
-        PaddedCipherText::build(&parent_key, &from_parent, META_DATA_PADDING_BLOCKSIZE)?,
-        empty_children.to_cbor(),
-    );
-    let node_cid = put_block_signed(store.as_ref(), owner, &writer, node.to_cbor().to_bytes(), &tid).await?;
-    let writer_owned =
-        put_block_signed(store.as_ref(), owner, &writer, peergos_core::Champ::empty().serialize(), &tid).await?;
-    let fs_empty =
-        put_block_signed(store.as_ref(), owner, &writer, peergos_core::Champ::empty().serialize(), &tid).await?;
-    let mut fs_champ =
-        ChampWrapper::create(owner.clone(), fs_empty, None, store.clone(), identity_key_hasher()).await?;
-    fs_champ
-        .put(&writer, &dir_map_key, &None, Some(CborObject::MerkleLink(node_cid.to_bytes())), &tid)
-        .await?;
-    let writer_wd = CborObject::map()
-        .put("controller", writer_hash.to_cbor())
-        .put("owned", CborObject::MerkleLink(writer_owned.to_bytes()))
-        .put("tree", CborObject::MerkleLink(fs_champ.root_hash().to_bytes()))
-        .build();
-    let writer_wd_cid = put_block_signed(store.as_ref(), owner, &writer, writer_wd.to_bytes(), &tid).await?;
-    let writer_update = PointerUpdate::new(None, Some(writer_wd_cid), PointerUpdate::increment(None));
-    if !mutable.set_pointer_update(owner, &writer, &writer_update).await? {
-        return Err(Error::Protocol("new writer pointer rejected".into()));
-    }
-    store.close_transaction(owner, &tid).await?;
-
-    // --- 3. Add a child link (with explicit writer) to the parent ------------
-    // The rotated directory lives entirely in the new writer subspace. The caller
-    // links it into the parent via a link node (see `create_link_node`), so the
-    // name is kept in the parent's writer space.
-    AbsoluteCapability::new(
-        owner.clone(),
-        writer_hash,
-        dir_map_key,
-        Some(dir_bat),
-        dir_r,
-        Some(dir_w),
-    )
-}
-
 /// Where a link node goes and its keys (`createAndCommitLink`'s `linkCap` and
 /// parent key). Chosen before the link node exists, so the target's parent link
 /// can already point at it.
@@ -2155,125 +2020,6 @@ pub async fn move_dir_to_own_writer(
     move_to_new_writing_space(parent_cap, child_name, entry_signer, mirror_bat, store, mutable).await
 }
 
-/// Create a **single-chunk file** in a fresh writer subspace owned by the parent
-/// writer, holding `content` under new keys with a writer link (so it is writable),
-/// and return its writable capability. The file is NOT yet linked into the parent —
-/// the caller adds a link node (see [`move_file_to_own_writer`]). Mirrors the file
-/// arm of Java `rotateAllKeys`.
-#[allow(clippy::too_many_arguments)]
-async fn create_writable_shared_file(
-    parent_cap: &AbsoluteCapability,
-    name: &str,
-    content: &[u8],
-    old_props: &FileProperties,
-    link: &LinkNodeKeys,
-    entry_signer: Option<SigningPrivateKeyAndPublicHash>,
-    mirror_bat: Option<&BatId>,
-    store: Arc<dyn ContentAddressedStorage>,
-    mutable: &dyn MutablePointers,
-) -> Result<AbsoluteCapability> {
-    let owner = &parent_cap.owner;
-    let parent_writer = parent_writer_signer(parent_cap, &entry_signer, store.clone(), mutable).await?;
-    let parent_writer_hash = parent_writer.public_key_hash.clone();
-
-    let writer_pair = SigningKeyPair::random_writer()?;
-
-    // Fresh file keys/location.
-    let file_r = random_symmetric_key()?;
-    let file_w = loop {
-        let k = random_symmetric_key()?;
-        if k != file_r {
-            break k;
-        }
-    };
-    let file_data_key = loop {
-        let k = random_symmetric_key()?;
-        if k != file_r {
-            break k;
-        }
-    };
-    let file_map_key = random_bytes(32);
-    let file_bat = Bat::new(random_bytes(32))?;
-    let stream_secret = random_bytes(32);
-
-    let tid = store.start_transaction(owner).await?;
-    let writer_hash = put_signing_key(store.as_ref(), owner, &parent_writer, &writer_pair.public, &tid).await?;
-    let writer = SigningPrivateKeyAndPublicHash::new(writer_hash.clone(), writer_pair.secret);
-
-    // --- 1. Register the new writer as owned by the parent writer (must precede
-    // any block signed by the new writer).
-    let pw_pointer = mutable.get_pointer_target(owner, &parent_writer_hash, store.as_ref()).await?;
-    let pw_wd_cid = pw_pointer.updated.clone().ok_or_else(|| Error::Protocol("parent writer has no data".into()))?;
-    let pw_wd = store.get(owner, &pw_wd_cid, None).await?.ok_or_else(|| Error::Protocol("parent writer data missing".into()))?;
-    let owned_root = Cid::cast(
-        pw_wd.get("owned").and_then(|c| c.as_link()).ok_or_else(|| Error::Protocol("parent writer has no owned champ".into()))?,
-    )?;
-    let signed_owner = writer.secret.sign_message(&parent_writer_hash.to_cbor().to_bytes(), peergos_core::SigningDomain::OwnerProof)?;
-    let owner_proof = CborObject::map()
-        .put("o", writer_hash.to_cbor())
-        .put("p", CborObject::ByteString(signed_owner))
-        .build();
-    let proof_cid = put_block_signed(store.as_ref(), owner, &parent_writer, owner_proof.to_bytes(), &tid).await?;
-    let mut owned_champ = ChampWrapper::create(owner.clone(), owned_root, None, store.clone(), identity_key_hasher()).await?;
-    let mut owned_key = writer_hash.to_cbor().to_bytes();
-    owned_key.reverse();
-    owned_champ.put(&parent_writer, &owned_key, &None, Some(CborObject::MerkleLink(proof_cid.to_bytes())), &tid).await?;
-    let new_pw_wd = writer_data_with_owned(&pw_wd, owned_champ.root_hash())?;
-    let new_pw_wd_cid = put_block_signed(store.as_ref(), owner, &parent_writer, new_pw_wd.to_bytes(), &tid).await?;
-    let pw_update = PointerUpdate::new(Some(pw_wd_cid), Some(new_pw_wd_cid), PointerUpdate::increment(pw_pointer.sequence));
-    if !mutable.set_pointer_update(owner, &parent_writer, &pw_update).await? {
-        return Err(Error::Protocol("parent writer pointer rejected".into()));
-    }
-
-    // --- 2. Write the file's chunk nodes (writer link on chunk 0) in the new writer.
-    let writer_link = peergos_core::symmetric::CipherText::build(&file_w, &writer)?.to_cbor();
-    let mime = mimetype::calculate_mime_type(content, name);
-    let to_parent = link.parent_link(&parent_cap.writer);
-    let chunks = write_file_chunks(
-        owner,
-        &writer,
-        &file_map_key,
-        &Some(file_bat.clone()),
-        &file_r,
-        &file_data_key,
-        &stream_secret,
-        old_props.chunk_size,
-        &to_parent,
-        Some(&writer_link),
-        name,
-        &mime,
-        old_props.created_epoch,
-        None,
-        &old_props.thumbnail,
-        mirror_bat,
-        content,
-        &store,
-        &tid,
-    )
-    .await?;
-
-    // --- 3. The new writer's subspace: a champ holding all the file's chunk nodes.
-    let writer_owned = put_block_signed(store.as_ref(), owner, &writer, peergos_core::Champ::empty().serialize(), &tid).await?;
-    let fs_empty = put_block_signed(store.as_ref(), owner, &writer, peergos_core::Champ::empty().serialize(), &tid).await?;
-    let mut fs_champ = ChampWrapper::create(owner.clone(), fs_empty, None, store.clone(), identity_key_hasher()).await?;
-    for (mk, cid) in &chunks {
-        fs_champ.put(&writer, mk, &None, Some(CborObject::MerkleLink(cid.to_bytes())), &tid).await?;
-    }
-    let writer_wd = CborObject::map()
-        .put("controller", writer_hash.to_cbor())
-        .put("owned", CborObject::MerkleLink(writer_owned.to_bytes()))
-        .put("tree", CborObject::MerkleLink(fs_champ.root_hash().to_bytes()))
-        .build();
-    let writer_wd_cid = put_block_signed(store.as_ref(), owner, &writer, writer_wd.to_bytes(), &tid).await?;
-    let writer_update = PointerUpdate::new(None, Some(writer_wd_cid), PointerUpdate::increment(None));
-    if !mutable.set_pointer_update(owner, &writer, &writer_update).await? {
-        return Err(Error::Protocol("new writer pointer rejected".into()));
-    }
-    store.close_transaction(owner, &tid).await?;
-
-    AbsoluteCapability::new(owner.clone(), writer_hash, file_map_key, Some(file_bat), file_r, Some(file_w))
-}
-
 /// Move the file `child_name` in `parent_cap` into its **own writer subspace** so
 /// write access to it can be granted. Keeps every key: see
 /// [`move_to_new_writing_space`]. Returns its writable capability.
@@ -2369,12 +2115,12 @@ async fn delete_writer_subspace(
     Ok(())
 }
 
-/// Force a write-shared directory (`child_name` in `parent_cap`, already in its
-/// own writer subspace behind a link node) into a **fresh** writer subspace,
-/// deleting the old one and deauthorising the old writer. This is Peergos
-/// `rotateAllKeys` with `rotateSigner=true`, used to revoke write access.
+/// Revoke write access to the write-shared `child_name` in `parent_cap` by giving
+/// it, and every writing space in it, fresh keys and a new signer
+/// (`rotateAllKeys` with `rotateSigner`), then deauthorising the old writer. Only
+/// cryptree nodes are written again: file data keeps its blocks.
 ///
-/// Returns the new writable capability to the rotated directory.
+/// Returns the new writable capability to the rotated target.
 pub async fn force_rotate_child_to_new_writer(
     parent_cap: &AbsoluteCapability,
     child_name: &str,
@@ -2383,60 +2129,17 @@ pub async fn force_rotate_child_to_new_writer(
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<AbsoluteCapability> {
-    // The parent's child is a link node; follow it to the real (own-writer) target.
-    let link = list_directory(parent_cap, store.clone(), mutable)
-        .await?
-        .into_iter()
-        .find(|e| e.name == child_name)
-        .ok_or_else(|| Error::Protocol(format!("no such child: {child_name}")))?;
-    let (_n, link_props) = retrieve_file_metadata(&link.cap, store.clone(), mutable).await?;
-    if !link_props.is_link {
-        return Err(Error::Protocol(
-            "child is not write-shared (no link node / own writer)".into(),
-        ));
-    }
-    let old_target = list_directory(&link.cap, store.clone(), mutable)
-        .await?
-        .into_iter()
-        .next()
-        .ok_or_else(|| Error::Protocol("link node has no target".into()))?
-        .cap;
-    let old_writer = recover_signer(&old_target, store.clone(), mutable).await?;
-    let (_old_meta, old_props) = retrieve_file_metadata(&old_target, store.clone(), mutable).await?;
-    let is_dir = old_props.is_directory;
-
-    // Create a fresh writer subspace, copy the old contents across, and relink.
-    let link_keys = LinkNodeKeys::random()?;
-    let new_target = if is_dir {
-        let new_dir =
-            create_writable_shared_dir(parent_cap, child_name, &link_keys, entry_signer.clone(), mirror_bat, store.clone(), mutable).await?;
-        let new_signer = recover_signer(&new_dir, store.clone(), mutable).await?;
-        copy_dir_contents(&old_target, &new_dir, &new_signer, Some(&old_writer), mirror_bat, store.clone(), mutable).await?;
-        new_dir
-    } else {
-        let (props, content) = read_file(&old_target, store.clone(), mutable).await?;
-        create_writable_shared_file(
-            parent_cap, child_name, &content, &props, &link_keys, entry_signer.clone(), mirror_bat, store.clone(), mutable,
-        ).await?
-    };
-    create_link_node(parent_cap, child_name, &new_target, &old_props, &link_keys, entry_signer.clone(), mirror_bat, store.clone(), mutable)
-        .await?;
-
-    // Delete the old target subspace (while its writer is still authorised), then
-    // remove the orphaned old link node, then deauthorise the old writer.
-    delete_writer_subspace(&parent_cap.owner, &old_writer, &store, mutable).await?;
-    remove_orphaned_subtree(parent_cap, &link.cap, entry_signer.clone(), mirror_bat, &store, mutable).await?;
-    deauthorize_writer(parent_cap, &old_target.writer, entry_signer, store.clone(), mutable).await?;
-    Ok(new_target)
+    let (cap, _) = rotate::rotate_child(parent_cap, child_name, entry_signer, true, mirror_bat, &store, mutable).await?;
+    Ok(cap)
 }
 
-/// Rotate the symmetric keys of `child_name` in `parent_cap` **in place** (same
-/// writer, fresh read/write/map keys), re-encrypting its content and deleting the
-/// old copy. This is the read-access rotation of Peergos `rotateAllKeys`
-/// (`rotateSigner=false`): any cached capability to the old keys is invalidated.
+/// Rotate the keys of `child_name` in `parent_cap` (`rotateAllKeys`): fresh
+/// read/write keys and locations for everything in it, the same writers, so any
+/// cap to the old keys stops working. Only cryptree nodes are written again: file
+/// data keeps its blocks, with its data key marked dirty, so the next write to a
+/// file re-encrypts it.
 ///
-/// Returns the new capability. The child (file or directory) must share the
-/// parent's writer (i.e. not already write-shared into its own writer).
+/// Returns the new capability.
 pub async fn rotate_child_read_keys(
     parent_cap: &AbsoluteCapability,
     child_name: &str,
@@ -2445,33 +2148,8 @@ pub async fn rotate_child_read_keys(
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<AbsoluteCapability> {
-    let old = list_directory(parent_cap, store.clone(), mutable)
-        .await?
-        .into_iter()
-        .find(|e| e.name == child_name)
-        .ok_or_else(|| Error::Protocol(format!("no such child: {child_name}")))?;
-    if old.cap.writer != parent_cap.writer {
-        return Err(Error::Protocol(
-            "child has its own writer; use write-access rotation instead".into(),
-        ));
-    }
-    let signer = parent_writer_signer(parent_cap, &entry_signer, store.clone(), mutable).await?;
-
-    let new_cap = if old.is_dir == Some(true) {
-        // Re-create the directory under fresh keys (replaces the parent's child
-        // link by name), then copy the old subtree across.
-        let new_dir = create_directory(parent_cap, child_name, Some(signer.clone()), mirror_bat, store.clone(), mutable).await?;
-        copy_dir_contents(&old.cap, &new_dir, &signer, Some(&signer), mirror_bat, store.clone(), mutable).await?;
-        new_dir
-    } else {
-        // Re-upload the file's content under fresh keys (replaces the link).
-        let (props, bytes) = read_file(&old.cap, store.clone(), mutable).await?;
-        upload_file(parent_cap, child_name, &bytes, props.thumbnail, Some(signer.clone()), mirror_bat, store.clone(), mutable)
-            .await?
-    };
-    // Delete the old (now-orphaned) subtree so its old keys grant no access.
-    remove_orphaned_subtree(parent_cap, &old.cap, entry_signer, mirror_bat, &store, mutable).await?;
-    Ok(new_cap)
+    let (cap, _) = rotate::rotate_child(parent_cap, child_name, entry_signer, false, mirror_bat, &store, mutable).await?;
+    Ok(cap)
 }
 
 /// Remove a child link from `dir_cap` **without deleting the child's data**
@@ -2662,6 +2340,8 @@ pub async fn rewrite_file_content(
     let r_base = &cap.r_base_key;
     let base = node.base_block(r_base)?;
     let data_key = node.get_data_key(r_base)?;
+    // revoked readers may hold a dirty key, so nothing new goes under it
+    let data_key = if data_key.is_dirty { random_symmetric_key()? } else { data_key };
     let writer_link = base.signer.clone();
     let to_parent = node.parent_link(r_base)?.ok_or_else(|| Error::Protocol("file has no parent link".into()))?;
     let stream_secret = old_props
@@ -2759,6 +2439,23 @@ pub async fn overwrite_file_section(
     mutable: &dyn MutablePointers,
 ) -> Result<Vec<Vec<u8>>> {
     write_file_section(cap, offset, data, signer, mirror_bat, store, mutable).await
+}
+
+/// Re-encrypt a file whose data key a rotation left dirty under a fresh key,
+/// keeping its cap (`FileWrapper.clean`), before anything new is written to it.
+async fn clean_if_dirty(
+    cap: &AbsoluteCapability,
+    signer: &SigningPrivateKeyAndPublicHash,
+    mirror_bat: Option<&BatId>,
+    store: &Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let (node, _) = retrieve_file_metadata(cap, store.clone(), mutable).await?;
+    if node.is_directory() || !node.get_data_key(&cap.r_base_key)?.is_dirty {
+        return Ok(());
+    }
+    let (_, content) = read_file(cap, store.clone(), mutable).await?;
+    rewrite_file_content(cap, &content, signer, mirror_bat, store.clone(), mutable).await
 }
 
 /// A file's first chunk, its properties and the writer root it was read under.
@@ -2869,6 +2566,7 @@ async fn write_section_at(
     if data.is_empty() {
         return Ok(Vec::new());
     }
+    clean_if_dirty(cap, signer, mirror_bat, &store, mutable).await?;
     let (root, cache, first, props) = open_file_for_write(cap, &store, mutable).await?;
     let requested = offset.unwrap_or(props.size);
     // a write past the end starts at the end, so that every chunk before it exists,
@@ -2994,10 +2692,12 @@ pub async fn truncate_file(
     store: Arc<dyn ContentAddressedStorage>,
     mutable: &dyn MutablePointers,
 ) -> Result<Vec<Vec<u8>>> {
-    let (root, cache, first, props) = open_file_for_write(cap, &store, mutable).await?;
+    let (_, _, _, props) = open_file_for_write(cap, &store, mutable).await?;
     if new_size >= props.size {
         return Ok(Vec::new());
     }
+    clean_if_dirty(cap, signer, mirror_bat, &store, mutable).await?;
+    let (root, cache, first, props) = open_file_for_write(cap, &store, mutable).await?;
     let chunk_size = props.chunk_size;
     let old_n = chunk_count(props.size, chunk_size);
     let keep = chunk_count(new_size, chunk_size);
@@ -3351,6 +3051,11 @@ pub async fn move_to_as(
     } else if keep_access && child.cap.writer == source_parent_cap.writer && target_dir_cap.owner == source_parent_cap.owner {
         writing_space::move_across_writing_spaces(
             source_parent_cap, &child, name, target_dir_cap, &target_node, new_name, entry_signer, mirror_bat, store, mutable,
+        )
+        .await
+    } else if !keep_access && target_dir_cap.owner == source_parent_cap.owner {
+        rotate::move_rotating_keys(
+            source_parent_cap, &child, name, target_dir_cap, &target_node, new_name, entry_signer, mirror_bat, &store, mutable,
         )
         .await
     } else {

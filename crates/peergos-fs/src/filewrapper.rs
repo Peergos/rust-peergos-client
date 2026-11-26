@@ -56,6 +56,26 @@ pub struct FileWrapper {
     /// Session-shared decrypted-cryptree-node cache; inherited by navigation so a
     /// path walk / list / read reuses already-decrypted nodes.
     cache: CryptreeCache,
+    /// Our login, below our own home, so renames and moves keep who things are
+    /// shared with. Inherited by navigation.
+    sharing: Option<Arc<Sharing>>,
+}
+
+/// What keeping our shared-with records up to date needs.
+pub(crate) struct Sharing {
+    pub user: LoggedInUser,
+    pub poster: Arc<dyn peergos_core::HttpPoster>,
+    /// What our home's own path starts with.
+    pub prefix: String,
+}
+
+impl Sharing {
+    fn home_relative(&self, path: &str) -> String {
+        match path.strip_prefix(&self.prefix) {
+            Some(rest) if self.prefix.is_empty() || rest.is_empty() || rest.starts_with('/') => rest.trim_matches('/').to_string(),
+            _ => path.trim_matches('/').to_string(),
+        }
+    }
 }
 
 impl FileWrapper {
@@ -81,6 +101,7 @@ impl FileWrapper {
             store,
             mutable,
             cache,
+            sharing: None,
         })
     }
 
@@ -95,6 +116,11 @@ impl FileWrapper {
     /// logged-in user's mirror bat into every wrapper it hands out).
     pub fn with_mirror_bat(mut self, mirror_bat: Option<BatId>) -> FileWrapper {
         self.mirror_bat = mirror_bat;
+        self
+    }
+
+    pub(crate) fn with_sharing(mut self, sharing: Option<Arc<Sharing>>) -> FileWrapper {
+        self.sharing = sharing;
         self
     }
 
@@ -114,7 +140,7 @@ impl FileWrapper {
     ) -> Result<FileWrapper> {
         let cache = CryptreeCache::new();
         let props = crate::retrieve_file_metadata_cached(&cap, store.clone(), mutable.as_ref(), &cache).await?.1;
-        Ok(FileWrapper { name: name.into(), cap, props, signer, path: path.into(), home_cap, mirror_bat: None, store, mutable, cache })
+        Ok(FileWrapper { name: name.into(), cap, props, signer, path: path.into(), home_cap, mirror_bat: None, store, mutable, cache, sharing: None })
     }
 
     // ---- accessors ---------------------------------------------------------
@@ -182,6 +208,7 @@ impl FileWrapper {
             store: self.store.clone(),
             mutable: self.mutable.clone(),
             cache: self.cache.clone(),
+            sharing: self.sharing.clone(),
         })
     }
 
@@ -207,7 +234,7 @@ impl FileWrapper {
         }
         let signer = crate::recover_signer(&cap, store.clone(), mutable.as_ref()).await.ok();
         let name = props.name.clone();
-        Ok(FileWrapper { name, cap, props, signer, path: String::new(), home_cap: None, mirror_bat: None, store, mutable, cache })
+        Ok(FileWrapper { name, cap, props, signer, path: String::new(), home_cap: None, mirror_bat: None, store, mutable, cache, sharing: None })
     }
 
     /// The children of this directory (`getChildren`), link nodes followed, with
@@ -247,6 +274,7 @@ impl FileWrapper {
                     store: self.store.clone(),
                     mutable: self.mutable.clone(),
                     cache: self.cache.clone(),
+                    sharing: self.sharing.clone(),
                 }),
                 // Link node (or unexpectedly absent): follow it via the per-child path.
                 _ => out.push(self.wrap_child(e).await?),
@@ -355,7 +383,8 @@ impl FileWrapper {
         )
         .await?
         .with_cache(self.cache.clone())
-        .with_mirror_bat(self.mirror_bat.clone()))
+        .with_mirror_bat(self.mirror_bat.clone())
+        .with_sharing(self.sharing.clone()))
     }
 
     // ---- mutation ----------------------------------------------------------
@@ -602,6 +631,10 @@ impl FileWrapper {
         let prior = self.writer_root().await;
         crate::rename_child(&self.cap, old_name, new_name, self.signer.clone(), self.mirror_bat.as_ref(), self.store.clone(), self.mutable.as_ref())
             .await?;
+        if let Some(s) = &self.sharing {
+            let (from, to) = (s.home_relative(&join(&self.path, old_name)), s.home_relative(&join(&self.path, new_name)));
+            crate::social::move_shared_with(&s.user, &from, &to, self.store.clone(), self.mutable.as_ref()).await?;
+        }
         let mut changed: Vec<&[u8]> = vec![&self.cap.map_key];
         if let Some(k) = &child_key {
             changed.push(k);
@@ -616,8 +649,29 @@ impl FileWrapper {
         let child_key = self.child(name).await.ok().flatten().map(|c| c.cap.map_key.clone());
         let src_prior = self.writer_root().await;
         let dst_prior = target.writer_root().await;
+        let entry = crate::list_directory(&self.cap, self.store.clone(), self.mutable.as_ref())
+            .await?
+            .into_iter()
+            .find(|e| e.name == name);
         let moved = crate::move_to(&self.cap, name, &target.cap, keep_access, self.signer.clone(), self.mirror_bat.as_ref(), self.store.clone(), self.mutable.as_ref())
             .await?;
+        if let (Some(s), Some(entry)) = (&self.sharing, entry) {
+            let from = s.home_relative(&join(&self.path, name));
+            // the moves that keep every key
+            let kept = keep_access && (target.cap.writer == self.cap.writer || entry.cap.writer == self.cap.writer);
+            match (&target.sharing, kept) {
+                (Some(t), true) => {
+                    let to = t.home_relative(&join(&target.path, name));
+                    crate::social::move_shared_with(&s.user, &from, &to, self.store.clone(), self.mutable.as_ref()).await?;
+                    if moved.writer != entry.cap.writer {
+                        crate::UserContext::for_user(s.user.clone(), &s.poster, &self.store, &self.mutable)
+                            .reshare_all_shares_and_links_recursive(&to)
+                            .await?;
+                    }
+                }
+                _ => crate::social::clear_shared_with(&s.user, &from, self.store.clone(), self.mutable.as_ref()).await?,
+            }
+        }
         // Both the source directory (child removed) and destination (child added)
         // changed. They may share a writer/tree or not; migrate each independently.
         let mut src_changed: Vec<&[u8]> = vec![&self.cap.map_key];

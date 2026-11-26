@@ -254,7 +254,15 @@ impl UserContext {
         Ok(user)
     }
 
-    fn for_user(
+    fn sharing(&self, prefix: &str) -> Arc<crate::filewrapper::Sharing> {
+        Arc::new(crate::filewrapper::Sharing {
+            user: self.user.clone().expect("only a login has a home"),
+            poster: self.poster.clone(),
+            prefix: prefix.to_string(),
+        })
+    }
+
+    pub(crate) fn for_user(
         user: LoggedInUser,
         poster: &Arc<dyn HttpPoster>,
         store: &Arc<dyn ContentAddressedStorage>,
@@ -588,7 +596,10 @@ impl UserContext {
             .user
             .as_ref()
             .ok_or_else(|| Error::Protocol("no home directory in a secret-link context".into()))?;
-        Ok(FileWrapper::home(user, self.store.clone(), self.mutable.clone()).await?.with_cache(self.cache.clone()))
+        Ok(FileWrapper::home(user, self.store.clone(), self.mutable.clone())
+            .await?
+            .with_cache(self.cache.clone())
+            .with_sharing(Some(self.sharing(""))))
     }
 
     /// The entry-point roots of this context: the home + accepted friend roots for
@@ -615,7 +626,8 @@ impl UserContext {
                     )
                     .await?
                     .with_cache(self.cache.clone())
-                    .with_mirror_bat(self.mirror_bat_id()),
+                    .with_mirror_bat(self.mirror_bat_id())
+                    .with_sharing((e.owner_name == user.username && Some(&e.pointer) == home.as_ref()).then(|| self.sharing(&user.username))),
                 );
             }
         } else {
@@ -1025,7 +1037,9 @@ impl UserContext {
         if !writable && self.is_public(path).await? {
             return Ok(());
         }
-        let Some(file) = self.get_by_path(path).await? else { return Ok(()) };
+        if self.get_by_path(path).await?.is_none() {
+            return Ok(());
+        }
         let user = self.require_user()?;
         let (parent_path, name) = split_home_path(path);
         let parent = self
@@ -1033,18 +1047,18 @@ impl UserContext {
             .await?
             .ok_or_else(|| Error::Protocol(format!("no parent directory for {path}")))?;
         let mb = user.mirror_bat_id();
-        let old_writer = file.capability().writer.clone();
-        if old_writer == parent.capability().writer {
-            crate::rotate_child_read_keys(parent.capability(), name, parent.signer().cloned(), mb.as_ref(), self.store.clone(), self.mutable.as_ref())
-                .await?;
-        } else {
-            let quotas = self.writer_quota_map().await.unwrap_or_default();
-            let new_cap = crate::force_rotate_child_to_new_writer(
-                parent.capability(), name, parent.signer().cloned(), mb.as_ref(), self.store.clone(), self.mutable.as_ref(),
-            )
-            .await?;
+        let rotate_signers = writable;
+        let quotas = if rotate_signers { self.writer_quota_map().await.unwrap_or_default() } else { Default::default() };
+        let net = peergos_core::BufferedNetwork::with_defaults(self.store.clone(), self.mutable.clone());
+        let bstore: Arc<dyn ContentAddressedStorage> = net.storage();
+        let (_, rotated) = crate::rotate::rotate_child(
+            parent.capability(), name, parent.signer().cloned(), rotate_signers, mb.as_ref(), &bstore, net.pointers().as_ref(),
+        )
+        .await?;
+        net.commit(&user.identity).await?;
+        for (old_writer, new_writer) in rotated {
             if let Some(quota) = quotas.get(&old_writer) {
-                crate::writer_quota::set_writer_quota(&user.signer, &new_cap.writer, Some(*quota), self.poster.as_ref()).await?;
+                crate::writer_quota::set_writer_quota(&user.signer, &new_writer, Some(*quota), self.poster.as_ref()).await?;
                 if let Err(e) = crate::writer_quota::set_writer_quota(&user.signer, &old_writer, None, self.poster.as_ref()).await {
                     log::warn!("Couldn't remove the cap of rotated signer {old_writer}: {e}");
                 }
@@ -1601,7 +1615,7 @@ impl UserContext {
     /// [`Self::reshare_all_shares_and_links`] for `path` and everything shared below
     /// it, whose keys a rotation of `path` changed too. A link is sent once, however
     /// many of its members are below.
-    async fn reshare_all_shares_and_links_recursive(&self, path: &str) -> Result<()> {
+    pub(crate) async fn reshare_all_shares_and_links_recursive(&self, path: &str) -> Result<()> {
         let user = self.require_user()?;
         let trimmed = path.trim_matches('/');
         let prefix = format!("{trimmed}/");

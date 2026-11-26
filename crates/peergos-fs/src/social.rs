@@ -1989,6 +1989,245 @@ pub async fn get_all_shares(
     Ok(res)
 }
 
+/// The cache folder holding the records of home-relative directory `dir`, if any.
+async fn find_cache_dir(
+    user: &LoggedInUser,
+    dir: &[String],
+    store: &Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<Option<AbsoluteCapability>> {
+    let Some(mut cur) = outbound_root(user, store.clone(), mutable).await? else { return Ok(None) };
+    for comp in dir {
+        cur = match list_directory(&cur, store.clone(), mutable).await?.into_iter().find(|e| &e.name == comp) {
+            Some(e) => e.cap,
+            None => return Ok(None),
+        };
+    }
+    Ok(Some(cur))
+}
+
+/// The records in the cache folder `dir` and below it, keyed by their path below it.
+async fn cache_states_below(
+    dir: &AbsoluteCapability,
+    store: &Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<Vec<(Vec<String>, SharedWithState)>> {
+    let mut res = Vec::new();
+    let mut todo = vec![(Vec::<String>::new(), dir.clone())];
+    while let Some((path, d)) = todo.pop() {
+        for e in list_directory(&d, store.clone(), mutable).await? {
+            if e.name == DIR_CACHE_FILE {
+                let bytes = crate::read_file(&e.cap, store.clone(), mutable).await?.1;
+                res.push((path.clone(), SharedWithState::from_cbor(&CborObject::from_bytes(&bytes)?)));
+            } else if e.is_dir != Some(false) {
+                let mut child = path.clone();
+                child.push(e.name.clone());
+                todo.push((child, e.cap));
+            }
+        }
+    }
+    Ok(res)
+}
+
+/// Where absolute `path` ends up when the subtree at `from` moves to `to`, if it is
+/// in that subtree. Compared by component.
+fn moved_path(path: &str, from: &[String], to: &[String]) -> Option<String> {
+    let p: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+    if p.len() < from.len() || p[..from.len()].iter().zip(from).any(|(a, b)| *a != b) {
+        return None;
+    }
+    let dest: Vec<&str> = to.iter().map(String::as_str).chain(p[from.len()..].iter().copied()).collect();
+    Some(format!("/{}", dest.join("/")))
+}
+
+impl SharedWithState {
+    /// This, with every link member at or below absolute `from` moved to `to`.
+    fn with_moved_members(mut self, from: &[String], to: &[String]) -> (SharedWithState, bool) {
+        let mut changed = false;
+        for links in self.links.values_mut() {
+            for l in links.iter_mut() {
+                for m in l.members.iter_mut() {
+                    if let Some(p) = moved_path(&m.path, from, to) {
+                        m.path = p;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        (self, changed)
+    }
+
+    fn merge(&mut self, other: SharedWithState) {
+        for (k, v) in other.read {
+            self.read.entry(k).or_default().extend(v);
+        }
+        for (k, v) in other.write {
+            self.write.entry(k).or_default().extend(v);
+        }
+        for (k, v) in other.links {
+            let e = self.links.entry(k).or_default();
+            for l in v {
+                e.retain(|x| x.label != l.label);
+                e.push(l);
+            }
+        }
+    }
+
+    /// Take the records of child `name` out of this.
+    fn take(&mut self, name: &str) -> SharedWithState {
+        let mut out = SharedWithState::default();
+        if let Some(v) = self.read.remove(name) {
+            out.read.insert(name.to_string(), v);
+        }
+        if let Some(v) = self.write.remove(name) {
+            out.write.insert(name.to_string(), v);
+        }
+        if let Some(v) = self.links.remove(name) {
+            out.links.insert(name.to_string(), v);
+        }
+        out
+    }
+
+    fn renamed(self, from: &str, to: &str) -> SharedWithState {
+        let re = |m: BTreeMap<String, BTreeSet<String>>| m.into_iter().map(|(k, v)| (if k == from { to.to_string() } else { k }, v)).collect();
+        SharedWithState {
+            read: re(self.read),
+            write: re(self.write),
+            links: self.links.into_iter().map(|(k, v)| (if k == from { to.to_string() } else { k }, v)).collect(),
+        }
+    }
+
+    fn has_records(&self) -> bool {
+        !self.read.is_empty() || !self.write.is_empty() || !self.links.is_empty()
+    }
+}
+
+/// Send the read and write shares of everything below home-relative `path`, and
+/// with `include_path` of `path` itself, again with the caps they have now: after a
+/// rotation, nested writing spaces may have new signers too
+/// (`reSendAllSharesAndLinksRecursive`, for shares).
+async fn reshare_below(
+    user: &LoggedInUser,
+    path: &str,
+    include_path: bool,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let path = path.trim_matches('/');
+    let prefix = format!("{path}/");
+    let wanted = |full: &str| full.starts_with(&prefix) || (include_path && full == path);
+    for (dir, state) in get_all_shares(user, store.clone(), mutable).await? {
+        let names: Vec<&String> = state.read_shares().keys().chain(state.write_shares().keys()).collect();
+        if !names.iter().any(|n| wanted(&join_path(&dir, n))) {
+            continue;
+        }
+        let Some(dir_cap) = resolve_home_path(user, &dir, store.clone(), mutable).await? else { continue };
+        for (name, readers) in state.read_shares() {
+            let full = join_path(&dir, name);
+            if !wanted(&full) {
+                continue;
+            }
+            let Some(cap) = resolve_home_path(user, &full, store.clone(), mutable).await? else { continue };
+            for r in readers {
+                share_read_access(user, &full, &cap, r, store.clone(), mutable).await?;
+            }
+        }
+        for (name, writers) in state.write_shares() {
+            if !wanted(&join_path(&dir, name)) {
+                continue;
+            }
+            for w in writers {
+                share_write_access(user, &dir, &dir_cap, name, w, store.clone(), mutable).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Our records of who home-relative `from` and everything below it is shared with,
+/// moved to `to` (`SharedWithCache.rename` and `moveSharedWith`), with the paths of
+/// link members in or below it, wherever their link is recorded, moved too.
+pub(crate) async fn move_shared_with(
+    user: &LoggedInUser,
+    from: &str,
+    to: &str,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let (from_dir, from_name) = split_path(from);
+    let (to_dir, to_name) = split_path(to);
+    let abs = |dir: &[String], name: &str| -> Vec<String> {
+        std::iter::once(user.username.clone()).chain(dir.iter().cloned()).chain(std::iter::once(name.to_string())).collect()
+    };
+    let (abs_from, abs_to) = (abs(&from_dir, &from_name), abs(&to_dir, &to_name));
+
+    // the records of the item itself, in its parent's file
+    let mut moved = SharedWithState::default();
+    if find_cache_dir(user, &from_dir, &store, mutable).await?.is_some() {
+        let mut parent = read_shared_with_at(user, &from_dir, store.clone(), mutable).await?;
+        moved = parent.take(&from_name);
+        if moved.has_records() {
+            write_shared_with_at(user, &from_dir, &parent, store.clone(), mutable).await?;
+        }
+    }
+    // and of everything below it, in the cache folders below its own
+    let mut from_cache = from_dir.clone();
+    from_cache.push(from_name.clone());
+    let below = match find_cache_dir(user, &from_cache, &store, mutable).await? {
+        Some(dir) => cache_states_below(&dir, &store, mutable).await?,
+        None => Vec::new(),
+    };
+    if moved.has_records() {
+        let mut target = read_shared_with_at(user, &to_dir, store.clone(), mutable).await?;
+        target.merge(moved.renamed(&from_name, &to_name));
+        write_shared_with_at(user, &to_dir, &target, store.clone(), mutable).await?;
+    }
+    for (rel, state) in below {
+        let mut dir = to_dir.clone();
+        dir.push(to_name.clone());
+        dir.extend(rel);
+        let mut target = read_shared_with_at(user, &dir, store.clone(), mutable).await?;
+        target.merge(state);
+        write_shared_with_at(user, &dir, &target, store.clone(), mutable).await?;
+    }
+    if let Some(parent_cache) = find_cache_dir(user, &from_dir, &store, mutable).await? {
+        if list_directory(&parent_cache, store.clone(), mutable).await?.iter().any(|e| e.name == from_name) {
+            let signer = recover_signer(user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?, store.clone(), mutable).await?;
+            crate::delete_child(&parent_cache, &from_name, Some(signer), user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
+        }
+    }
+    // a link that also holds items elsewhere is recorded under those too
+    for (dir, state) in get_all_shares(user, store.clone(), mutable).await? {
+        let (state, changed) = state.with_moved_members(&abs_from, &abs_to);
+        if changed {
+            let comps: Vec<String> = dir.split('/').filter(|c| !c.is_empty()).map(str::to_string).collect();
+            write_shared_with_at(user, &comps, &state, store.clone(), mutable).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Forget who home-relative `path` and everything below it is shared with
+/// (`SharedWithCache.clearSharedWith`).
+pub(crate) async fn clear_shared_with(
+    user: &LoggedInUser,
+    path: &str,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let (dir, name) = split_path(path);
+    let Some(parent_cache) = find_cache_dir(user, &dir, &store, mutable).await? else { return Ok(()) };
+    let mut parent = read_shared_with_at(user, &dir, store.clone(), mutable).await?;
+    if parent.take(&name).has_records() {
+        write_shared_with_at(user, &dir, &parent, store.clone(), mutable).await?;
+    }
+    if list_directory(&parent_cache, store.clone(), mutable).await?.iter().any(|e| e.name == name) {
+        let signer = recover_signer(user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?, store.clone(), mutable).await?;
+        crate::delete_child(&parent_cache, &name, Some(signer), user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
+    }
+    Ok(())
+}
+
 /// The secret links recorded for the file at home-relative `path`.
 pub async fn get_links(
     user: &LoggedInUser,
@@ -2060,8 +2299,7 @@ async fn unshare_read_exactly(
     let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?;
     let home_signer = recover_signer(home, store.clone(), mutable).await?;
 
-    // Rotate the child's keys: this re-encrypts and deletes the old content, so
-    // any capability the revoked users cached no longer works.
+    // Rotate the child's keys, so any capability the revoked users cached no longer works.
     let new_cap =
         crate::rotate_child_read_keys(parent_cap, child_name, Some(home_signer), user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
 
@@ -2082,6 +2320,7 @@ async fn unshare_read_exactly(
         append_cap_to_friend(user, friend, READ_SHARING_FILE, &new_cap.read_only(), store.clone(), mutable)
             .await?;
     }
+    reshare_below(user, &join_path(parent_path, child_name), false, store, mutable).await?;
     Ok(())
 }
 
@@ -2157,6 +2396,7 @@ async fn unshare_write_exactly(
     for r in &cur_readers {
         append_cap_to_friend(user, r, READ_SHARING_FILE, &new_target.read_only(), store.clone(), mutable).await?;
     }
+    reshare_below(user, &join_path(parent_path, child_name), false, store, mutable).await?;
     Ok(())
 }
 
@@ -2841,11 +3081,12 @@ pub async fn delete_group(
     delete_shared_child(user, group_uid, store, mutable).await
 }
 
-/// `move` with shared-with cache maintenance (`FileWrapper.moveTo` +
-/// `clearSharedWith`/`addAllSharedWith`): move `name` from `source_parent` into
-/// `target`, then rewrite the shared-with cache. A same-writer move with
-/// `keep_access` keeps the capability (and the share record); otherwise the keys
-/// rotate, breaking old shares, so the record is dropped.
+/// `move` with shared-with cache maintenance (`FileWrapper.moveTo`): move `name`
+/// from `source_parent` into `target`. A move that keeps every key takes the
+/// records of who it and everything below it is shared with along; any other
+/// rotates the keys, breaking old shares, so the records are dropped. A move to
+/// another writing space sends the shares again, but not links:
+/// `FileWrapper::move_child` sends those too.
 #[allow(clippy::too_many_arguments)]
 pub async fn move_file(
     user: &LoggedInUser,
@@ -2861,34 +3102,19 @@ pub async fn move_file(
 ) -> Result<AbsoluteCapability> {
     let old_file_path = join_path(source_path, name);
     let new_file_path = join_path(target_path, name);
-    let readers: BTreeSet<String> =
-        get_shared_with(user, &old_file_path, Access::Read, store.clone(), mutable).await?.into_iter().collect();
-    let writers: BTreeSet<String> =
-        get_shared_with(user, &old_file_path, Access::Write, store.clone(), mutable).await?.into_iter().collect();
-    // The fast (metadata-only) path preserves the capability, so shares survive.
-    let preserved = keep_access && target.writer == source_parent.writer;
+    let entry = list_directory(source_parent, store.clone(), mutable).await?.into_iter().find(|e| e.name == name);
+    // the moves that keep every key
+    let kept = keep_access && (target.writer == source_parent.writer || entry.as_ref().is_some_and(|e| e.cap.writer == source_parent.writer));
 
     let new_cap =
         crate::move_to(source_parent, name, target, keep_access, entry_signer, user.mirror_bat_id().as_ref(), store.clone(), mutable).await?;
-
-    // Clear the shares at the old path (`clearSharedWith`).
-    let (old_dir, old_name) = split_path(&old_file_path);
-    let mut old_state = read_shared_with_at(user, &old_dir, store.clone(), mutable).await?;
-    old_state.read.remove(&old_name);
-    old_state.write.remove(&old_name);
-    write_shared_with_at(user, &old_dir, &old_state, store.clone(), mutable).await?;
-
-    // Re-add them at the new path if the capability survived (`addAllSharedWith`).
-    if preserved && (!readers.is_empty() || !writers.is_empty()) {
-        let (new_dir, new_name) = split_path(&new_file_path);
-        let mut new_state = read_shared_with_at(user, &new_dir, store.clone(), mutable).await?;
-        if !readers.is_empty() {
-            new_state.read.insert(new_name.clone(), readers);
+    if kept {
+        move_shared_with(user, &old_file_path, &new_file_path, store.clone(), mutable).await?;
+        if entry.is_some_and(|e| e.cap.writer != new_cap.writer) {
+            reshare_below(user, &new_file_path, true, store, mutable).await?;
         }
-        if !writers.is_empty() {
-            new_state.write.insert(new_name, writers);
-        }
-        write_shared_with_at(user, &new_dir, &new_state, store, mutable).await?;
+    } else {
+        clear_shared_with(user, &old_file_path, store, mutable).await?;
     }
     Ok(new_cap)
 }
