@@ -229,7 +229,7 @@ impl Chat {
         Box::pin(async move {
             let msg_time = self.current.increment(&self.host);
             let msg = MessageEnvelope::new(self.host.clone(), msg_time, now_millis(), recent_refs, body);
-            let signature = signer.secret.signature_only(&msg.serialize())?;
+            let signature = signer.secret.signature_only(&msg.serialize(), peergos_core::SigningDomain::Chat)?;
             let signed = SignedMessage::new(signature, msg);
             let host = self.host().clone();
             self.merge_message(signed, host, user_identity, cas).await
@@ -425,7 +425,7 @@ impl Chat {
                 // NaCl attached signature = sig || message
                 let mut attached = signed.signature.clone();
                 attached.extend_from_slice(&signed.msg.serialize());
-                signer.unsign_message(&attached)?;
+                signer.unsign_message(&attached, peergos_core::SigningDomain::Chat)?;
                 let update = self.apply_message(signed, user_identity, cas).await?;
                 let new_state = update.state.merge_message_timestamp(&msg.timestamp, &host);
                 Ok(update.with_state(new_state))

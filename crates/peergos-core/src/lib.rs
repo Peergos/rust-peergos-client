@@ -30,7 +30,7 @@ pub use direct_s3::{hash_to_key, BlockStoreProperties, DirectS3Storage, Presigne
 pub use symmetric::{CipherText, SymmetricKey};
 pub use error::{Error, Result};
 pub use keys::{
-    OwnerProof, PublicKeyHash, PublicSigningKey, SecretSigningKey, SigningKeyPair,
+    OwnerProof, PublicKeyHash, PublicSigningKey, SecretSigningKey, SigningDomain, SigningKeyPair,
     SigningPrivateKeyAndPublicHash,
 };
 pub use mutable::{
@@ -40,7 +40,7 @@ pub use poster::{HttpPoster, ReqwestPoster};
 pub use cached::{CachedMutablePointers, CachedStorage};
 pub use ram::RamStorage;
 pub use storage::{
-    build_cid, champ_lookup_local, get_signing_key, hash_to_cid, put_block_signed, sign_block,
+    build_cid, champ_lookup_local, get_signing_key, hash_to_cid, put_block_signed, put_signing_key, sign_block,
     BlockWriteGroup, ChunkMirrorCap, ContentAddressedStorage, FallbackStorage, HttpStorage,
     TransactionId, MAX_CHAMP_GETS,
 };

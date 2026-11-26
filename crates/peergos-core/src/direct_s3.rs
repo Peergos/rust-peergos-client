@@ -452,7 +452,7 @@ impl ContentAddressedStorage for DirectS3Storage {
                 .map(|b| crate::storage::hash_to_cid(b, true))
                 .collect::<Result<Vec<_>>>()?;
             let auth = crate::bulk::BlockWriteAuth {
-                signature: signer.secret.sign_message(&crate::bulk::block_write_payload(owner, &hashes))?,
+                signature: signer.secret.sign_message(&crate::bulk::block_write_payload(owner, &hashes), crate::keys::SigningDomain::BlockWriteAuth)?,
                 hashes,
                 sizes: blocks.iter().map(|b| b.len() as i64).collect(),
                 bat_ids: blocks.iter().map(|b| raw_block_bats(b)).collect(),

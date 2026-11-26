@@ -215,3 +215,16 @@ fn blake3_grouped_merge_matches_whole_hash() {
         assert_eq!(hash::blake3_merge_as_root(&groups), hash::blake3(&data), "n {n_pieces}");
     }
 }
+
+#[test]
+fn mldsa44_matches_the_jdk() {
+    let seed = [7u8; 32];
+    let jdk_public = hex(include_str!("testdata/mldsa44_seed7_public.hex").trim());
+    assert_eq!(mldsa::public_key(&seed).unwrap(), jdk_public);
+    let jdk_sig = hex(include_str!("testdata/mldsa44_seed7_sig_peergos.hex").trim());
+    assert!(mldsa::verify(&jdk_sig, b"peergos", &jdk_public));
+    assert!(!mldsa::verify(&jdk_sig, b"peergoz", &jdk_public));
+    let ours = mldsa::sign(b"peergos", &seed).unwrap();
+    assert_eq!(ours.len(), mldsa::SIGNATURE_BYTES);
+    assert!(mldsa::verify(&ours, b"peergos", &jdk_public));
+}

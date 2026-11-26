@@ -546,6 +546,21 @@ impl SocialFeed {
         Ok(FileRef { path: path.to_string(), cap: file.capability().read_only(), content_hash: sha256_multihash(&bytes) })
     }
 
+    /// The contents of the file a [`FileRef`] refers to (`UserContext.getFile`). Its
+    /// cap names a writer, which stops resolving once the file's owner moves to
+    /// hybrid writers, but the file is still at its path.
+    pub async fn read_file_ref(&self, file: &FileRef) -> Result<Vec<u8>> {
+        if let Ok((_, bytes)) = crate::read_file(&file.cap, self.ctx.store(), self.ctx.mutable().as_ref()).await {
+            return Ok(bytes);
+        }
+        self.ctx
+            .get_by_path(&file.path)
+            .await?
+            .ok_or_else(|| Error::Protocol(format!("no file at {}", file.path)))?
+            .read()
+            .await
+    }
+
     /// Upload media for a post, storing it under `/username/.posts/<year>/media/`,
     /// and return a [`FileRef`] to it (`uploadMediaForPost`). Wrap it in a
     /// [`Content::Reference`] to attach it to a post body.

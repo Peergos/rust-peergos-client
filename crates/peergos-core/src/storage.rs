@@ -10,6 +10,7 @@ use crate::champ::{Champ, Payload, BIT_WIDTH};
 use crate::error::{Error, Result};
 use crate::keys::{PublicKeyHash, PublicSigningKey, SigningPrivateKeyAndPublicHash};
 use crate::poster::HttpPoster;
+use std::collections::HashMap;
 use async_trait::async_trait;
 use peergos_cbor::{CborObject, Cborable};
 use peergos_crypto::hash::sha256;
@@ -113,7 +114,7 @@ pub fn hash_to_cid(input: &[u8], is_raw: bool) -> Result<Cid> {
 /// Sign a single block for writing: the writer signs `sha256(block)`, yielding a
 /// NaCl attached signature (`sig || hash`), matching the default `put`.
 pub fn sign_block(writer: &SigningPrivateKeyAndPublicHash, block: &[u8]) -> Result<Vec<u8>> {
-    writer.secret.sign_message(&sha256(block))
+    writer.secret.sign_message(&sha256(block), crate::keys::SigningDomain::Block)
 }
 
 /// `application/x-www-form-urlencoded` component encoding, matching Java's
@@ -432,7 +433,7 @@ impl HttpStorage {
         let mut res = Vec::with_capacity(blocks.len());
         for group in group_by_size(blocks, MAX_BLOCK_SIZE) {
             let hashes = group.iter().map(|b| build_cid(sha256(b), is_raw)).collect::<Result<Vec<_>>>()?;
-            let signature = signer.secret.sign_message(&crate::bulk::block_write_payload(owner, &hashes))?;
+            let signature = signer.secret.sign_message(&crate::bulk::block_write_payload(owner, &hashes), crate::keys::SigningDomain::BlockWriteAuth)?;
             let body = crate::bulk::BlockWriteBatch { blocks: group, signature }.serialize();
             let url = format!(
                 "{API_PREFIX}block/put/bulk/v2?format={}&owner={}&transaction={}&writer={}",
@@ -825,10 +826,53 @@ pub async fn get_signing_key(
         let cbor = CborObject::from_bytes(hash.target.get_hash())?;
         return Ok(Some(PublicSigningKey::from_cbor(&cbor)?));
     }
-    match store.get(owner, &hash.target, None).await? {
-        Some(cbor) => Ok(Some(PublicSigningKey::from_cbor(&cbor)?)),
-        None => Ok(None),
+    if let Some(key) = signing_key_cache().lock().unwrap().get(hash) {
+        return Ok(Some(key.clone()));
     }
+    let key = match store.get(owner, &hash.target, None).await? {
+        Some(cbor) => PublicSigningKey::from_cbor(&cbor)?,
+        None => return Ok(None),
+    };
+    // legacy Ed25519 keys in blocks aren't necessarily canonical cbor, so only check other types
+    if !matches!(key, PublicSigningKey::Ed25519(_)) {
+        if &key.hash()? != hash {
+            return Err(Error::Protocol(format!("Signing key doesn't match its hash {hash}")));
+        }
+        let mut cache = signing_key_cache().lock().unwrap();
+        if cache.len() >= 10_000 {
+            cache.clear();
+        }
+        cache.insert(hash.clone(), key.clone());
+    }
+    Ok(Some(key))
+}
+
+/// Keys addressed by their hash never change, so they can be shared process wide.
+fn signing_key_cache() -> &'static std::sync::Mutex<HashMap<PublicKeyHash, PublicSigningKey>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<PublicKeyHash, PublicSigningKey>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// `ContentAddressedStorage.putSigningKey`: store a new signing key, authorised by
+/// an existing writer of the owner, and return its hash. Keys inlined in their
+/// hash need no block.
+pub async fn put_signing_key(
+    store: &dyn ContentAddressedStorage,
+    owner: &PublicKeyHash,
+    parent: &SigningPrivateKeyAndPublicHash,
+    key: &PublicSigningKey,
+    tid: &TransactionId,
+) -> Result<PublicKeyHash> {
+    let hash = key.hash()?;
+    if hash.is_identity() {
+        return Ok(hash);
+    }
+    let cid = put_block_signed(store, owner, parent, key.serialize(), tid).await?;
+    if cid != hash.target {
+        return Err(Error::Protocol(format!("Stored signing key under {cid} but its hash is {hash}")));
+    }
+    Ok(hash)
 }
 
 /// Parse the newline/concatenated JSON objects returned by `block/put/bulk`,

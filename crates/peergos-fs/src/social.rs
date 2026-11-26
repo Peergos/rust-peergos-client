@@ -309,7 +309,7 @@ async fn fetch_follow_requests(
         .ok_or_else(|| Error::Protocol("account has no boxing key (legacy?)".into()))?;
 
     // Authenticate with a signed timestamp.
-    let signed_time = user.signer.secret.sign_message(&CborObject::Long(now_millis()).to_bytes())?;
+    let signed_time = user.signer.secret.sign_message(&CborObject::Long(now_millis()).to_bytes(), peergos_core::SigningDomain::TimeLimited)?;
     let url = format!(
         "{SOCIAL_URL}getFollowRequests?owner={}&auth={}",
         url_encode(&user.identity.to_string()),
@@ -353,7 +353,7 @@ pub async fn remove_follow_request(
     raw_cipher: &[u8],
     poster: &dyn HttpPoster,
 ) -> Result<bool> {
-    let signed = user.signer.secret.sign_message(raw_cipher)?;
+    let signed = user.signer.secret.sign_message(raw_cipher, peergos_core::SigningDomain::FollowRequestRemoval)?;
     let url = format!("{SOCIAL_URL}removeFollowRequest?owner={}", url_encode(&user.identity.to_string()));
     let res = poster.post_unzip(&url, signed, 30_000).await?;
     Ok(res.first().is_some_and(|b| *b != 0))
@@ -920,7 +920,7 @@ pub async fn get_friends(
         .into_iter()
         .find(|e| e.name == FROM_FRIENDS_FILE);
     let bytes = match file {
-        Some(e) => crate::read_file(&e.cap, store, mutable).await?.1,
+        Some(e) => crate::read_file(&e.cap, store.clone(), mutable).await?.1,
         None => return Ok(Vec::new()),
     };
     let mut entries = Vec::new();
@@ -933,7 +933,26 @@ pub async fn get_friends(
         }
         offset += consumed;
     }
+    // a friend who moved to hybrid writers left a link where our sharing folder was
+    for e in entries.iter_mut() {
+        if let Some(target) = follow_link(&e.pointer, &store, mutable).await {
+            e.pointer = target;
+        }
+    }
     Ok(entries)
+}
+
+/// Where `cap` leads, if it is a link node.
+pub(crate) async fn follow_link(
+    cap: &AbsoluteCapability,
+    store: &Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Option<AbsoluteCapability> {
+    let (_, props) = crate::retrieve_file_metadata(cap, store.clone(), mutable).await.ok()?;
+    if !props.is_link {
+        return None;
+    }
+    Some(list_directory(cap, store.clone(), mutable).await.ok()?.into_iter().next()?.cap)
 }
 
 fn is_null_cap(cap: &AbsoluteCapability) -> bool {

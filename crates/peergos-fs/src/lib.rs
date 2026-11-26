@@ -84,11 +84,11 @@ use peergos_cbor::{CborObject, Cborable};
 use peergos_core::auth::{Bat, BatId};
 use peergos_core::error::{Error, Result};
 use peergos_core::keys::{
-    PublicKeyHash, PublicSigningKey, SecretSigningKey, SigningPrivateKeyAndPublicHash,
+    PublicKeyHash, SigningKeyPair, SigningPrivateKeyAndPublicHash,
 };
 use peergos_core::mutable::{MutablePointers, PointerUpdate};
 use peergos_core::storage::{
-    put_block_signed, put_raw_blocks_signed, ContentAddressedStorage, TransactionId,
+    put_block_signed, put_raw_blocks_signed, put_signing_key, ContentAddressedStorage, TransactionId,
 };
 use peergos_core::symmetric::SymmetricKey;
 use peergos_core::{
@@ -1740,12 +1740,7 @@ async fn create_writable_shared_dir(
     let parent_writer = parent_writer_signer(parent_cap, &entry_signer, store.clone(), mutable).await?;
     let parent_writer_hash = parent_writer.public_key_hash.clone();
 
-    // A fresh writer keypair with an inline (identity-multihash) key hash.
-    let (wpub, wsec64) = peergos_crypto::sign::keypair_from_seed(&random_bytes(32))
-        .map_err(|e| Error::Crypto(e.to_string()))?;
-    let writer_pub = PublicSigningKey::new(wpub.to_vec());
-    let writer_hash = writer_pub.hash()?;
-    let writer = SigningPrivateKeyAndPublicHash::new(writer_hash.clone(), SecretSigningKey::new(wsec64.to_vec()));
+    let writer_pair = SigningKeyPair::random_writer()?;
 
     // Directory keys/location.
     let dir_r = random_symmetric_key()?;
@@ -1765,6 +1760,8 @@ async fn create_writable_shared_dir(
     let dir_bat = Bat::new(random_bytes(32))?;
 
     let tid = store.start_transaction(owner).await?;
+    let writer_hash = put_signing_key(store.as_ref(), owner, &parent_writer, &writer_pair.public, &tid).await?;
+    let writer = SigningPrivateKeyAndPublicHash::new(writer_hash.clone(), writer_pair.secret);
 
     // --- 1. Register the new writer as owned by the PARENT WRITER first. The
     // server checks ownership on every block write and pointer set, so this must
@@ -1779,7 +1776,7 @@ async fn create_writable_shared_dir(
     let owned_root = Cid::cast(
         pw_wd.get("owned").and_then(|c| c.as_link()).ok_or_else(|| Error::Protocol("parent writer has no owned champ".into()))?,
     )?;
-    let signed_owner = writer.secret.sign_message(&parent_writer_hash.to_cbor().to_bytes())?;
+    let signed_owner = writer.secret.sign_message(&parent_writer_hash.to_cbor().to_bytes(), peergos_core::SigningDomain::OwnerProof)?;
     let owner_proof = CborObject::map()
         .put("o", writer_hash.to_cbor())
         .put("p", CborObject::ByteString(signed_owner))
@@ -2179,11 +2176,7 @@ async fn create_writable_shared_file(
     let parent_writer = parent_writer_signer(parent_cap, &entry_signer, store.clone(), mutable).await?;
     let parent_writer_hash = parent_writer.public_key_hash.clone();
 
-    // A fresh writer keypair (inline identity-multihash hash).
-    let (wpub, wsec64) =
-        peergos_crypto::sign::keypair_from_seed(&random_bytes(32)).map_err(|e| Error::Crypto(e.to_string()))?;
-    let writer_hash = PublicSigningKey::new(wpub.to_vec()).hash()?;
-    let writer = SigningPrivateKeyAndPublicHash::new(writer_hash.clone(), SecretSigningKey::new(wsec64.to_vec()));
+    let writer_pair = SigningKeyPair::random_writer()?;
 
     // Fresh file keys/location.
     let file_r = random_symmetric_key()?;
@@ -2204,6 +2197,8 @@ async fn create_writable_shared_file(
     let stream_secret = random_bytes(32);
 
     let tid = store.start_transaction(owner).await?;
+    let writer_hash = put_signing_key(store.as_ref(), owner, &parent_writer, &writer_pair.public, &tid).await?;
+    let writer = SigningPrivateKeyAndPublicHash::new(writer_hash.clone(), writer_pair.secret);
 
     // --- 1. Register the new writer as owned by the parent writer (must precede
     // any block signed by the new writer).
@@ -2213,7 +2208,7 @@ async fn create_writable_shared_file(
     let owned_root = Cid::cast(
         pw_wd.get("owned").and_then(|c| c.as_link()).ok_or_else(|| Error::Protocol("parent writer has no owned champ".into()))?,
     )?;
-    let signed_owner = writer.secret.sign_message(&parent_writer_hash.to_cbor().to_bytes())?;
+    let signed_owner = writer.secret.sign_message(&parent_writer_hash.to_cbor().to_bytes(), peergos_core::SigningDomain::OwnerProof)?;
     let owner_proof = CborObject::map()
         .put("o", writer_hash.to_cbor())
         .put("p", CborObject::ByteString(signed_owner))

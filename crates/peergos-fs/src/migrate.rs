@@ -111,7 +111,7 @@ pub fn build_migration_chain(
     serialize_string(&mut payload, &new_expiry);
     payload.extend_from_slice(&1u32.to_be_bytes());
     serialize_bytes(&mut payload, &new_storage_id.to_bytes());
-    let signed = signer.sign_message(&payload)?;
+    let signed = signer.sign_message(&payload, peergos_core::SigningDomain::UsernameClaim)?;
 
     let new_claim = CborObject::List(vec![
         CborObject::Str(username.to_string()),

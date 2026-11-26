@@ -175,7 +175,7 @@ async fn add_owned_writer(
     tid: &TransactionId,
 ) -> Result<()> {
     let (pointer, wd, mut owned) = open_champ(owner, &parent.public_key_hash, "owned", store, mutable).await?;
-    let signed = child.secret.sign_message(&parent.public_key_hash.to_cbor().to_bytes())?;
+    let signed = child.secret.sign_message(&parent.public_key_hash.to_cbor().to_bytes(), peergos_core::SigningDomain::OwnerProof)?;
     let proof = CborObject::map()
         .put("o", child.public_key_hash.to_cbor())
         .put("p", CborObject::ByteString(signed))
@@ -282,12 +282,10 @@ pub async fn move_to_new_writing_space(
     let mut subtree = Subtree::default();
     collect_subtree(&entry.cap, &old_champ, &mut subtree, &store, mutable).await?;
 
-    let (wpub, wsec) =
-        peergos_crypto::sign::keypair_from_seed(&random_bytes(32)).map_err(|e| Error::Crypto(e.to_string()))?;
-    let new_hash = PublicSigningKey::new(wpub.to_vec()).hash()?;
-    let new_signer = SigningPrivateKeyAndPublicHash::new(new_hash.clone(), SecretSigningKey::new(wsec.to_vec()));
-
+    let new_pair = SigningKeyPair::random_writer()?;
     let tid = store.start_transaction(&owner).await?;
+    let new_hash = put_signing_key(store.as_ref(), &owner, &old_signer, &new_pair.public, &tid).await?;
+    let new_signer = SigningPrivateKeyAndPublicHash::new(new_hash.clone(), new_pair.secret);
     // the server checks ownership on every write, so this goes before any block
     // signed by the new writer
     add_owned_writer(&owner, &old_signer, &new_signer, &store, mutable, &tid).await?;
@@ -558,8 +556,8 @@ mod tests {
         let home_signer = recover_signer(user.home().unwrap(), store.clone(), mutable.as_ref()).await.unwrap();
         let (wpub, wsec) = peergos_crypto::sign::keypair_from_seed(&[3u8; 32]).unwrap();
         let orphan = SigningPrivateKeyAndPublicHash::new(
-            PublicSigningKey::new(wpub.to_vec()).hash().unwrap(),
-            SecretSigningKey::new(wsec.to_vec()),
+            peergos_core::PublicSigningKey::new(wpub.to_vec()).hash().unwrap(),
+            peergos_core::SecretSigningKey::new(wsec.to_vec()),
         );
         let tid = store.start_transaction(&user.identity).await.unwrap();
         add_owned_writer(&user.identity, &home_signer, &orphan, &store, mutable.as_ref(), &tid).await.unwrap();
@@ -567,4 +565,241 @@ mod tests {
         assert_eq!(ctx.remove_orphaned_writers().await.unwrap(), 1);
         assert_eq!(ctx.remove_orphaned_writers().await.unwrap(), 0);
     }
+}
+
+/// A writing space nested in another, the directory or link node in the other
+/// holding its cap, and that other space's signer.
+pub(crate) struct NestedSpace {
+    pub cap: AbsoluteCapability,
+    pub holder: AbsoluteCapability,
+    pub holder_signer: SigningPrivateKeyAndPublicHash,
+}
+
+/// The writing spaces nested in `dir`'s subtree, each with the directory or link
+/// node holding its cap (`FileWrapper.findNestedWritingSpaces`). Files' chunks are
+/// not read.
+pub(crate) fn find_nested_writing_spaces<'a>(
+    dir: &'a AbsoluteCapability,
+    out: &'a mut Vec<(AbsoluteCapability, AbsoluteCapability)>,
+    store: &'a Arc<dyn ContentAddressedStorage>,
+    mutable: &'a dyn MutablePointers,
+) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+    Box::pin(async move {
+        for child in list_directory(dir, store.clone(), mutable).await? {
+            if child.cap.writer != dir.writer {
+                out.push((child.cap, dir.clone()));
+            } else if child.is_dir != Some(false) {
+                match find_nested_writing_spaces(&child.cap, out, store, mutable).await {
+                    Err(Error::Protocol(m)) if m.contains("points to a file") => {}
+                    r => r?,
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Move the writing space rooted at `space` to a new writer owned by `parent`, in
+/// one commit (`UserContext.switchSpace`): the new writer takes the old one's champ
+/// as it is, as nodes in one writing space name their children without a writer;
+/// the root is rewritten with its new signer link; the holder, if any, points at
+/// it; and the old writer's champ is replaced by link nodes, under the old keys, to
+/// where its root and each of `also_linked` now are, so old caps still lead there.
+/// The old writer's update is from the version the new one was built from, so a
+/// concurrent write fails the commit, and the move is tried again. A space that
+/// has moved already is left alone. Returns the new cap of the space.
+pub(crate) async fn switch_writer(
+    space: &AbsoluteCapability,
+    parent: &SigningPrivateKeyAndPublicHash,
+    from: Option<&NestedSpace>,
+    also_linked: &[AbsoluteCapability],
+    mirror_bat: Option<&BatId>,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: Arc<dyn MutablePointers>,
+) -> Result<AbsoluteCapability> {
+    let mut attempts = 5;
+    loop {
+        let net = BufferedNetwork::with_defaults(store.clone(), mutable.clone());
+        net.disable_commits();
+        let bstore: Arc<dyn ContentAddressedStorage> = net.storage();
+        let bmut = net.pointers();
+        let res = async {
+            let new_cap = switch_writer_once(space, parent, from, also_linked, mirror_bat, &bstore, bmut.as_ref()).await?;
+            net.commit(&space.owner).await?;
+            Ok(new_cap)
+        }
+        .await;
+        match res {
+            Err(e) if attempts > 1 => {
+                attempts -= 1;
+                log::info!("Retrying the move of {} to a new writer: {e}", space.writer);
+            }
+            r => return r,
+        }
+    }
+}
+
+async fn switch_writer_once(
+    space: &AbsoluteCapability,
+    parent: &SigningPrivateKeyAndPublicHash,
+    from: Option<&NestedSpace>,
+    also_linked: &[AbsoluteCapability],
+    mirror_bat: Option<&BatId>,
+    store: &Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<AbsoluteCapability> {
+    let owner = &space.owner;
+    let w_base_key = space.w_base_key.clone().ok_or_else(|| Error::Protocol("writing space is not writable".into()))?;
+    let (old_pointer, old_wd, old_tree) = open_champ(owner, &space.writer, "tree", store, mutable).await?;
+    let root = fetch_chunk_node(&old_tree, space, &space.map_key, &space.bat, store.as_ref())
+        .await?
+        .ok_or_else(|| Error::Protocol("Writing space root is missing".into()))?;
+    if root.get_properties(&space.r_base_key)?.is_link {
+        return list_directory(space, store.clone(), mutable)
+            .await?
+            .into_iter()
+            .next()
+            .map(|e| e.cap)
+            .ok_or_else(|| Error::Protocol("link node has no target".into()));
+    }
+    let old_signer = root.get_signer(&space.r_base_key, &w_base_key)?;
+
+    let new_pair = SigningKeyPair::random_writer()?;
+    let tid = store.start_transaction(owner).await?;
+    let new_hash = put_signing_key(store.as_ref(), owner, parent, &new_pair.public, &tid).await?;
+    let new_signer = SigningPrivateKeyAndPublicHash::new(new_hash.clone(), new_pair.secret);
+    add_owned_writer(owner, parent, &new_signer, store, mutable, &tid).await?;
+
+    let mut new_root = with_writer_link(&root, &space.r_base_key, &w_base_key, &new_signer)?;
+    if let Some(n) = from {
+        let link = root
+            .parent_link(&space.r_base_key)?
+            .ok_or_else(|| Error::Protocol("Nested writing space with no parent link!".into()))?;
+        let link = RelCap { writer: Some(n.holder_signer.public_key_hash.clone()), ..link };
+        new_root = with_parent_link(&new_root, &space.r_base_key, &link)?;
+    }
+    let root_cid = put_block_signed(store.as_ref(), owner, &new_signer, new_root.to_cbor().to_bytes(), &tid).await?;
+    let mut tree = ChampWrapper::create(owner.clone(), old_tree.root_hash().clone(), None, store.clone(), identity_key_hasher()).await?;
+    let current = tree.get(&space.map_key).await?;
+    tree.put(&new_signer, &space.map_key, &current, Some(CborObject::MerkleLink(root_cid.to_bytes())), &tid).await?;
+    let owned_root = put_block_signed(store.as_ref(), owner, &new_signer, Champ::empty().serialize(), &tid).await?;
+    let wd = CborObject::map()
+        .put("controller", new_hash.to_cbor())
+        .put("owned", CborObject::MerkleLink(owned_root.to_bytes()))
+        .put("tree", CborObject::MerkleLink(tree.root_hash().to_bytes()))
+        .build();
+    let wd_cid = put_block_signed(store.as_ref(), owner, &new_signer, wd.to_bytes(), &tid).await?;
+    if !mutable
+        .set_pointer_update(owner, &new_signer, &PointerUpdate::new(None, Some(wd_cid), PointerUpdate::increment(None)))
+        .await?
+    {
+        return Err(Error::Protocol("new writer's pointer rejected".into()));
+    }
+    let new_cap = AbsoluteCapability { writer: new_hash.clone(), ..space.clone() };
+
+    if let Some(n) = from {
+        point_holder_at(n, &new_cap, mirror_bat, store, mutable).await?;
+    }
+
+    // the old writer last, from the version the new one took
+    let empty = put_block_signed(store.as_ref(), owner, &old_signer, Champ::empty().serialize(), &tid).await?;
+    let mut links = ChampWrapper::create(owner.clone(), empty, None, store.clone(), identity_key_hasher()).await?;
+    let root_parent_writer = from.map(|n| n.holder_signer.public_key_hash.clone());
+    let in_place = also_linked
+        .iter()
+        .map(|c| (c.clone(), AbsoluteCapability { writer: new_hash.clone(), ..c.clone() }, Some(new_hash.clone())))
+        .chain(std::iter::once((space.clone(), new_cap.clone(), root_parent_writer)));
+    for (old, target, parent_writer) in in_place {
+        let node = fetch_chunk_node(&old_tree, &old, &old.map_key, &old.bat, store.as_ref())
+            .await?
+            .ok_or_else(|| Error::Protocol("directory to link is missing".into()))?;
+        let (link, fragments) = link_in_place_of(&node, &old, &target, parent_writer, mirror_bat)?;
+        put_raw_blocks_signed(store.as_ref(), owner, &old_signer, fragments, &tid).await?;
+        let cid = put_block_signed(store.as_ref(), owner, &old_signer, link.to_cbor().to_bytes(), &tid).await?;
+        links.put(&old_signer, &old.map_key, &None, Some(CborObject::MerkleLink(cid.to_bytes())), &tid).await?;
+    }
+    commit_champ(owner, &old_signer, "tree", &old_pointer, &old_wd, &links, store, mutable, &tid).await?;
+    store.close_transaction(owner, &tid).await?;
+    Ok(new_cap)
+}
+
+/// A link node in place of `old`, at its location and with its keys and name, to
+/// `target`. It holds the write key, so old write caps still write there.
+fn link_in_place_of(
+    old: &CryptreeNode,
+    old_cap: &AbsoluteCapability,
+    target: &AbsoluteCapability,
+    parent_writer: Option<PublicKeyHash>,
+    mirror_bat: Option<&BatId>,
+) -> Result<(CryptreeNode, Vec<Vec<u8>>)> {
+    let mut props = old.get_properties(&old_cap.r_base_key)?;
+    props.is_link = true;
+    // a link is a directory, which needs a parent key of its own, unlike a file
+    let parent_key = random_symmetric_key()?;
+    let to_parent = old.parent_link(&old_cap.r_base_key)?.map(|p| match &parent_writer {
+        Some(w) => RelCap { writer: Some(w.clone()), ..p },
+        None => p,
+    });
+    let old_w = old_cap.w_base_key.as_ref().ok_or_else(|| Error::Protocol("old cap is not writable".into()))?;
+    let target_w = target.w_base_key.as_ref().ok_or_else(|| Error::Protocol("target is not writable".into()))?;
+    let to_target = NamedRelativeCapability {
+        name: props.name.clone(),
+        cap: RelCap {
+            writer: Some(target.writer.clone()),
+            map_key: target.map_key.clone(),
+            bat: target.bat.clone(),
+            r_base_key: target.r_base_key.clone(),
+            w_base_key_link: Some(peergos_core::symmetric::CipherText::build(old_w, target_w)?.to_cbor()),
+        },
+        is_dir: Some(props.is_directory),
+        mime_type: Some(props.mime_type.clone()),
+        created_epoch: Some(props.created_epoch),
+    };
+    let next_chunk = RelCap::subsequent_chunk(random_bytes(32), Some(Bat::new(random_bytes(32))?), old_cap.r_base_key.clone());
+    let from_base = CborObject::map().put("k", parent_key.to_cbor()).put("n", next_chunk.to_cbor()).build();
+    let from_parent = CborObject::map()
+        .put_opt("p", to_parent.map(|p| p.to_cbor()))
+        .put("s", props.to_cbor())
+        .build();
+    let (children_data, fragments) = retrieve::FragmentedPaddedCipherText::build(
+        &old_cap.r_base_key,
+        &ChildrenLinks::Named(vec![to_target]).to_cbor(),
+        MIN_FRAGMENT_SIZE,
+        mirror_bat,
+    )?;
+    let node = CryptreeNode::new(
+        true,
+        node_bats_opt(old_cap.bat.as_ref(), mirror_bat)?,
+        PaddedCipherText::build(&old_cap.r_base_key, &from_base, BASE_BLOCK_PADDING_BLOCKSIZE)?,
+        PaddedCipherText::build(&parent_key, &from_parent, META_DATA_PADDING_BLOCKSIZE)?,
+        children_data.to_cbor(),
+    );
+    Ok((node, fragments))
+}
+
+/// Point the holder of a nested space, in its own space's writer, at the nested
+/// space's new cap.
+async fn point_holder_at(
+    from: &NestedSpace,
+    new_cap: &AbsoluteCapability,
+    mirror_bat: Option<&BatId>,
+    store: &Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    if !from.holder.is_writable() {
+        return Err(Error::Protocol("Nested writing space held by a read only cap".into()));
+    }
+    let holder = AbsoluteCapability { writer: from.holder_signer.public_key_hash.clone(), ..from.holder.clone() };
+    let mut ctx = begin_dir_write(&holder, Some(from.holder_signer.clone()), mirror_bat, store, mutable).await?;
+    let mut chunks = collect_dir_chunks(&holder, &ctx, store).await?;
+    let found = chunks.iter_mut().enumerate().find_map(|(i, (.., children))| {
+        children.iter_mut().find(|c| c.cap.map_key == from.cap.map_key).map(|c| {
+            c.cap.writer = Some(new_cap.writer.clone());
+            i
+        })
+    });
+    let i = found.ok_or_else(|| Error::Protocol("Moved holder of a nested writing space is missing its child".into()))?;
+    let (map_key, node, champ_value, children) = &chunks[i];
+    recommit_dir_chunk(&mut ctx, &holder, store, map_key, node, champ_value, children.clone()).await?;
+    commit_dir_write(&ctx, &holder, store, mutable).await
 }

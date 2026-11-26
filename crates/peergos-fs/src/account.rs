@@ -27,7 +27,7 @@ fn now_millis() -> i64 {
 fn signed_auth(user: &LoggedInUser, endpoint: &str) -> Result<String> {
     let path = format!("{LOGIN_URL}{endpoint}");
     let req = CborObject::map().put("p", CborObject::Str(path)).put("t", CborObject::Long(now_millis())).build();
-    Ok(to_hex(&user.signer.secret.sign_message(&req.to_bytes())?))
+    Ok(to_hex(&user.signer.secret.sign_message(&req.to_bytes(), peergos_core::SigningDomain::TimeLimited)?))
 }
 
 fn parse_bool(res: &[u8]) -> Result<bool> {

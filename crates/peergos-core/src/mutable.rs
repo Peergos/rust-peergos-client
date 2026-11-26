@@ -175,7 +175,7 @@ pub trait MutablePointers: Send + Sync {
         writer: &SigningPrivateKeyAndPublicHash,
         cas_update: &PointerUpdate,
     ) -> Result<bool> {
-        let signed = writer.secret.sign_message(&cas_update.serialize())?;
+        let signed = writer.secret.sign_message(&cas_update.serialize(), crate::keys::SigningDomain::Pointer)?;
         self.set_pointer(owner, &writer.public_key_hash, signed).await
     }
 
@@ -203,7 +203,7 @@ pub async fn parse_pointer_target(
 ) -> Result<PointerUpdate> {
     match get_signing_key(ipfs, owner, writer_key_hash).await? {
         Some(writer_key) => {
-            let signed = writer_key.unsign_message(pointer_cas)?;
+            let signed = writer_key.unsign_message(pointer_cas, crate::keys::SigningDomain::Pointer)?;
             PointerUpdate::from_cbor(&CborObject::from_bytes(&signed)?)
         }
         None => Ok(PointerUpdate::empty()),

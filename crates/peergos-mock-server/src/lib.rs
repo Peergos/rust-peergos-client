@@ -10,14 +10,14 @@
 use async_trait::async_trait;
 use peergos_cbor::{Cborable, CborObject};
 use peergos_core::error::{Error, Result};
-use peergos_core::keys::PublicKeyHash;
+use peergos_core::keys::{PublicKeyHash, PublicSigningKey, SigningDomain, HYBRID_SIGNATURE_BYTES};
 use peergos_core::mutable::{PointerUpdate, SignedPointerUpdate, MUTABLE_POINTERS_URL};
 use peergos_core::poster::HttpPoster;
 use peergos_core::storage::{
     champ_lookup_local, BlockWriteGroup, ChunkMirrorCap, ContentAddressedStorage, TransactionId,
     API_PREFIX,
 };
-use peergos_core::{build_cid, hash_to_cid, identity_key_hasher, Champ, ChampWrapper, Payload, RamStorage};
+use peergos_core::{build_cid, get_signing_key, hash_to_cid, identity_key_hasher, Champ, ChampWrapper, Payload, RamStorage};
 use peergos_multiformats::Cid;
 use peergos_core::bulk::{
     block_write_payload, BlockWriteBatch, BulkCommit, WriterCommit, MAX_BULK_COMMIT_BLOCKS, MAX_BULK_COMMIT_SIZE,
@@ -237,9 +237,9 @@ impl MockServer {
         let mut stack: Vec<Cid> = Vec::new();
         {
             let map = self.pointers.lock().unwrap();
-            for ((o, _w), payload) in map.iter() {
+            for ((o, w), payload) in map.iter() {
                 if *o == owner_key {
-                    if let Ok(upd) = parse_pointer_update(payload) {
+                    if let Ok(upd) = writer_of(w).and_then(|w| parse_pointer_update(&w, payload)) {
                         if let Some(cid) = upd.updated {
                             stack.push(cid);
                         }
@@ -391,6 +391,9 @@ impl MockServer {
                 if !self.is_authorized(&owner, &writer).await? {
                     return Ok(vec![0]);
                 }
+                if !self.verifies_pointer(&owner, &writer, &body, &HashMap::new()).await? {
+                    return Err(Error::Http("status 500: Invalid pointer signature".into()));
+                }
                 Ok(vec![self.apply_cas(&owner, &writer, body)? as u8])
             }
             "setPointers" => {
@@ -402,6 +405,9 @@ impl MockServer {
                 };
                 let mut ok = true;
                 for u in updates {
+                    if !self.verifies_pointer(&owner, &u.writer, &u.signed, &HashMap::new()).await? {
+                        return Err(Error::Http("status 500: Invalid pointer signature".into()));
+                    }
                     ok &= self.is_authorized(&owner, &u.writer).await? && self.apply_cas(&owner, &u.writer, u.signed)?;
                 }
                 Ok(vec![ok as u8])
@@ -447,7 +453,7 @@ impl MockServer {
         let wd_cid = {
             let map = self.pointers.lock().unwrap();
             map.get(&(pkh_key(owner), pkh_key(writer)))
-                .and_then(|p| parse_pointer_update(p).ok())
+                .and_then(|p| parse_pointer_update(writer, p).ok())
                 .and_then(|u| u.updated)
         };
         let wd = match wd_cid {
@@ -494,15 +500,47 @@ impl MockServer {
         Ok(out)
     }
 
+    /// Whether `signed` is `writer`'s signature in `domain` over `expected`. A new
+    /// writer's key block may be in the same call.
+    async fn verifies(
+        &self,
+        owner: &PublicKeyHash,
+        writer: &PublicKeyHash,
+        signed: &[u8],
+        expected: &[u8],
+        domain: SigningDomain,
+        in_call: &HashMap<Cid, Vec<u8>>,
+    ) -> Result<bool> {
+        let key = match in_call.get(&writer.target) {
+            Some(raw) => Some(PublicSigningKey::from_cbor(&CborObject::from_bytes(raw)?)?),
+            None => get_signing_key(self.blocks.as_ref(), owner, writer).await?,
+        };
+        Ok(match key {
+            Some(k) => k.unsign_message(signed, domain).map(|m| m == expected).unwrap_or(false),
+            None => false,
+        })
+    }
+
+    async fn verifies_pointer(
+        &self,
+        owner: &PublicKeyHash,
+        writer: &PublicKeyHash,
+        signed: &[u8],
+        in_call: &HashMap<Cid, Vec<u8>>,
+    ) -> Result<bool> {
+        let message = signed_payload(writer, signed)?.to_vec();
+        self.verifies(owner, writer, signed, &message, SigningDomain::Pointer, in_call).await
+    }
+
     /// Apply a signed CAS pointer update: accept iff its `original` matches the
     /// writer's current target, then store the new signed payload. Returns whether
     /// it was accepted (a rejected CAS drives the client's 3-way merge path).
     fn apply_cas(&self, owner: &PublicKeyHash, writer: &PublicKeyHash, signed: Vec<u8>) -> Result<bool> {
-        let new = parse_pointer_update(&signed)?;
+        let new = parse_pointer_update(writer, &signed)?;
         let key = (pkh_key(owner), pkh_key(writer));
         let mut map = self.pointers.lock().unwrap();
         let current_target = match map.get(&key) {
-            Some(p) => parse_pointer_update(p)?.updated,
+            Some(p) => parse_pointer_update(writer, p)?.updated,
             None => None,
         };
         if new.original != current_target {
@@ -531,7 +569,7 @@ impl MockServer {
                 let wd_cid = {
                     let map = self.pointers.lock().unwrap();
                     map.get(&(pkh_key(&owner), pkh_key(&owner)))
-                        .and_then(|p| parse_pointer_update(p).ok())
+                        .and_then(|p| parse_pointer_update(&owner, p).ok())
                         .and_then(|u| u.updated)
                 }
                 .ok_or_else(|| Error::Http("status 404: no writer data".into()))?;
@@ -561,6 +599,15 @@ impl MockServer {
                 let writer = q.pkh("writer")?;
                 let is_raw = q.get("format") == Some("raw");
                 let group = BlockWriteGroup::from_cbor(&CborObject::from_bytes(&body)?)?;
+                if group.signatures.len() != group.blocks.len() {
+                    return Err(Error::Http("status 500: a signature is needed for each block".into()));
+                }
+                for (b, sig) in group.blocks.iter().zip(&group.signatures) {
+                    let hash = peergos_crypto::hash::sha256(b);
+                    if !self.verifies(&owner, &writer, sig, &hash, SigningDomain::Block, &HashMap::new()).await? {
+                        return Err(Error::Http("status 500: Invalid signature for block write".into()));
+                    }
+                }
                 let tid = TransactionId("1".into());
                 let cids = if is_raw {
                     self.blocks.put_raw(&owner, &writer, group.signatures, group.blocks, &tid).await?
@@ -619,7 +666,7 @@ impl MockServer {
                 let is_raw = q.get("format") == Some("raw");
                 let batch = BlockWriteBatch::from_cbor(&CborObject::from_bytes(&body)?)?;
                 let hashes = batch.blocks.iter().map(|b| hash_to_cid(b, is_raw)).collect::<Result<Vec<_>>>()?;
-                if signed_payload(&batch.signature)? != block_write_payload(&owner, &hashes).as_slice() {
+                if !self.verifies(&owner, &writer, &batch.signature, &block_write_payload(&owner, &hashes), SigningDomain::BlockWriteAuth, &HashMap::new()).await? {
                     return Err(Error::Http("status 500: Invalid signature for block write batch!".into()));
                 }
                 let tid = TransactionId("1".into());
@@ -648,6 +695,12 @@ impl MockServer {
         if commit.block_count() + commit.pre_written_count() > MAX_BULK_COMMIT_BLOCKS {
             return reject("Too many blocks in one commit".into());
         }
+        let call_blocks = commit
+            .writers
+            .iter()
+            .flat_map(|w| w.cbor_blocks.iter())
+            .map(|b| Ok((hash_to_cid(b, false)?, b.clone())))
+            .collect::<Result<HashMap<Cid, Vec<u8>>>>()?;
         let mut hashes = Vec::with_capacity(commit.writers.len());
         let mut updates = Vec::with_capacity(commit.writers.len());
         for w in &commit.writers {
@@ -658,7 +711,7 @@ impl MockServer {
                 .chain(w.raw_blocks.iter().map(|b| hash_to_cid(b, true)))
                 .collect::<Result<Vec<_>>>()?;
             match &w.pointer {
-                Some(p) => updates.push(Some(parse_pointer_update(&p.signed)?)),
+                Some(p) => updates.push(Some(parse_pointer_update(&w.writer, &p.signed)?)),
                 None => {
                     let sig = match &w.block_list_signature {
                         Some(s) => s,
@@ -669,7 +722,7 @@ impl MockServer {
                     }
                     let current = self.current_pointer(owner, &w.writer)?;
                     let expected = WriterCommit::block_list_payload(&cids, PointerUpdate::increment(current.sequence));
-                    if signed_payload(sig)? != expected.as_slice() {
+                    if !self.verifies(owner, &w.writer, sig, &expected, SigningDomain::BlockList, &call_blocks).await? {
                         return reject(format!("Invalid block list signature for {}", w.writer));
                     }
                     updates.push(None);
@@ -757,10 +810,14 @@ impl MockServer {
                 *self.pointers.lock().unwrap() = before;
                 return reject(format!("Key not allowed to write to this server: {}", w.writer));
             }
+            if !self.verifies_pointer(owner, &w.writer, &p.signed, &call_blocks).await? {
+                *self.pointers.lock().unwrap() = before;
+                return reject(format!("Invalid pointer signature for {}", w.writer));
+            }
             let current = self.current_pointer(owner, &w.writer)?;
             if !self.apply_cas(owner, &w.writer, p.signed.clone())? {
                 *self.pointers.lock().unwrap() = before;
-                let claimed = parse_pointer_update(&p.signed)?.original;
+                let claimed = parse_pointer_update(&w.writer, &p.signed)?.original;
                 let show = |c: &Option<Cid>| c.as_ref().map(|c| c.to_string()).unwrap_or_default();
                 return reject(format!(
                     "PointerCAS:{},{},{}",
@@ -775,7 +832,7 @@ impl MockServer {
 
     fn current_pointer(&self, owner: &PublicKeyHash, writer: &PublicKeyHash) -> Result<PointerUpdate> {
         match self.pointers.lock().unwrap().get(&(pkh_key(owner), pkh_key(writer))) {
-            Some(p) => parse_pointer_update(p),
+            Some(p) => parse_pointer_update(writer, p),
             None => Ok(PointerUpdate::empty()),
         }
     }
@@ -884,23 +941,33 @@ fn pkh_key(pkh: &PublicKeyHash) -> Vec<u8> {
     pkh.to_string().into_bytes()
 }
 
-/// Extract the `PointerUpdate` from a writer's signed CAS payload
-/// (`sign_message` = 64-byte signature || cbor). The mock trusts the signature
-/// for now (verification is a later milestone); it only needs the fields to CAS.
-fn parse_pointer_update(signed: &[u8]) -> Result<PointerUpdate> {
-    if signed.len() < 64 {
-        return Err(Error::Protocol("signed pointer payload too short".into()));
+/// How long `writer`'s signatures are: Ed25519 keys are inlined in their hash,
+/// composite ones are named by the sha256 of their block.
+fn sig_len(writer: &PublicKeyHash) -> usize {
+    if writer.is_identity() {
+        64
+    } else {
+        HYBRID_SIGNATURE_BYTES
     }
-    PointerUpdate::from_cbor(&CborObject::from_bytes(&signed[64..])?)
 }
 
-/// The message inside a `sign_message` output (64-byte signature || message). The
-/// mock checks what was signed, not the signature itself.
-fn signed_payload(signed: &[u8]) -> Result<&[u8]> {
-    if signed.len() < 64 {
+/// Extract the `PointerUpdate` from a writer's stored signed CAS payload, which
+/// was verified when it was set.
+fn parse_pointer_update(writer: &PublicKeyHash, signed: &[u8]) -> Result<PointerUpdate> {
+    PointerUpdate::from_cbor(&CborObject::from_bytes(signed_payload(writer, signed)?)?)
+}
+
+/// The message inside a `sign_message` output (signature || message).
+fn signed_payload<'a>(writer: &PublicKeyHash, signed: &'a [u8]) -> Result<&'a [u8]> {
+    let n = sig_len(writer);
+    if signed.len() < n {
         return Err(Error::Protocol("signature too short".into()));
     }
-    Ok(&signed[64..])
+    Ok(&signed[n..])
+}
+
+fn writer_of(key: &[u8]) -> Result<PublicKeyHash> {
+    PublicKeyHash::new(Cid::decode(&String::from_utf8_lossy(key))?)
 }
 
 fn link_list(cids: &[Cid]) -> Vec<u8> {
@@ -938,7 +1005,8 @@ mod tests {
     async fn put_get_roundtrip_through_httpstorage() {
         let server = MockServer::new();
         let store = HttpStorage::new(server.poster(), true);
-        let owner = PublicKeyHash::identity(vec![1u8; 4]).unwrap();
+        let signer = peergos_core::SigningKeyPair::random().unwrap().to_private_and_hash().unwrap();
+        let owner = signer.public_key_hash.clone();
 
         // id round-trips.
         assert!(store.id().await.is_ok());
@@ -947,7 +1015,7 @@ mod tests {
         let tid = store.start_transaction(&owner).await.unwrap();
         let block = b"hello mock world".to_vec();
         let cids = store
-            .put_raw(&owner, &owner, vec![vec![9u8; 64]], vec![block.clone()], &tid)
+            .put_raw(&owner, &owner, vec![peergos_core::sign_block(&signer, &block).unwrap()], vec![block.clone()], &tid)
             .await
             .unwrap();
         assert_eq!(cids.len(), 1);
@@ -975,7 +1043,7 @@ mod tests {
         assert!(mp.set_pointer_update(&owner, &writer, &u1).await.unwrap(), "first write accepted");
 
         let raw = mp.get_pointer(&owner, &writer.public_key_hash).await.unwrap().expect("pointer present");
-        assert_eq!(parse_pointer_update(&raw).unwrap().updated, Some(t1.clone()));
+        assert_eq!(parse_pointer_update(&writer.public_key_hash, &raw).unwrap().updated, Some(t1.clone()));
 
         // A stale CAS (original still None, not the current target) is rejected.
         let t2 = MockServer::cid_of(b"wd2", false).unwrap();
@@ -986,6 +1054,6 @@ mod tests {
         let valid = PointerUpdate::new(Some(t1), Some(t2.clone()), Some(2));
         assert!(mp.set_pointer_update(&owner, &writer, &valid).await.unwrap(), "valid CAS accepted");
         let raw2 = mp.get_pointer(&owner, &writer.public_key_hash).await.unwrap().unwrap();
-        assert_eq!(parse_pointer_update(&raw2).unwrap().updated, Some(t2));
+        assert_eq!(parse_pointer_update(&writer.public_key_hash, &raw2).unwrap().updated, Some(t2));
     }
 }

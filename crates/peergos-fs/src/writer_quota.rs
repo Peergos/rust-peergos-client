@@ -29,7 +29,7 @@ fn signed_request(secret: &SecretSigningKey, path: &str) -> Result<String> {
         .put("p", CborObject::Str(path.to_string()))
         .put("t", CborObject::Long(now_millis()))
         .build();
-    Ok(to_hex(&secret.sign_message(&req.to_bytes())?))
+    Ok(to_hex(&secret.sign_message(&req.to_bytes(), peergos_core::SigningDomain::TimeLimited)?))
 }
 
 /// A request, signed by an owner's identity key, to cap the space used by a
@@ -97,7 +97,7 @@ pub async fn set_writer_quota(
     poster: &dyn HttpPoster,
 ) -> Result<bool> {
     let req = WriterQuotaRequest::new(identity.public_key_hash.clone(), writer.clone(), bytes)?;
-    let signed = identity.secret.sign_message(&req.serialize())?;
+    let signed = identity.secret.sign_message(&req.serialize(), peergos_core::SigningDomain::WriterQuota)?;
     let url = format!(
         "{SPACE_USAGE_URL}set-writer-quota?owner={}&req={}",
         url_encode(&identity.public_key_hash.to_string()),

@@ -702,7 +702,7 @@ async fn bulk_commit_owner(blocks: &BufferedStorage, pointers: &BufferedPointers
                 Some(t) => pre_write(&target, owner, &w.signer, large, t).await?,
                 None => Vec::new(),
             };
-            let signed = w.signer.secret.sign_message(&w.update.serialize())?;
+            let signed = w.signer.secret.sign_message(&w.update.serialize(), crate::keys::SigningDomain::Pointer)?;
             writers.push(bulk::WriterCommit {
                 writer: w.writer.clone(),
                 cbor_blocks: cbor,
@@ -888,7 +888,7 @@ fn split(
             count += group.len();
             let (cbor, raw): (Vec<InlineBlock>, Vec<InlineBlock>) = group.into_iter().partition(|b| !b.is_raw);
             let in_order: Vec<Cid> = cbor.iter().chain(raw.iter()).map(|b| b.cid.clone()).collect();
-            let sig = signer.secret.sign_message(&bulk::WriterCommit::block_list_payload(&in_order, seq))?;
+            let sig = signer.secret.sign_message(&bulk::WriterCommit::block_list_payload(&in_order, seq), crate::keys::SigningDomain::BlockList)?;
             calls.last_mut().unwrap().push(bulk::WriterCommit {
                 writer: writer.clone(),
                 cbor_blocks: cbor.into_iter().map(|b| b.data).collect(),

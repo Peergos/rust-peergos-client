@@ -81,6 +81,9 @@ pub struct LoggedInUser {
     /// The account mirror BAT — every block we write is tagged with its id so the
     /// server can mirror the data. `None` if the account has none.
     pub mirror_bat: Option<peergos_core::auth::BatWithId>,
+    /// Our home entry point as stored, when it is a link to where our home has
+    /// moved: `entries` names the home itself.
+    pub stored_home: Option<AbsoluteCapability>,
 }
 
 impl LoggedInUser {
@@ -104,6 +107,7 @@ impl LoggedInUser {
             .put_opt("b", self.boxer.as_ref().map(|b| b.to_cbor()))
             .put("e", CborObject::List(self.entries.iter().map(|e| e.to_cbor()).collect()))
             .put_opt("m", self.mirror_bat.as_ref().map(|b| b.to_cbor()))
+            .put_opt("h", self.stored_home.as_ref().map(|c| c.to_cbor()))
             .build()
     }
 
@@ -122,6 +126,7 @@ impl LoggedInUser {
                 .map(EntryPoint::from_cbor)
                 .collect::<Result<Vec<_>>>()?,
             mirror_bat: cbor.get("m").map(peergos_core::auth::BatWithId::from_cbor).transpose()?,
+            stored_home: cbor.get("h").map(AbsoluteCapability::from_cbor).transpose()?,
         })
     }
 
@@ -264,7 +269,7 @@ fn sign_now(login_secret: &SecretSigningKey) -> Result<Vec<u8>> {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     let time = CborObject::Long(now_millis).to_bytes();
-    login_secret.sign_message(&time)
+    login_secret.sign_message(&time, peergos_core::SigningDomain::TimeLimited)
 }
 
 /// A callback that answers a second-factor challenge during login (e.g. reads a
@@ -399,7 +404,7 @@ pub async fn fetch_mirror_bat(
         .put("p", CborObject::Str(path.to_string()))
         .put("t", CborObject::Long(now))
         .build();
-    let auth = to_hex(&identity.secret.sign_message(&req.to_bytes())?);
+    let auth = to_hex(&identity.secret.sign_message(&req.to_bytes(), peergos_core::SigningDomain::TimeLimited)?);
     let url = format!(
         "{path}?username={}&auth={auth}",
         peergos_core::storage::url_encode(username)
@@ -459,7 +464,7 @@ pub async fn change_password(
         .put("e", new_static)
         .put("r", new_creds.login_pub.to_cbor())
         .build();
-    let auth = to_hex(&signer.secret.signature_only(&login_data.to_bytes())?);
+    let auth = to_hex(&signer.secret.signature_only(&login_data.to_bytes(), peergos_core::SigningDomain::Login)?);
     let url = format!("{LOGIN_URL}setLogin?username={username}&auth={auth}&local=false");
     let res = poster.post_unzip(&url, login_data.to_bytes(), 0).await?;
     if res.first().copied() != Some(1) {
@@ -503,7 +508,7 @@ pub async fn mirror_login_data(
         .put("e", new_static)
         .put("r", creds.login_pub.to_cbor())
         .build();
-    let auth = to_hex(&signer.secret.signature_only(&login_data.to_bytes())?);
+    let auth = to_hex(&signer.secret.signature_only(&login_data.to_bytes(), peergos_core::SigningDomain::Login)?);
     let url = format!("{LOGIN_URL}setLogin?username={username}&auth={auth}&local=true");
     let res = poster.post_unzip(&url, login_data.to_bytes(), 0).await?;
     Ok(res.first().copied() == Some(1))
@@ -582,7 +587,8 @@ pub async fn login(
         Some(sd) => (decrypt_entry_points(sd, &creds.root)?, true),
         None => (get_login_data(poster, username, &creds, mfa).await?, false),
     };
-    let (entries, identity, boxer) = parse_entry_points(&entry_points_cbor)?;
+    let (mut entries, identity, boxer) = parse_entry_points(&entry_points_cbor)?;
+    let stored_home = follow_moved_home(username, &mut entries, &store, mutable).await;
 
     // The identity signer: derived login key for legacy accounts, otherwise the
     // identity key stored (encrypted) in the entry points.
@@ -606,5 +612,103 @@ pub async fn login(
         boxer,
         entries,
         mirror_bat,
+        stored_home,
     })
+}
+
+/// Point our home entry at where our home is, if its root has been replaced by a
+/// link to a new writer, returning the entry as stored.
+async fn follow_moved_home(
+    username: &str,
+    entries: &mut [EntryPoint],
+    store: &Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Option<AbsoluteCapability> {
+    let home = entries.iter_mut().find(|e| e.owner_name == username)?;
+    let (_, props) = crate::retrieve_file_metadata(&home.pointer, store.clone(), mutable).await.ok()?;
+    if !props.is_link {
+        return None;
+    }
+    let target = crate::list_directory(&home.pointer, store.clone(), mutable).await.ok()?.into_iter().next()?.cap;
+    Some(std::mem::replace(&mut home.pointer, target))
+}
+
+/// The entry points cbor with our home entry at `old` replaced by one to `new`.
+fn replace_home_entry(entry_points: &CborObject, username: &str, old: &AbsoluteCapability, new: &AbsoluteCapability) -> Result<CborObject> {
+    let CborObject::Map(m) = entry_points else {
+        return Err(Error::Cbor("EntryPoints is not a map".into()));
+    };
+    let mut found = false;
+    let entries = entry_points
+        .get("e")
+        .and_then(|c| c.as_list())
+        .ok_or_else(|| Error::Cbor("EntryPoints missing 'e'".into()))?
+        .iter()
+        .map(|c| {
+            let e = EntryPoint::from_cbor(c)?;
+            if e.owner_name == username && e.pointer.writer == old.writer && e.pointer.map_key == old.map_key {
+                found = true;
+                return Ok(EntryPoint { pointer: new.clone(), owner_name: e.owner_name }.to_cbor());
+            }
+            Ok(c.clone())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !found {
+        return Err(Error::Protocol("No such entry point to replace".into()));
+    }
+    let mut m = m.clone();
+    m.insert(peergos_cbor::CborString::new("e"), CborObject::List(entries));
+    Ok(CborObject::Map(m))
+}
+
+/// Point our home entry point, stored at `old`, at `new`
+/// (`UserContext.replaceHomeEntryPoint`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn replace_home_entry_point(
+    username: &str,
+    password: &str,
+    mfa: Option<&MfaResponder<'_>>,
+    signer: &SigningPrivateKeyAndPublicHash,
+    old: &AbsoluteCapability,
+    new: &AbsoluteCapability,
+    poster: &dyn HttpPoster,
+    store: Arc<dyn ContentAddressedStorage>,
+    mutable: &dyn MutablePointers,
+) -> Result<()> {
+    let owner = &signer.public_key_hash;
+    let pointer = mutable.get_pointer_target(owner, owner, store.as_ref()).await?;
+    let wd_cid = pointer.updated.clone().ok_or_else(|| Error::Protocol("User has been deleted".into()))?;
+    let wd = store.get(owner, &wd_cid, None).await?.ok_or_else(|| Error::Protocol("writer data block missing".into()))?;
+    let algo = ScryptParams::from_writer_data(&wd)?;
+    let creds = generate_user(username, password, &algo)?;
+    if let Some(sd) = wd.get("static") {
+        // legacy account
+        let updated = replace_home_entry(&decrypt_entry_points(sd, &creds.root)?, username, old, new)?;
+        let new_static = crate::cryptree::PaddedCipherText::build(&creds.root, &updated, USER_STATIC_DATA_PADDING)?.to_cbor();
+        let CborObject::Map(mut m) = wd else {
+            return Err(Error::Cbor("WriterData is not a map".into()));
+        };
+        m.insert(peergos_cbor::CborString::new("static"), new_static);
+        let tid = store.start_transaction(owner).await?;
+        let cid = peergos_core::put_block_signed(store.as_ref(), owner, signer, CborObject::Map(m).to_bytes(), &tid).await?;
+        let update = peergos_core::PointerUpdate::new(Some(wd_cid), Some(cid), peergos_core::PointerUpdate::increment(pointer.sequence));
+        if !mutable.set_pointer_update(owner, signer, &update).await? {
+            return Err(Error::Protocol(format!("Couldn't store the new home entry point for {username}")));
+        }
+        store.close_transaction(owner, &tid).await?;
+        return Ok(());
+    }
+    let updated = replace_home_entry(&get_login_data(poster, username, &creds, mfa).await?, username, old, new)?;
+    let new_static = crate::cryptree::PaddedCipherText::build(&creds.root, &updated, USER_STATIC_DATA_PADDING)?.to_cbor();
+    let login_data = CborObject::map()
+        .put("u", CborObject::Str(username.to_string()))
+        .put("e", new_static)
+        .put("r", creds.login_pub.to_cbor())
+        .build();
+    let auth = to_hex(&signer.secret.signature_only(&login_data.to_bytes(), peergos_core::SigningDomain::Login)?);
+    let url = format!("{LOGIN_URL}setLogin?username={username}&auth={auth}&local=false");
+    if poster.post_unzip(&url, login_data.to_bytes(), 0).await?.first().copied() != Some(1) {
+        return Err(Error::Protocol(format!("Couldn't store the new home entry point for {username}")));
+    }
+    Ok(())
 }

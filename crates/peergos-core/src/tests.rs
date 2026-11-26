@@ -346,7 +346,7 @@ async fn get_pointer_target_unwraps_signature() {
     let w = writer_keypair(7);
     assert!(w.public_key_hash.is_identity());
     let update = PointerUpdate::new(None, Some(hash_to_cid(b"newroot", false).unwrap()), Some(1));
-    let signed = w.secret.sign_message(&update.serialize()).unwrap();
+    let signed = w.secret.sign_message(&update.serialize(), crate::keys::SigningDomain::Pointer).unwrap();
 
     let mp_mock = MockPoster::with(vec![signed]); // getPointer returns the signed CAS
     let mp = HttpMutablePointers::new(mp_mock);
@@ -839,4 +839,78 @@ async fn champ_correct_delete() {
         let expected = Some(CborObject::ByteString(val.clone()));
         assert_eq!(cw.get(key).await.unwrap(), expected, "remaining key mismatch");
     }
+}
+
+fn unhex(s: &str) -> Vec<u8> {
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+}
+
+#[test]
+fn hybrid_signing_keys_match_java() {
+    let mut lines = include_str!("testdata/hybrid_signing_pair.txt").lines();
+    let pair_bytes = unhex(lines.next().unwrap());
+    let signed = unhex(lines.next().unwrap());
+    let hash = lines.next().unwrap();
+
+    let pair = SigningKeyPair::from_cbor(&CborObject::from_bytes(&pair_bytes).unwrap()).unwrap();
+    assert!(matches!(pair.public, PublicSigningKey::Hybrid { .. }));
+    assert_eq!(pair.to_cbor().to_bytes(), pair_bytes);
+    assert_eq!(pair.public.hash().unwrap().to_string(), hash);
+
+    assert_eq!(pair.public.unsign_message(&signed, SigningDomain::Pointer).unwrap(), b"peergos");
+    assert!(pair.public.unsign_message(&signed, SigningDomain::Block).is_err());
+
+    let ours = pair.secret.sign_message(b"peergos", SigningDomain::Pointer).unwrap();
+    assert_eq!(ours.len(), HYBRID_SIGNATURE_BYTES + 7);
+    assert_eq!(pair.public.unsign_message(&ours, SigningDomain::Pointer).unwrap(), b"peergos");
+}
+
+#[test]
+fn hybrid_signatures_are_bound_to_their_domain_and_both_components() {
+    let pair = SigningKeyPair::random_hybrid().unwrap();
+    let message = b"hello";
+    for signed_in in SigningDomain::ALL {
+        let signed = pair.secret.sign_message(message, signed_in).unwrap();
+        for verified_in in SigningDomain::ALL {
+            assert_eq!(pair.public.unsign_message(&signed, verified_in).is_ok(), signed_in == verified_in);
+        }
+    }
+    let signed = pair.secret.sign_message(message, SigningDomain::Pointer).unwrap();
+    for index in [0, 70, HYBRID_SIGNATURE_BYTES] {
+        let mut bad = signed.clone();
+        bad[index] ^= 1;
+        assert!(pair.public.unsign_message(&bad, SigningDomain::Pointer).is_err());
+    }
+    assert!(SigningKeyPair::random_hybrid().unwrap().public.unsign_message(&signed, SigningDomain::Pointer).is_err());
+
+    let PublicSigningKey::Hybrid { ed25519, .. } = &pair.public else { unreachable!() };
+    let mut ed_only = signed[..64].to_vec();
+    ed_only.extend_from_slice(message);
+    assert!(PublicSigningKey::new(ed25519.clone()).unsign_message(&ed_only, SigningDomain::Pointer).is_err());
+
+    assert!(!pair.public.hash().unwrap().is_identity());
+    assert!(SigningKeyPair::random().unwrap().public.hash().unwrap().is_identity());
+    assert!(pair.secret.to_cbor().to_bytes().len() < 128);
+}
+
+#[test]
+fn ed25519_ignores_the_domain() {
+    let pair = SigningKeyPair::random().unwrap();
+    let a = pair.secret.sign_message(b"hello", SigningDomain::Block).unwrap();
+    assert_eq!(a, pair.secret.sign_message(b"hello", SigningDomain::Pointer).unwrap());
+    assert_eq!(pair.public.unsign_message(&a, SigningDomain::OwnerProof).unwrap(), b"hello");
+}
+
+#[tokio::test]
+async fn hybrid_keys_are_stored_as_blocks() {
+    let store = RamStorage::new();
+    let parent = SigningKeyPair::random().unwrap().to_private_and_hash().unwrap();
+    let owner = parent.public_key_hash.clone();
+    let hybrid = SigningKeyPair::random_hybrid().unwrap();
+    let tid = TransactionId("1".into());
+    let hash = put_signing_key(&store, &owner, &parent, &hybrid.public, &tid).await.unwrap();
+    assert_eq!(hash, hybrid.public.hash().unwrap());
+    assert_eq!(get_signing_key(&store, &owner, &hash).await.unwrap(), Some(hybrid.public.clone()));
+    let ed = SigningKeyPair::random().unwrap();
+    assert!(put_signing_key(&store, &owner, &parent, &ed.public, &tid).await.unwrap().is_identity());
 }

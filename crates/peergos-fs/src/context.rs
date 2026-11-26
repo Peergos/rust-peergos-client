@@ -36,6 +36,8 @@ fn split_home_path(path: &str) -> (&str, &str) {
 /// in one block, which [`crate::put_secret_link`] enforces.
 pub const MAX_LINK_MEMBERS: usize = 100;
 
+pub const UPGRADING_MESSAGE: &str = "Upgrading to post-quantum signatures, please wait.";
+
 /// One of the owner's secret links, deduplicated across the paths it is recorded
 /// under (`SecretLinkSummary`).
 #[derive(Debug, Clone)]
@@ -84,7 +86,7 @@ fn to_hex(bytes: &[u8]) -> String {
 /// the auth token the space-usage endpoints expect.
 fn signed_now(secret: &SecretSigningKey) -> Result<String> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-    Ok(to_hex(&secret.sign_message(&CborObject::Long(now).to_bytes())?))
+    Ok(to_hex(&secret.sign_message(&CborObject::Long(now).to_bytes(), peergos_core::SigningDomain::TimeLimited)?))
 }
 
 fn parse_cbor_long(res: &[u8]) -> Result<i64> {
@@ -205,8 +207,202 @@ impl UserContext {
         store: Arc<dyn ContentAddressedStorage>,
         mutable: Arc<dyn MutablePointers>,
     ) -> Result<UserContext> {
-        let user = login(username, password, poster.as_ref(), store.clone(), mutable.as_ref(), mfa).await?;
+        let mut user = login(username, password, poster.as_ref(), store.clone(), mutable.as_ref(), mfa).await?;
+        if peergos_core::keys::hybrid_writers() {
+            user = Self::move_to_hybrid_writers(user, password, mfa, &poster, &store, &mutable).await?;
+        }
         Ok(UserContext { user: Some(user), link_caps: Vec::new(), link_mounts: Vec::new(), store, mutable, poster, cache: CryptreeCache::new() })
+    }
+
+    /// Move an old account's writing spaces to hybrid writers: the home first, then
+    /// the rest from a fresh login, which reaches the new home through the link the
+    /// old one holds until our entry point names it. A failure leaves the account
+    /// usable, and the next login carries on.
+    async fn move_to_hybrid_writers(
+        mut user: LoggedInUser,
+        password: &str,
+        mfa: Option<&MfaResponder<'_>>,
+        poster: &Arc<dyn HttpPoster>,
+        store: &Arc<dyn ContentAddressedStorage>,
+        mutable: &Arc<dyn MutablePointers>,
+    ) -> Result<LoggedInUser> {
+        let relogin = |u: &LoggedInUser| {
+            let username = u.username.clone();
+            async move { login(&username, password, poster.as_ref(), store.clone(), mutable.as_ref(), mfa).await }
+        };
+        if user.home().is_some_and(|h| h.writer.is_identity()) {
+            log::info!("{UPGRADING_MESSAGE}");
+            let ctx = Self::for_user(user.clone(), poster, store, mutable);
+            match ctx.switch_home_to_hybrid_writer().await {
+                Ok(()) => user = relogin(&user).await?,
+                Err(e) => {
+                    log::warn!("Couldn't move our home to a hybrid writer: {e}");
+                    return Ok(user);
+                }
+            }
+        }
+        let moving = user.stored_home.as_ref().is_some_and(|h| h.writer.is_identity())
+            && user.home().is_some_and(|h| !h.writer.is_identity());
+        if moving {
+            log::info!("{UPGRADING_MESSAGE}");
+            let ctx = Self::for_user(user.clone(), poster, store, mutable);
+            match ctx.finish_move_to_hybrid_writers(password, mfa).await {
+                Ok(()) => user = relogin(&user).await?,
+                Err(e) => log::warn!("Couldn't finish moving to hybrid writers, which the next login retries: {e}"),
+            }
+        }
+        Ok(user)
+    }
+
+    fn for_user(
+        user: LoggedInUser,
+        poster: &Arc<dyn HttpPoster>,
+        store: &Arc<dyn ContentAddressedStorage>,
+        mutable: &Arc<dyn MutablePointers>,
+    ) -> UserContext {
+        UserContext {
+            user: Some(user),
+            link_caps: Vec::new(),
+            link_mounts: Vec::new(),
+            store: store.clone(),
+            mutable: mutable.clone(),
+            poster: poster.clone(),
+            cache: CryptreeCache::new(),
+        }
+    }
+
+    /// Move our home's writing space to a new hybrid writer
+    /// (`switchHomeToHybridWriter`), so a quantum computer can't forge its pointers.
+    /// Friends hold entry points to our sharing folders, which nothing sends again,
+    /// so those get links in the old writer too.
+    async fn switch_home_to_hybrid_writer(&self) -> Result<()> {
+        let user = self.require_user()?;
+        let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?.clone();
+        let mut sharing_dirs = Vec::new();
+        let shared = crate::list_directory(&home, self.store.clone(), self.mutable.as_ref())
+            .await?
+            .into_iter()
+            .find(|e| e.name == "shared");
+        if let Some(shared) = shared {
+            for d in crate::list_directory(&shared.cap, self.store.clone(), self.mutable.as_ref()).await? {
+                if d.cap.writer != home.writer || !d.cap.is_writable() {
+                    continue;
+                }
+                let (_, props) = crate::retrieve_file_metadata(&d.cap, self.store.clone(), self.mutable.as_ref()).await?;
+                if props.is_directory && !props.is_link {
+                    sharing_dirs.push(d.cap);
+                }
+            }
+        }
+        let mirror = user.mirror_bat_id();
+        crate::writing_space::switch_writer(&home, &user.signer, None, &sharing_dirs, mirror.as_ref(), self.store.clone(), self.mutable.clone())
+            .await?;
+        Ok(())
+    }
+
+    /// Move each writing space nested in our home to a new hybrid writer, send
+    /// shares and links again and republish with the new caps, then point our entry
+    /// point at the new home (`finishMoveToHybridWriters`). Each step can be redone,
+    /// and the entry point goes last, so a login that stops part way is finished by
+    /// the next.
+    async fn finish_move_to_hybrid_writers(&self, password: &str, mfa: Option<&MfaResponder<'_>>) -> Result<()> {
+        let user = self.require_user()?;
+        let home = user.home().ok_or_else(|| Error::Protocol("no home directory".into()))?.clone();
+        let stored = user.stored_home.clone().ok_or_else(|| Error::Protocol("our home hasn't moved".into()))?;
+        let quotas: std::collections::HashMap<_, _> = crate::writer_quota::get_writer_quotas(&user.signer, self.poster.as_ref())
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|q| q.quota.map(|b| (q.writer, b)))
+            .collect();
+        let home_signer = crate::recover_signer(&home, self.store.clone(), self.mutable.as_ref()).await?;
+        self.switch_nested_spaces(&home, &home_signer, &quotas).await?;
+        self.reshare_after_move().await?;
+        self.update_published_caps("").await?;
+        crate::login::replace_home_entry_point(
+            &user.username,
+            password,
+            mfa,
+            &user.signer,
+            &stored,
+            &home,
+            self.poster.as_ref(),
+            self.store.clone(),
+            self.mutable.as_ref(),
+        )
+        .await
+    }
+
+    /// Switch the Ed25519 writing spaces nested in a space to hybrid writers, top
+    /// down, including those nested in spaces that are hybrid already.
+    fn switch_nested_spaces<'a>(
+        &'a self,
+        space: &'a AbsoluteCapability,
+        space_signer: &'a peergos_core::SigningPrivateKeyAndPublicHash,
+        quotas: &'a std::collections::HashMap<peergos_core::PublicKeyHash, i64>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
+        Box::pin(async move {
+            let user = self.require_user()?;
+            let mut found = Vec::new();
+            crate::writing_space::find_nested_writing_spaces(space, &mut found, &self.store, self.mutable.as_ref()).await?;
+            for (cap, holder) in found {
+                if !cap.is_writable() {
+                    continue;
+                }
+                let Ok((_, props)) = crate::retrieve_file_metadata(&cap, self.store.clone(), self.mutable.as_ref()).await else {
+                    continue;
+                };
+                let moved = if cap.writer.is_identity() {
+                    let n = crate::writing_space::NestedSpace { cap: cap.clone(), holder, holder_signer: space_signer.clone() };
+                    let mirror = user.mirror_bat_id();
+                    let new_cap = crate::writing_space::switch_writer(
+                        &cap,
+                        space_signer,
+                        Some(&n),
+                        &[],
+                        mirror.as_ref(),
+                        self.store.clone(),
+                        self.mutable.clone(),
+                    )
+                    .await?;
+                    if let Some(q) = quotas.get(&cap.writer) {
+                        crate::writer_quota::set_writer_quota(&user.signer, &new_cap.writer, Some(*q), self.poster.as_ref()).await?;
+                        let _ = crate::writer_quota::set_writer_quota(&user.signer, &cap.writer, None, self.poster.as_ref()).await;
+                    }
+                    new_cap
+                } else {
+                    cap
+                };
+                if props.is_directory {
+                    let signer = crate::recover_signer(&moved, self.store.clone(), self.mutable.as_ref()).await?;
+                    self.switch_nested_spaces(&moved, &signer, quotas).await?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Send every share and link again with the caps they have after moving to
+    /// hybrid writers. One that can't be sent, e.g. to a former friend or of a file
+    /// that is gone, mustn't stop the others.
+    async fn reshare_after_move(&self) -> Result<()> {
+        let user = self.require_user()?;
+        let mut targets: Vec<String> = Vec::new();
+        for (dir, state) in crate::get_all_shares(user, self.store.clone(), self.mutable.as_ref()).await? {
+            for name in state.read_shares().keys().chain(state.write_shares().keys()).chain(state.links().keys()) {
+                let full = if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") };
+                if !targets.contains(&full) {
+                    targets.push(full);
+                }
+            }
+        }
+        let mut sent = std::collections::HashSet::new();
+        for t in targets {
+            if let Err(e) = self.reshare_with(&t, &mut sent).await {
+                log::warn!("Couldn't send the shares of {t} again after moving to hybrid writers: {e}");
+            }
+        }
+        Ok(())
     }
 
     /// Sign in to a TOTP-protected account, generating the current code from the
@@ -1544,7 +1740,7 @@ impl UserContext {
             utc_millis: now,
             payment_proof: None,
         };
-        let signed = user.signer.secret.sign_message(&req.serialize())?;
+        let signed = user.signer.secret.sign_message(&req.serialize(), peergos_core::SigningDomain::SpaceRequest)?;
         let auth = to_hex(&signed);
         let url = format!(
             "{SPACE_USAGE_URL}request?owner={}&req={auth}",

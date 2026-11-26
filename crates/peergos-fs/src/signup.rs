@@ -346,7 +346,7 @@ fn build_claim_chain(
     serialize_string(&mut payload, expiry);
     payload.extend_from_slice(&1u32.to_be_bytes());
     serialize_bytes(&mut payload, &storage_provider.to_bytes());
-    let signed = identity.secret.sign_message(&payload)?;
+    let signed = identity.secret.sign_message(&payload, peergos_core::SigningDomain::UsernameClaim)?;
 
     let claim = CborObject::List(vec![
         CborObject::Str(username.to_string()),
@@ -419,7 +419,11 @@ pub async fn signup(
     )?;
 
     // --- 1. The home directory's writer subspace ------------------------------
-    let (_writer_kp, writer) = random_signer()?;
+    let writer_kp = SigningKeyPair::random_writer()?;
+    let writer = SigningPrivateKeyAndPublicHash::new(
+        peergos_core::put_signing_key(store.as_ref(), &identity_hash, &identity, &writer_kp.public, &tid).await?,
+        writer_kp.secret,
+    );
     let root_map_key = random_bytes(32);
     let root_bat = Bat::new(random_bytes(32))?;
     let root_r_key = random_symmetric_key()?;
@@ -488,7 +492,7 @@ pub async fn signup(
     oplog.set_pointer_update(&identity_hash, &writer, &writer_update).await?;
 
     // --- 2. Authorise the writer as an owned key of the identity --------------
-    let signed_owner = writer.secret.sign_message(&identity_hash.to_cbor().to_bytes())?;
+    let signed_owner = writer.secret.sign_message(&identity_hash.to_cbor().to_bytes(), peergos_core::SigningDomain::OwnerProof)?;
     let owner_proof = CborObject::map()
         .put("o", writer.public_key_hash.to_cbor())
         .put("p", CborObject::ByteString(signed_owner))
@@ -551,7 +555,7 @@ pub async fn signup(
         .put("e", static_data)
         .put("r", login_pub.to_cbor())
         .build();
-    let login_auth = identity.secret.signature_only(&login_data.to_bytes())?;
+    let login_auth = identity.secret.signature_only(&login_data.to_bytes(), peergos_core::SigningDomain::Login)?;
     oplog.set_login_data(login_data, login_auth);
 
     // --- 4. The mirror BAT ----------------------------------------------------
@@ -610,7 +614,7 @@ pub(crate) fn sign_time_limited(identity: &SigningPrivateKeyAndPublicHash, path:
         .put("p", CborObject::Str(path.to_string()))
         .put("t", CborObject::Long(now))
         .build();
-    identity.secret.sign_message(&req.to_bytes())
+    identity.secret.sign_message(&req.to_bytes(), peergos_core::SigningDomain::SpaceRequest)
 }
 
 /// POST the signup log to `core/signup`. Returns `Ok(None)` on success, or

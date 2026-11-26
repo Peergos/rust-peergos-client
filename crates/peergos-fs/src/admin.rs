@@ -20,7 +20,7 @@ fn now_millis() -> i64 {
 }
 
 fn signed_now(secret: &peergos_core::keys::SecretSigningKey) -> Result<String> {
-    Ok(to_hex(&secret.sign_message(&CborObject::Long(now_millis()).to_bytes())?))
+    Ok(to_hex(&secret.sign_message(&CborObject::Long(now_millis()).to_bytes(), peergos_core::SigningDomain::TimeLimited)?))
 }
 
 /// A `TimeLimitedClient.SignedRequest` for `ADMIN_URL + endpoint`.
@@ -29,7 +29,7 @@ fn signed_request(secret: &peergos_core::keys::SecretSigningKey, endpoint: &str)
         .put("p", CborObject::Str(format!("{ADMIN_URL}{endpoint}")))
         .put("t", CborObject::Long(now_millis()))
         .build();
-    Ok(to_hex(&secret.sign_message(&req.to_bytes())?))
+    Ok(to_hex(&secret.sign_message(&req.to_bytes(), peergos_core::SigningDomain::TimeLimited)?))
 }
 
 fn parse_bool(res: &[u8]) -> Result<bool> {
@@ -162,7 +162,7 @@ pub async fn approve_space_request(
     request: &LabelledSignedSpaceRequest,
     poster: &dyn HttpPoster,
 ) -> Result<bool> {
-    let signed = admin.signer.secret.sign_message(&request.serialize())?;
+    let signed = admin.signer.secret.sign_message(&request.serialize(), peergos_core::SigningDomain::SpaceRequestApproval)?;
     let auth = to_hex(&signed);
     let url = format!(
         "{ADMIN_URL}approve?admin={}&instance={}&req={auth}",

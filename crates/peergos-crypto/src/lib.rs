@@ -5,14 +5,12 @@
 //! Byte-compatibility with the Java implementation is essential: existing
 //! accounts and blocks can only be read if key derivation, cipher output and
 //! hashing all match exactly. See each module for the specific mapping.
-//!
-//! Not yet ported: the hybrid Curve25519 + ML-KEM boxing (`Mlkem`), which is a
-//! later-phase task.
 
 use std::fmt;
 
 pub mod boxing;
 pub mod hash;
+pub mod mldsa;
 pub mod sign;
 pub mod symmetric;
 
